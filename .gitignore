@@ -1,0 +1,11 @@
+/build/
+/build-cpu/
+/build-cuda/
+/models/
+/.venv/
+/logs/
+compile_commands.json
+*.gguf
+.cache/
+__pycache__/
+*.pyc

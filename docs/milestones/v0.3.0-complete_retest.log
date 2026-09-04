@@ -1,0 +1,289 @@
+
+========== identity-0.6B ==========
++ /home/leye/kvmem_llamacpp/scripts/identity_canary.py -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
+off [34166, 13, 358, 1079, 264, 5458, 304, 279, 220, 16, 15, 339, 11972, 13, 358, 1079, 8014, 304, 20956, 304, 279, 3853, 13, 358, 1366, 311, 1414, 1246, 311, 10549, 369, 279]
+on  [34166, 13, 358, 1079, 264, 5458, 304, 279, 220, 16, 15, 339, 11972, 13, 358, 1079, 8014, 304, 20956, 304, 279, 3853, 13, 358, 1366, 311, 1414, 1246, 311, 10549, 369, 279]
+PASS: identity (KVMem-on greedy tokens == KVMem-off)
+[identity-0.6B] rc=0 wall=2s
+
+========== identity-1.7B ==========
++ /home/leye/kvmem_llamacpp/scripts/identity_canary.py -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf
+off [444, 2210, 11, 358, 1079, 220, 16, 20, 1635, 2310, 11, 358, 1079, 264, 5458, 304, 264, 1550, 2906, 11, 358, 1079, 504, 264, 2613, 6290, 304, 279, 9806, 315, 5616, 11]
+on  [444, 2210, 11, 358, 1079, 220, 16, 20, 1635, 2310, 11, 358, 1079, 264, 5458, 304, 264, 1550, 2906, 11, 358, 1079, 504, 264, 2613, 6290, 304, 279, 9806, 315, 5616, 11]
+PASS: identity (KVMem-on greedy tokens == KVMem-off)
+[identity-1.7B] rc=0 wall=3s
+
+========== needle-recency-0.6B ==========
++ /home/leye/kvmem_llamacpp/scripts/needle_recall.py -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf --method recency --budget 256 --block-tokens 32
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=837
+   KVMEM_KV_BYTES bytes=44040192 cells=384 slots=12 budget=256 pool=384 ratio=0.50 high=0.95 low=0.85 cap_blocks=1164 gpu_total=8546549760 block_bytes=3670016
+   KVMEM_TRACE mask last_pos=127 n_kv=256 keep=128 holes=0 keep_pos=[0,127]
+   KVMEM_TRACE mask last_pos=255 n_kv=256 keep=256 holes=0 keep_pos=[0,255]
+   KVMEM_TRACE mask last_pos=383 n_kv=256 keep=256 holes=1 keep_pos=[0,383]
+   KVMEM_TRACE mask last_pos=511 n_kv=256 keep=256 holes=1 keep_pos=[0,511]
+   KVMEM_TRACE mask last_pos=639 n_kv=256 keep=256 holes=1 keep_pos=[0,639]
+   KVMEM_TRACE mask last_pos=767 n_kv=256 keep=256 holes=1 keep_pos=[0,767]
+   KVMEM_TRACE mask last_pos=836 n_kv=256 keep=229 holes=1 keep_pos=[0,836]
+output:  the secret code is the code that is used to protect the system from unauthorized access.
+Answer:
+The secret code is the code that is used to protect the system from unauthorized access.
+Answer:
+The secret code is the code that is used to
+
+PASS: recency budget=256 bt=32 did not recall the middle needle
+[needle-recency-0.6B] rc=0 wall=2s
+
+========== needle-retr-0.6B ==========
++ /home/leye/kvmem_llamacpp/scripts/needle_recall.py -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf --method retrieval --budget 256 --block-tokens 32
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=837
+   KVMEM_KV_BYTES bytes=44040192 cells=384 slots=12 budget=256 pool=384 ratio=0.50 high=0.95 low=0.85 cap_blocks=1164 gpu_total=8546549760 block_bytes=3670016
+   KVMEM_TRACE mask last_pos=127 n_kv=256 keep=128 holes=0 keep_pos=[0,127]
+   KVMEM_TRACE mask last_pos=255 n_kv=256 keep=256 holes=0 keep_pos=[0,255]
+   KVMEM_TRACE mask last_pos=383 n_kv=256 keep=256 holes=1 keep_pos=[0,383]
+   KVMEM_TRACE mask last_pos=511 n_kv=256 keep=256 holes=1 keep_pos=[0,511]
+   KVMEM_TRACE mask last_pos=639 n_kv=256 keep=256 holes=1 keep_pos=[0,639]
+   KVMEM_TRACE mask last_pos=767 n_kv=256 keep=256 holes=1 keep_pos=[0,767]
+   KVMEM_TRACE mask last_pos=836 n_kv=256 keep=229 holes=1 keep_pos=[0,836]
+   KVMEM_TRACE retrieval stage_in=4 stage_out=4 skip=6 gpu_reused=4 window=229 free_slots=4
+   KVMEM_TRACE selected 0 1 2 12 13 24 25 26
+   KVMEM_KV --- native reused block 24 orig=768 skip=1 (GPU vs host rope) ---
+   KVMEM_KV dump block=24 slot=3 n=32 orig=768 raw=1 v_trans=0 type_k=f16 rope n_rot=128 freq_base=1000000.0 scale=1 pos0=768
+   KVMEM_KV L0 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.005796 maxabs=0.123291 rms_gpu=24.412282
+   KVMEM_KV L0 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.991433 rmse=3.409749 maxabs=25.762669 rms_gpu=26.048258
+   KVMEM_KV L0 V raw_vs_gpu (no rope) n=32768 cos=0.000000 rmse=0.156234 maxabs=0.799316 rms_gpu=0.156234
+   KVMEM_KV L14 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000508 maxabs=0.007788 rms_gpu=2.611493
+   KVMEM_KV L14 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.777895 rmse=1.716875 maxabs=15.831503 rms_gpu=2.576006
+   KVMEM_KV L14 V raw_vs_gpu (no rope) n=32768 cos=0.000000 rmse=0.731001 maxabs=4.613281 rms_gpu=0.731001
+   KVMEM_KV L27 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000701 maxabs=0.015240 rms_gpu=3.433617
+   KVMEM_KV L27 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.859242 rmse=1.937337 maxabs=17.363573 rms_gpu=3.651343
+   KVMEM_KV L27 V raw_vs_gpu (no rope) n=32768 cos=0.000000 rmse=7.073578 maxabs=35.343750 rms_gpu=7.073578
+   KVMEM_TRACE layout_orig_pos 0 1 2 12 13 24 25 26
+   KVMEM_TRACE stage_in_raw block=1 slot=1 n=32 orig=32
+   KVMEM_TRACE stage_in_raw block=2 slot=2 n=32 orig=64
+   KVMEM_TRACE stage_in_raw block=12 slot=3 n=32 orig=384
+   KVMEM_TRACE stage_in_raw block=13 slot=4 n=32 orig=416
+   KVMEM_TRACE layout_writeback move=4 raw=4
+   KVMEM_TRACE writeback laid_out=1 raw=0 skip_resident=0 stage_in=4
+   KVMEM_KV --- after stage_in_raw block 1 ---
+   KVMEM_KV dump block=1 slot=1 n=32 orig=32 raw=1 v_trans=0 type_k=f16 rope n_rot=128 freq_base=1000000.0 scale=1 pos0=32
+   KVMEM_KV L0 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.005760 maxabs=0.124390 rms_gpu=24.442828
+   KVMEM_KV L0 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.995076 rmse=2.067798 maxabs=20.792318 rms_gpu=20.838356
+   KVMEM_KV L0 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=0.156095
+   KVMEM_KV L14 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000502 maxabs=0.007671 rms_gpu=2.559325
+   KVMEM_KV L14 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.833990 rmse=1.395283 maxabs=14.377581 rms_gpu=2.421490
+   KVMEM_KV L14 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=0.844499
+   KVMEM_KV L27 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000743 maxabs=0.015591 rms_gpu=3.499455
+   KVMEM_KV L27 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.899524 rmse=1.698397 maxabs=16.817194 rms_gpu=3.788761
+   KVMEM_KV L27 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=7.161699
+   KVMEM_TRACE after_retrieval cells used=229 used_max_p1=229 size=384 seq_pos=[0,836]
+   KVMEM_TRACE occupy tag=after_retrieval block=0 slot=0 cell=0 empty=0 pos=0 last_empty=0 last_pos=31 n=32 orig=0
+   KVMEM_TRACE occupy tag=after_retrieval block=1 slot=1 cell=32 empty=0 pos=32 last_empty=0 last_pos=63 n=32 orig=32
+   KVMEM_TRACE occupy tag=after_retrieval block=2 slot=2 cell=64 empty=0 pos=64 last_empty=0 last_pos=95 n=32 orig=64
+   KVMEM_TRACE occupy tag=after_retrieval block=12 slot=3 cell=96 empty=0 pos=384 last_empty=0 last_pos=415 n=32 orig=384
+   KVMEM_TRACE occupy tag=after_retrieval block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE occupy tag=after_retrieval block=24 slot=5 cell=160 empty=0 pos=768 last_empty=0 last_pos=799 n=32 orig=768
+   KVMEM_TRACE occupy tag=after_retrieval block=25 slot=6 cell=192 empty=0 pos=800 last_empty=0 last_pos=831 n=32 orig=800
+   KVMEM_TRACE occupy tag=after_retrieval block=26 slot=7 cell=224 empty=0 pos=832 last_empty=0 last_pos=836 n=5 orig=832
+   KVMEM_TRACE before_seq_rm seq_pos=[0,836] query=[773,837)
+   KVMEM_TRACE after_seq_rm seq_pos=[0,772] auto_pos0=773
+   KVMEM_TRACE after_seq_rm cells used=165 used_max_p1=165 size=384 seq_pos=[0,772]
+   KVMEM_TRACE occupy tag=after_seq_rm block=0 slot=0 cell=0 empty=0 pos=0 last_empty=0 last_pos=31 n=32 orig=0
+   KVMEM_TRACE occupy tag=after_seq_rm block=1 slot=1 cell=32 empty=0 pos=32 last_empty=0 last_pos=63 n=32 orig=32
+   KVMEM_TRACE occupy tag=after_seq_rm block=2 slot=2 cell=64 empty=0 pos=64 last_empty=0 last_pos=95 n=32 orig=64
+   KVMEM_TRACE occupy tag=after_seq_rm block=12 slot=3 cell=96 empty=0 pos=384 last_empty=0 last_pos=415 n=32 orig=384
+   KVMEM_TRACE occupy tag=after_seq_rm block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE occupy tag=after_seq_rm block=24 slot=5 cell=160 empty=0 pos=768 last_empty=1 last_pos=-1 n=32 orig=768
+   KVMEM_TRACE occupy tag=after_seq_rm block=25 slot=6 cell=192 empty=1 pos=-1 last_empty=1 last_pos=-1 n=32 orig=800
+   KVMEM_TRACE occupy tag=after_seq_rm block=26 slot=7 cell=224 empty=1 pos=-1 last_empty=1 last_pos=-1 n=5 orig=832
+   KVMEM_TRACE mask last_pos=836 n_kv=256 keep=229 holes=1 keep_pos=[0,836]
+   KVMEM_TRACE query_replay begin=773 n=64
+   KVMEM_TRACE after_query_replay cells used=229 used_max_p1=229 size=384 seq_pos=[0,836]
+   KVMEM_TRACE occupy tag=after_query_replay block=0 slot=0 cell=0 empty=0 pos=0 last_empty=0 last_pos=31 n=32 orig=0
+   KVMEM_TRACE occupy tag=after_query_replay block=1 slot=1 cell=32 empty=0 pos=32 last_empty=0 last_pos=63 n=32 orig=32
+   KVMEM_TRACE occupy tag=after_query_replay block=2 slot=2 cell=64 empty=0 pos=64 last_empty=0 last_pos=95 n=32 orig=64
+   KVMEM_TRACE occupy tag=after_query_replay block=12 slot=3 cell=96 empty=0 pos=384 last_empty=0 last_pos=415 n=32 orig=384
+   KVMEM_TRACE occupy tag=after_query_replay block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE occupy tag=after_query_replay block=24 slot=5 cell=160 empty=0 pos=768 last_empty=0 last_pos=799 n=32 orig=768
+   KVMEM_TRACE occupy tag=after_query_replay block=25 slot=6 cell=192 empty=0 pos=800 last_empty=0 last_pos=831 n=32 orig=800
+   KVMEM_TRACE occupy tag=after_query_replay block=26 slot=7 cell=224 empty=0 pos=832 last_empty=0 last_pos=836 n=5 orig=832
+output:  the secret code is BLUEBIRD-42.
+The secret code is BLUEBIRD-42.
+Answer:
+The secret code is BLUEBIRD-42.
+Answer:
+The secret code is BLUEBIRD-42.
+
+
+PASS: retrieval budget=256 bt=32 revived the middle needle
+[needle-retr-0.6B] rc=0 wall=5s
+
+========== needle-recency-1.7B ==========
++ /home/leye/kvmem_llamacpp/scripts/needle_recall.py -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf --method recency --budget 256 --block-tokens 32
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=837
+   KVMEM_KV_BYTES bytes=44040192 cells=384 slots=12 budget=256 pool=384 ratio=0.50 high=0.95 low=0.85 cap_blocks=1164 gpu_total=8546549760 block_bytes=3670016
+   KVMEM_TRACE mask last_pos=127 n_kv=256 keep=128 holes=0 keep_pos=[0,127]
+   KVMEM_TRACE mask last_pos=255 n_kv=256 keep=256 holes=0 keep_pos=[0,255]
+   KVMEM_TRACE mask last_pos=383 n_kv=256 keep=256 holes=1 keep_pos=[0,383]
+   KVMEM_TRACE mask last_pos=511 n_kv=256 keep=256 holes=1 keep_pos=[0,511]
+   KVMEM_TRACE mask last_pos=639 n_kv=256 keep=256 holes=1 keep_pos=[0,639]
+   KVMEM_TRACE mask last_pos=767 n_kv=256 keep=256 holes=1 keep_pos=[0,767]
+   KVMEM_TRACE mask last_pos=836 n_kv=256 keep=229 holes=1 keep_pos=[0,836]
+output:  1234567890
+The user is asking for the secret code, but the answer is given as 1234567890. The user is confused because the answer is not
+
+PASS: recency budget=256 bt=32 did not recall the middle needle
+[needle-recency-1.7B] rc=0 wall=3s
+
+========== needle-retr-1.7B ==========
++ /home/leye/kvmem_llamacpp/scripts/needle_recall.py -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf --method retrieval --budget 256 --block-tokens 32
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=837
+   KVMEM_KV_BYTES bytes=44040192 cells=384 slots=12 budget=256 pool=384 ratio=0.50 high=0.95 low=0.85 cap_blocks=1164 gpu_total=8546549760 block_bytes=3670016
+   KVMEM_TRACE mask last_pos=127 n_kv=256 keep=128 holes=0 keep_pos=[0,127]
+   KVMEM_TRACE mask last_pos=255 n_kv=256 keep=256 holes=0 keep_pos=[0,255]
+   KVMEM_TRACE mask last_pos=383 n_kv=256 keep=256 holes=1 keep_pos=[0,383]
+   KVMEM_TRACE mask last_pos=511 n_kv=256 keep=256 holes=1 keep_pos=[0,511]
+   KVMEM_TRACE mask last_pos=639 n_kv=256 keep=256 holes=1 keep_pos=[0,639]
+   KVMEM_TRACE mask last_pos=767 n_kv=256 keep=256 holes=1 keep_pos=[0,767]
+   KVMEM_TRACE mask last_pos=836 n_kv=256 keep=229 holes=1 keep_pos=[0,836]
+   KVMEM_TRACE retrieval stage_in=4 stage_out=4 skip=6 gpu_reused=4 window=229 free_slots=4
+   KVMEM_TRACE selected 0 1 2 12 13 24 25 26
+   KVMEM_KV --- native reused block 24 orig=768 skip=1 (GPU vs host rope) ---
+   KVMEM_KV dump block=24 slot=3 n=32 orig=768 raw=1 v_trans=0 type_k=f16 rope n_rot=128 freq_base=1000000.0 scale=1 pos0=768
+   KVMEM_KV L0 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.004488 maxabs=0.119568 rms_gpu=18.234009
+   KVMEM_KV L0 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.982064 rmse=3.393071 maxabs=32.459572 rms_gpu=17.913069
+   KVMEM_KV L0 V raw_vs_gpu (no rope) n=32768 cos=0.000000 rmse=0.153183 maxabs=0.747559 rms_gpu=0.153183
+   KVMEM_KV L14 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000507 maxabs=0.007795 rms_gpu=2.491234
+   KVMEM_KV L14 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.807807 rmse=1.525320 maxabs=15.353801 rms_gpu=2.460270
+   KVMEM_KV L14 V raw_vs_gpu (no rope) n=32768 cos=0.000000 rmse=1.688741 maxabs=12.257812 rms_gpu=1.688741
+   KVMEM_KV L27 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000791 maxabs=0.015545 rms_gpu=3.605442
+   KVMEM_KV L27 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.834345 rmse=2.120611 maxabs=19.553565 rms_gpu=3.684127
+   KVMEM_KV L27 V raw_vs_gpu (no rope) n=32768 cos=0.000000 rmse=14.652844 maxabs=91.562500 rms_gpu=14.652844
+   KVMEM_TRACE layout_orig_pos 0 1 2 12 13 24 25 26
+   KVMEM_TRACE stage_in_raw block=1 slot=1 n=32 orig=32
+   KVMEM_TRACE stage_in_raw block=2 slot=2 n=32 orig=64
+   KVMEM_TRACE stage_in_raw block=12 slot=3 n=32 orig=384
+   KVMEM_TRACE stage_in_raw block=13 slot=4 n=32 orig=416
+   KVMEM_TRACE layout_writeback move=4 raw=4
+   KVMEM_TRACE writeback laid_out=1 raw=0 skip_resident=0 stage_in=4
+   KVMEM_KV --- after stage_in_raw block 1 ---
+   KVMEM_KV dump block=1 slot=1 n=32 orig=32 raw=1 v_trans=0 type_k=f16 rope n_rot=128 freq_base=1000000.0 scale=1 pos0=32
+   KVMEM_KV L0 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.004477 maxabs=0.112671 rms_gpu=18.268111
+   KVMEM_KV L0 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.991696 rmse=2.256121 maxabs=22.986748 rms_gpu=17.504833
+   KVMEM_KV L0 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=0.153089
+   KVMEM_KV L14 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000513 maxabs=0.012390 rms_gpu=2.415291
+   KVMEM_KV L14 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.956504 rmse=0.626503 maxabs=6.437757 rms_gpu=2.124161
+   KVMEM_KV L14 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=1.783048
+   KVMEM_KV L27 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000788 maxabs=0.015614 rms_gpu=3.535732
+   KVMEM_KV L27 K raw_vs_gpu (no rope; ~1 only at pos0) n=1024 cos=0.893969 rmse=1.717848 maxabs=21.764880 rms_gpu=3.730397
+   KVMEM_KV L27 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=14.754444
+   KVMEM_TRACE after_retrieval cells used=229 used_max_p1=229 size=384 seq_pos=[0,836]
+   KVMEM_TRACE occupy tag=after_retrieval block=0 slot=0 cell=0 empty=0 pos=0 last_empty=0 last_pos=31 n=32 orig=0
+   KVMEM_TRACE occupy tag=after_retrieval block=1 slot=1 cell=32 empty=0 pos=32 last_empty=0 last_pos=63 n=32 orig=32
+   KVMEM_TRACE occupy tag=after_retrieval block=2 slot=2 cell=64 empty=0 pos=64 last_empty=0 last_pos=95 n=32 orig=64
+   KVMEM_TRACE occupy tag=after_retrieval block=12 slot=3 cell=96 empty=0 pos=384 last_empty=0 last_pos=415 n=32 orig=384
+   KVMEM_TRACE occupy tag=after_retrieval block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE occupy tag=after_retrieval block=24 slot=5 cell=160 empty=0 pos=768 last_empty=0 last_pos=799 n=32 orig=768
+   KVMEM_TRACE occupy tag=after_retrieval block=25 slot=6 cell=192 empty=0 pos=800 last_empty=0 last_pos=831 n=32 orig=800
+   KVMEM_TRACE occupy tag=after_retrieval block=26 slot=7 cell=224 empty=0 pos=832 last_empty=0 last_pos=836 n=5 orig=832
+   KVMEM_TRACE before_seq_rm seq_pos=[0,836] query=[773,837)
+   KVMEM_TRACE after_seq_rm seq_pos=[0,772] auto_pos0=773
+   KVMEM_TRACE after_seq_rm cells used=165 used_max_p1=165 size=384 seq_pos=[0,772]
+   KVMEM_TRACE occupy tag=after_seq_rm block=0 slot=0 cell=0 empty=0 pos=0 last_empty=0 last_pos=31 n=32 orig=0
+   KVMEM_TRACE occupy tag=after_seq_rm block=1 slot=1 cell=32 empty=0 pos=32 last_empty=0 last_pos=63 n=32 orig=32
+   KVMEM_TRACE occupy tag=after_seq_rm block=2 slot=2 cell=64 empty=0 pos=64 last_empty=0 last_pos=95 n=32 orig=64
+   KVMEM_TRACE occupy tag=after_seq_rm block=12 slot=3 cell=96 empty=0 pos=384 last_empty=0 last_pos=415 n=32 orig=384
+   KVMEM_TRACE occupy tag=after_seq_rm block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE occupy tag=after_seq_rm block=24 slot=5 cell=160 empty=0 pos=768 last_empty=1 last_pos=-1 n=32 orig=768
+   KVMEM_TRACE occupy tag=after_seq_rm block=25 slot=6 cell=192 empty=1 pos=-1 last_empty=1 last_pos=-1 n=32 orig=800
+   KVMEM_TRACE occupy tag=after_seq_rm block=26 slot=7 cell=224 empty=1 pos=-1 last_empty=1 last_pos=-1 n=5 orig=832
+   KVMEM_TRACE mask last_pos=836 n_kv=256 keep=229 holes=1 keep_pos=[0,836]
+   KVMEM_TRACE query_replay begin=773 n=64
+   KVMEM_TRACE after_query_replay cells used=229 used_max_p1=229 size=384 seq_pos=[0,836]
+   KVMEM_TRACE occupy tag=after_query_replay block=0 slot=0 cell=0 empty=0 pos=0 last_empty=0 last_pos=31 n=32 orig=0
+   KVMEM_TRACE occupy tag=after_query_replay block=1 slot=1 cell=32 empty=0 pos=32 last_empty=0 last_pos=63 n=32 orig=32
+   KVMEM_TRACE occupy tag=after_query_replay block=2 slot=2 cell=64 empty=0 pos=64 last_empty=0 last_pos=95 n=32 orig=64
+   KVMEM_TRACE occupy tag=after_query_replay block=12 slot=3 cell=96 empty=0 pos=384 last_empty=0 last_pos=415 n=32 orig=384
+   KVMEM_TRACE occupy tag=after_query_replay block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE occupy tag=after_query_replay block=24 slot=5 cell=160 empty=0 pos=768 last_empty=0 last_pos=799 n=32 orig=768
+   KVMEM_TRACE occupy tag=after_query_replay block=25 slot=6 cell=192 empty=0 pos=800 last_empty=0 last_pos=831 n=32 orig=800
+   KVMEM_TRACE occupy tag=after_query_replay block=26 slot=7 cell=224 empty=0 pos=832 last_empty=0 last_pos=836 n=5 orig=832
+output:  BLUEBIRD-42.
+The secret code is BLUEBIRD-42.
+The secret code is BLUEBIRD-42.
+The secret code is BLUEBIRD-42.
+The secret code is BLUEBIRD-
+
+PASS: retrieval budget=256 bt=32 revived the middle needle
+[needle-retr-1.7B] rc=0 wall=6s
+
+========== speed-0.6B ==========
++ /home/leye/kvmem_llamacpp/scripts/prefill_speed.py --lengths 1024,4096,8192,16384,32768 -n 64 --warmup 1 --runs 2 --modes off,recency,retr -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
+model=Qwen3-0.6B-Q8_0.gguf warmup=1 runs=2 n_predict=64 device=RTX 5050
+modes: off | recency (no capture) | cap (retrieval capture, no replay) | retr (capture + score/writeback + query-last 64)
+
+  len     mode prefill_n    prefill       ms     px  retr_ms rep_n   rep_ms  tot_n  tot_tok/s gen_n   decode     dx
+-------------------------------------------------------------------------------------------------------------------
+ 1024      off      1025     6611.6    155.2   1.00      0.0     0      0.0   1025     6611.6    64    191.4   1.00
+ 1024  recency      1025     7082.6    144.8   0.93      0.0     0      0.0   1025     7082.6    64    189.8   1.01
+ 1024     retr      1025     3206.7    320.1   2.06      9.1    64     16.5   1089     3240.0    64    185.3   1.03
+
+ 4096      off      4095     7463.4    548.7   1.00      0.0     0      0.0   4095     7463.4    64     74.9   1.00
+ 4096  recency      4095     7485.5    547.2   1.00      0.0     0      0.0   4095     7485.5    64     78.0   0.96
+ 4096     retr      4095     5091.8    806.2   1.47     84.1    64     16.0   4159     5070.5    64     88.1   0.85
+
+ 8192      off      8195     5481.6   1495.0   1.00      0.0     0      0.0   8195     5481.6    64     58.4   1.00
+ 8192  recency      8195     5524.8   1483.3   0.99      0.0     0      0.0   8195     5524.8    64     59.2   0.99
+ 8192     retr      8195     3696.9   2220.8   1.48     94.8    64     19.4   8259     3693.5    64     58.6   1.00
+
+16384      off     16385     2756.0   5945.2   1.00      0.0     0      0.0  16385     2756.0    64     57.0   1.00
+16384  recency     16385     2727.4   6008.5   1.01      0.0     0      0.0  16385     2727.4    64     53.3   1.07
+16384     retr     16385     2541.1   6449.5   1.08    157.1    64     30.8  16449     2538.9    64     62.5   0.91
+
+32768      off     32765     1777.7  18431.5   1.00      0.0     0      0.0  32765     1777.7    64     30.4   1.00
+32768  recency     32765     1774.8  18461.8   1.00      0.0     0      0.0  32765     1774.8    64     30.5   1.00
+32768     retr     32765     1338.1  24886.8   1.33   4659.0    64    135.7  32829     1334.4    64     30.8   0.99
+
+px = off_prefill_toks / mode_prefill_toks  (1.0 = same as stock)
+dx = off_decode_toks / mode_decode_toks    (1.0 = same as stock)
+retr tot_tok/s includes query-replay tokens in llama prompt eval.
+[speed-0.6B] rc=0 wall=478s
+
+========== speed-1.7B ==========
++ /home/leye/kvmem_llamacpp/scripts/prefill_speed.py --lengths 1024,4096,8192,16384,32768 -n 64 --warmup 1 --runs 2 --modes off,recency,retr -m /home/leye/kvmem_llamacpp/models/unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf
+model=Qwen3-1.7B-Q4_K_M.gguf warmup=1 runs=2 n_predict=64 device=RTX 5050
+modes: off | recency (no capture) | cap (retrieval capture, no replay) | retr (capture + score/writeback + query-last 64)
+
+  len     mode prefill_n    prefill       ms     px  retr_ms rep_n   rep_ms  tot_n  tot_tok/s gen_n   decode     dx
+-------------------------------------------------------------------------------------------------------------------
+ 1024      off      1025     3560.0    290.2   1.00      0.0     0      0.0   1025     3560.0    64     60.4   1.00
+ 1024  recency      1025     3834.9    267.4   0.93      0.0     0      0.0   1025     3834.9    64     64.7   0.93
+ 1024     retr      1025     2482.9    412.8   1.43     11.5    64     20.4   1089     2513.5    64     55.6   1.09
+
+ 4096      off      4095     3486.1   1174.7   1.00      0.0     0      0.0   4095     3486.1    64     40.8   1.00
+ 4096  recency      4095     3486.8   1174.5   1.00      0.0     0      0.0   4095     3486.8    64     40.4   1.01
+ 4096     retr      4095     3074.8   1331.8   1.13    107.3    64     22.4   4159     3071.1    64     43.5   0.94
+
+ 8192      off      8195     3076.6   2663.7   1.00      0.0     0      0.0   8195     3076.6    64     29.7   1.00
+ 8192  recency      8195     3052.9   2684.8   1.01      0.0     0      0.0   8195     3052.9    64     30.1   0.99
+ 8192     retr      8195     2820.7   2906.6   1.09     93.1    64     23.7   8259     2819.7    64     40.8   0.73
+
+16384      off     16385     2241.9   7313.2   1.00      0.0     0      0.0  16385     2241.9    64     43.3   1.00
+16384  recency     16385     2211.9   7413.5   1.01      0.0     0      0.0  16385     2211.9    64     44.4   0.98
+16384     retr     16385     2158.1   7593.9   1.04    324.6    64     38.3  16449     2155.6    64     49.9   0.87
+
+32768      off     32765     1590.0  20607.0   1.00      0.0     0      0.0  32765     1590.0    64     26.4   1.00
+32768  recency     32765     1557.8  21049.4   1.02      0.0     0      0.0  32765     1557.8    64     25.3   1.04
+32768     retr     32765     1363.7  24062.5   1.17   2559.2    64     54.6  32829     1363.3    64     28.5   0.93
+
+px = off_prefill_toks / mode_prefill_toks  (1.0 = same as stock)
+dx = off_decode_toks / mode_decode_toks    (1.0 = same as stock)
+retr tot_tok/s includes query-replay tokens in llama prompt eval.
+[speed-1.7B] rc=0 wall=512s
+
+========== SUMMARY ==========
+wall=1011s failed=none
+DONE

@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kvmem <kvmem@local>
+Date: Fri, 4 Sep 2026 22:18:37 +0800
+Subject: [PATCH 2/3] kvmem: capture pre-RoPE K/Q/V and expose V storage
+
+---
+ src/llama-context.cpp | 16 +++++++++++-
+ src/llama-graph.cpp   | 61 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-graph.h     |  8 ++++++
+ src/llama-kv-cache.h  |  1 +
+ src/models/qwen3.cpp  |  3 +++
+ 5 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f286bd1..177e47a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,6 +12,9 @@
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
++#if defined(LLAMA_KVMEM)
++#include "llama-kvmem-hooks.h"
++#endif
+ 
+ #include <cinttypes>
+ #include <cmath>
+@@ -1344,7 +1347,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
++    if (!graph_reuse_disable && res->can_reuse(gparams)
++#if defined(LLAMA_KVMEM)
++        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, ubatch.n_pos, ubatch.pos)
++#endif
++            ) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1363,6 +1370,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
++#if defined(LLAMA_KVMEM)
++        llama_kvmem_capture_on_new_graph();
++#endif
+         gf = model.build_graph(gparams);
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+@@ -1397,6 +1407,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++#if defined(LLAMA_KVMEM)
++    llama_kvmem_harvest_ubatch(sched.get());
++#endif
++
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 72db486..de59b4f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -15,6 +15,9 @@
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
++#if defined(LLAMA_KVMEM)
++#include "llama-kvmem-hooks.h"
++#endif
+ 
+ #include <cassert>
+ #include <cmath>
+@@ -1500,6 +1503,64 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+     }
+ }
+ 
++static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * src, int il, const char * tag) {
++#if defined(LLAMA_KVMEM)
++    const llama_kvmem_params * kp = llama_kvmem_get_params();
++    if (!src || !kp->enabled) {
++        return;
++    }
++    // Recency/identity does not need host raw-K. Skip pinning intermediates
++    // unless retrieval is on or an explicit dump is requested.
++    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
++        return;
++    }
++    // Keep the pre-RoPE tensor itself (rope_ext is not in-place). Avoids a
++    // per-layer GPU cpy; harvest reads this buffer after the full graph.
++    GGML_UNUSED(ctx0);
++    ggml_format_name(src, "kvmem_%s-%d", tag, il);
++    ggml_set_output(src);
++    ggml_build_forward_expand(gf, src);
++    llama_kvmem_register_capture(src, il, tag[0]);
++#else
++    GGML_UNUSED(ctx0);
++    GGML_UNUSED(gf);
++    GGML_UNUSED(src);
++    GGML_UNUSED(il);
++    GGML_UNUSED(tag);
++#endif
++}
++
++void llm_graph_context::kvmem_capture_k(ggml_tensor * k_prerope, int il) const {
++    // Decode is one token; raw-K/Q for retrieval were harvested in prefill.
++    // Skip the extra cpy nodes so generation is not paying D2H every step.
++    if (ubatch.n_tokens <= 1) {
++        return;
++    }
++    kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
++}
++
++void llm_graph_context::kvmem_capture_q(ggml_tensor * q, int il) const {
++    if (ubatch.n_tokens <= 1) {
++        return;
++    }
++    if (!llama_kvmem_ubatch_needs_q_capture(ubatch.n_tokens, ubatch.n_pos, ubatch.pos)) {
++        return;
++    }
++    kvmem_capture_impl(ctx0, gf, q, il, "q");
++}
++
++void llm_graph_context::kvmem_capture_v(ggml_tensor * v, int il) const {
++    // Prefill no longer copies V. Retrieval scores K; resident GPU V is reused.
++    // Evicted blocks D2H V in apply_plan_to_kv before seq_rm.
++    if (getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
++        return;
++    }
++    if (ubatch.n_tokens <= 1) {
++        return;
++    }
++    kvmem_capture_impl(ctx0, gf, v, il, "v");
++}
++
+ 
+ 
+ ggml_tensor * llm_graph_context::build_cvec(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b388e02..873f2eb 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1040,6 +1040,14 @@ struct llm_graph_context {
+ 
+     void cb(ggml_tensor * cur, const char * name, int il) const;
+ 
++    // KVMem: side-channel copies. No-ops unless LLAMA_KVMEM is enabled and
++    // llama_kvmem_get_params()->enabled. Q is copied only when the ubatch
++    // overlaps the retrieval query span. V is not copied in prefill (D2H on
++    // stage-out). Dest tensors are graph outputs named kvmem_{k,q,v}-<il>.
++    void kvmem_capture_k(ggml_tensor * k_prerope, int il) const;
++    void kvmem_capture_q(ggml_tensor * q, int il) const;
++    void kvmem_capture_v(ggml_tensor * v, int il) const;
++
+     //
+     // common
+     //
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699..f1f00f6 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -165,6 +165,7 @@ public:
+ 
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
++    ggml_tensor * get_v_storage(int32_t il) const;
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index f4b2a2a..d75c2db 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -88,6 +88,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
++            kvmem_capture_q(Qcur, il);
+             Qcur = ggml_rope_ext(
+                     ctx0, Qcur, inp_pos, nullptr,
+                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+@@ -97,6 +98,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+             cb(Kcur, "Kcur_normed", il);
+ 
++            kvmem_capture_k(Kcur, il);
+             Kcur = ggml_rope_ext(
+                     ctx0, Kcur, inp_pos, nullptr,
+                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+@@ -106,6 +108,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+             cb(Qcur, "Qcur", il);
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
++            kvmem_capture_v(Vcur, il);
+ 
+             cur = build_attn(inp_attn,
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
