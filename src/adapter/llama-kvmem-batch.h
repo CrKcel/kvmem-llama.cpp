@@ -10,7 +10,7 @@
 // Map each ubatch token to a cell in its block's GPU slot.
 // cell = gpu_slot * block_tokens + (orig_pos - orig_pos_start)
 // Slot number is not the window RoPE coordinate; cell.pos stays the original
-// (monotonic) token position. P1 does not re-RoPE.
+// (monotonic) token position. Dim 0 of M-RoPE batches is that sequential pos.
 bool kvmem_fill_slot_info(
         const kvmem::KvMemStore & store,
         uint32_t block_tokens,

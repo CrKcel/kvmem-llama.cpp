@@ -54,5 +54,13 @@ int main() {
 
     kvmem::rope_neox_apply(rc, src.data(), 1, 1, dst.data());
     CHECK(std::fabs(dst[0] - src[0]) > 1e-6f || std::fabs(dst[2] - src[2]) > 1e-6f);
+
+    // Hybrid: only attention layers are captured; layer 0 may stay empty.
+    kvmem::RawKvStore raw_h(cfg);
+    raw_h.write_layer_tokens(0, 2, 1, k.data(), v.data());
+    CHECK(raw_h.has_block(0));
+    CHECK(raw_h.n_tokens(0) == 2);
+    CHECK(raw_h.k(0, 0) == nullptr);
+    CHECK(raw_h.k(0, 1)[0] == 0.0f);
     return 0;
 }

@@ -71,6 +71,10 @@ def run_text(cli: Path, model: Path, extra: list[str], prompt: str, n: int) -> t
         "layout_orig_pos",
         "writeback",
         "KVMEM_TRACE mask last_pos",
+        "gdn_ckpt",
+        "gdn_restore",
+        "recr_seq_pos",
+        "recr_ckpt",
     )
     for ln in proc.stderr.splitlines():
         if any(k in ln for k in keys):

@@ -37,4 +37,14 @@ if (KVMEM_BUILD_LLAMA)
         llama.cpp/include)
     target_link_libraries(llama-kvmem-cli PRIVATE llama)
     target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
+
+    add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp)
+    target_include_directories(llama-kvmem-server PRIVATE
+        src/adapter
+        llama.cpp/include
+        llama.cpp/common
+        llama.cpp/vendor
+        llama.cpp/vendor/cpp-httplib)
+    target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib)
+    target_compile_features(llama-kvmem-server PRIVATE cxx_std_17)
 endif()

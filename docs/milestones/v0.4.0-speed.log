@@ -1,0 +1,38 @@
+========== 0.8B hybrid prefill+decode ==========
+model=Qwen3.5-0.8B-Q8_0.gguf warmup=1 runs=2 n_predict=64 device=RTX 5050
+modes: off | recency (no capture) | cap (retrieval capture, no replay) | retr (capture + score/writeback + query-last 64)
+
+  len     mode prefill_n    prefill       ms     px  retr_ms rep_n   rep_ms  tot_n  tot_tok/s gen_n   decode     dx
+-------------------------------------------------------------------------------------------------------------------
+ 1024      off      1025     5175.6    198.8   1.00      0.0     0      0.0   1025     5175.6    64    165.4   1.00
+ 1024  recency      1025     5327.3    192.6   0.97      0.0     0      0.0   1025     5327.3    64    170.2   0.97
+ 1024     retr      1025     5119.5    200.4   1.01      2.5    64     16.7   1089     5020.3    64    162.2   1.02
+
+ 4096      off      4095     5973.5    685.7   1.00      0.0     0      0.0   4095     5973.5    64     93.8   1.00
+ 4096  recency      4095     5975.5    685.3   1.00      0.0     0      0.0   4095     5975.5    64     91.5   1.03
+ 4096     retr      4095     5543.4    739.3   1.08      5.0    64     23.4   4159     5457.5    64    110.8   0.85
+
+ 8192      off      8195     5088.6   1610.5   1.00      0.0     0      0.0   8195     5088.6    64     88.6   1.00
+ 8192  recency      8195     5136.5   1595.5   0.99      0.0     0      0.0   8195     5136.5    64     90.0   0.98
+ 8192     retr      8195     4991.5   1641.8   1.02     10.0    64     20.4   8259     4968.7    64     92.9   0.95
+
+16384      off     16385     4593.3   3567.6   1.00      0.0     0      0.0  16385     4593.3    64     78.3   1.00
+16384  recency     16385     4575.0   3581.5   1.00      0.0     0      0.0  16385     4575.0    64     78.6   1.00
+16384     retr     16385     4558.9   3594.1   1.01     19.2    64     21.4  16449     4549.6    64     77.8   1.01
+
+px = off_prefill_toks / mode_prefill_toks  (1.0 = same as stock)
+dx = off_decode_toks / mode_decode_toks    (1.0 = same as stock)
+retr tot_tok/s includes query-replay tokens in llama prompt eval.
+========== 0.6B dense 4k regression ==========
+model=Qwen3-0.6B-Q8_0.gguf warmup=1 runs=2 n_predict=64 device=RTX 5050
+modes: off | recency (no capture) | cap (retrieval capture, no replay) | retr (capture + score/writeback + query-last 64)
+
+  len     mode prefill_n    prefill       ms     px  retr_ms rep_n   rep_ms  tot_n  tot_tok/s gen_n   decode     dx
+-------------------------------------------------------------------------------------------------------------------
+ 4096      off      4095     8012.2    511.2   1.00      0.0     0      0.0   4095     8012.2    64     84.9   1.00
+ 4096  recency      4095     7804.9    524.7   1.03      0.0     0      0.0   4095     7804.9    64     81.7   1.04
+ 4096     retr      4095     5195.1    805.2   1.54     87.0    64     15.3   4159     5173.3    64     90.6   0.94
+
+px = off_prefill_toks / mode_prefill_toks  (1.0 = same as stock)
+dx = off_decode_toks / mode_decode_toks    (1.0 = same as stock)
+retr tot_tok/s includes query-replay tokens in llama prompt eval.

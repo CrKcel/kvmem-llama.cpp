@@ -3,14 +3,17 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.3.0`](docs/milestones/v0.3.0.md)** (2026-09-04).
-llama.cpp can run KVMem. Product default `--kvmem` is retrieval + query-last 64.
-Identity and needle revival hold on Qwen3-0.6B / 1.7B (RTX 5050); prefill/decode
-through 16k is not badly degraded. P4 (hybrid) is not started.
+**Current local milestone: [`v0.4.0`](docs/milestones/v0.4.0.md)** (2026-09-05).
+llama.cpp can run KVMem on dense Qwen3 and hybrid Qwen3.5. Product default
+`--kvmem` is retrieval + query-last 64. Identity and needle revival hold on
+Qwen3.5-0.8B (RTX 5050); independent `llama-kvmem-server` smokes greedy +
+streaming. P6 (Metal/Vulkan) is not started.
 
 ## Layout
 
 - `kvmem/` — host library (selection, CPU/NVMe tiers, runtime). No llama.cpp.
+- `src/adapter/` — `llama_memory_i` wrapper (dense slot-pool + hybrid).
+- `tools/` — `llama-kvmem-cli`, `llama-kvmem-server`.
 - `scripts/` — ModelScope downloads and GPU device helpers.
 - `models/` — Unsloth GGUFs (gitignored).
 
@@ -26,24 +29,40 @@ through 16k is not badly degraded. P4 (hybrid) is not started.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.3.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.4.0` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.3.0
+git checkout v0.4.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh
 scripts/build-cuda.sh                # nvcc from ~/.cu13-env, sm_120
 .venv/bin/ctest --test-dir build --output-on-failure
-python3 scripts/identity_canary.py   # Qwen3-0.6B Q8_0 greedy on/off
-python3 scripts/speed_canary.py      # KVMem-on vs off tok/s on RTX 5050
+python3 scripts/identity_canary.py \
+  -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
+python3 scripts/needle_recall.py \
+  -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
+  --method retrieval --budget 256 --block-tokens 32
+python3 scripts/server_smoke.py      # independent llama-kvmem-server
 ```
 
-`llama-kvmem-cli` lands in `build/bin/`. This llama.cpp revision gates
-`llama-cli` on `LLAMA_BUILD_SERVER`; the upstream greedy binary is
-`llama-completion` (`-no-cnv --temp 0`). P1 identity compares
-`llama-kvmem-cli` with and without `--kvmem`.
+`llama-kvmem-cli` and `llama-kvmem-server` land in `build/bin/`. This
+llama.cpp revision gates `llama-cli` on `LLAMA_BUILD_SERVER`; the upstream
+greedy binary is `llama-completion` (`-no-cnv --temp 0`). P1 identity
+compares `llama-kvmem-cli` with and without `--kvmem`.
+
+Independent OpenAI-compatible server (P5, single slot, does not patch
+`llama-server`):
+
+```bash
+source scripts/gpu.sh small
+build/bin/llama-kvmem-server -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
+  --port 8080 -c 2048 --kvmem --kvmem-budget 256 -ngl 99
+# POST /v1/chat/completions  (greedy + stream)
+# last user message becomes the retrieval query span; optional body.kvmem.pin / force_substr
+python3 scripts/server_smoke.py
+```
 
 ## GPUs on this machine
 

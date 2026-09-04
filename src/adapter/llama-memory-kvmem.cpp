@@ -1,4 +1,5 @@
 #include "llama-memory-kvmem.h"
+#include "llama-memory-kvmem-hybrid.h"
 
 #include "llama-kvmem-batch.h"
 #include "llama-kvmem-capture.h"
@@ -8,6 +9,7 @@
 #include "llama-arch.h"
 #include "llama-cparams.h"
 #include "llama-impl.h"
+#include "llama-memory-recurrent.h"
 #include "llama-model.h"
 
 #include "ggml-backend.h"
@@ -135,6 +137,122 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
     return cfg;
 }
 
+static bool kvmem_cache_has_layer(const llama_kv_cache * kv, int32_t il) {
+    if (!kv) {
+        return false;
+    }
+    for (uint32_t id : kv->get_layer_ids()) {
+        if (static_cast<int32_t>(id) == il) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t kvmem_first_attn_layer(const llama_model & model) {
+    const uint32_t n = model.hparams.n_layer();
+    for (uint32_t il = 0; il < n; ++il) {
+        if (!model.hparams.is_recr(il)) {
+            return il;
+        }
+    }
+    return 0;
+}
+
+static uint32_t kvmem_n_attn_layers(const llama_model & model) {
+    const uint32_t n = model.hparams.n_layer();
+    uint32_t c = 0;
+    for (uint32_t il = 0; il < n; ++il) {
+        if (!model.hparams.is_recr(il)) {
+            ++c;
+        }
+    }
+    return c == 0 ? n : c;
+}
+
+struct kvmem_pool_plan {
+    uint32_t block_tokens = 32;
+    uint32_t budget = 0;
+    uint32_t gen_reserve = 0;
+    uint32_t kv_size = 0;
+    uint32_t n_slots = 0;
+    uint64_t block_bytes = 0;
+    uint32_t cap_blocks = 0;
+    uint64_t gpu_total = 0;
+};
+
+static kvmem_pool_plan kvmem_compute_pool(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) {
+    kvmem_pool_plan p;
+    p.block_tokens = g_kvmem_params.block_tokens ? g_kvmem_params.block_tokens : 32u;
+    uint32_t budget = g_kvmem_params.budget;
+    if (budget == 0) {
+        budget = kvmem_align_tokens(cparams.n_ctx_seq, p.block_tokens);
+        if (budget == 0) {
+            budget = p.block_tokens;
+        }
+    } else {
+        budget = kvmem_align_tokens(budget, p.block_tokens);
+    }
+    uint32_t gen_reserve = g_kvmem_params.gen_reserve ? g_kvmem_params.gen_reserve : 256u;
+    gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
+
+    const uint32_t il0 = kvmem_first_attn_layer(model);
+    const uint32_t n_attn = kvmem_n_attn_layers(model);
+    const uint32_t n_embd_k = model.hparams.n_embd_k_gqa(il0);
+    const uint32_t n_embd_v = model.hparams.n_embd_v_gqa(il0);
+    const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
+    const uint64_t v_row = ggml_row_size(params.type_v, n_embd_v);
+    p.block_bytes = static_cast<uint64_t>(n_attn) * (k_row + v_row) * p.block_tokens;
+
+    const double ratio = kvmem_default_ratio(g_kvmem_params.gpu_memory_ratio, 0.50);
+    p.gpu_total = kvmem_first_gpu_total_bytes();
+    if (p.gpu_total > 0 && p.block_bytes > 0 && ratio > 0.0) {
+        p.cap_blocks = static_cast<uint32_t>(
+                (p.gpu_total * ratio) / std::max(p.block_bytes, uint64_t{1}));
+    }
+
+    uint32_t pool = budget + gen_reserve;
+    if (pool > cparams.n_ctx_seq && g_kvmem_params.budget == 0) {
+        pool = cparams.n_ctx_seq;
+    }
+    if (p.cap_blocks > 0) {
+        const uint32_t cap_tokens = p.cap_blocks * p.block_tokens;
+        if (pool > cap_tokens) {
+            pool = cap_tokens;
+            if (budget >= pool) {
+                gen_reserve = std::min(gen_reserve, p.block_tokens);
+                budget = pool > gen_reserve ? pool - gen_reserve : pool;
+            } else if (budget + gen_reserve > pool) {
+                gen_reserve = pool - budget;
+            }
+            budget = kvmem_align_tokens(std::max(budget, p.block_tokens), p.block_tokens);
+            gen_reserve = kvmem_align_tokens(std::max(gen_reserve, p.block_tokens), p.block_tokens);
+            pool = budget + gen_reserve;
+            if (pool > cap_tokens) {
+                pool = cap_tokens;
+            }
+        }
+    }
+    p.budget = budget;
+    p.gen_reserve = gen_reserve;
+    p.kv_size = std::max(pool, 1u);
+    p.n_slots = (p.kv_size + p.block_tokens - 1) / p.block_tokens;
+    if (p.n_slots * p.block_tokens < p.kv_size) {
+        p.n_slots += 1;
+    }
+    return p;
+}
+
+uint32_t llama_kvmem_pool_cells(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) {
+    return kvmem_compute_pool(model, params, cparams).kv_size;
+}
+
 llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
@@ -142,19 +260,27 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
     if (!g_kvmem_params.enabled) {
         return nullptr;
     }
-    if (llm_arch_is_hybrid(model.arch) || llm_arch_is_recurrent(model.arch)) {
-        LLAMA_LOG_WARN("%s: KVMem P1 skips hybrid/recurrent arch %s\n",
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        // MTP draft heads stay on a plain attn KV cache. llama-kvmem-cli
+        // does not create an MTP context.
+        return nullptr;
+    }
+    if (llm_arch_is_recurrent(model.arch)) {
+        LLAMA_LOG_WARN("%s: KVMem skips purely recurrent arch %s\n",
                 __func__, llm_arch_name(model.arch));
         return nullptr;
     }
-    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        LLAMA_LOG_WARN("%s: KVMem P1 skips SWA models\n", __func__);
-        return nullptr;
-    }
     if (cparams.n_seq_max > 1) {
-        LLAMA_LOG_WARN("%s: KVMem P1 requires n_seq_max=1 (got %u)\n",
+        LLAMA_LOG_WARN("%s: KVMem requires n_seq_max=1 (got %u)\n",
                 __func__, cparams.n_seq_max);
         return nullptr;
+    }
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_WARN("%s: KVMem skips SWA models\n", __func__);
+        return nullptr;
+    }
+    if (llm_arch_is_hybrid(model.arch)) {
+        return new llama_memory_kvmem_hybrid(model, params, cparams);
     }
     return new llama_memory_kvmem(model, params, cparams);
 }
@@ -162,106 +288,66 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
 llama_memory_kvmem::llama_memory_kvmem(
         const llama_model & model,
         const llama_memory_params & params,
-        const llama_cparams & cparams) :
+        const llama_cparams & cparams,
+        llama_kv_cache * ext_kv) :
     model_(model) {
     backend_.owner = this;
     trace_ = getenv("KVMEM_TRACE") != nullptr;
 
-    block_tokens_ = g_kvmem_params.block_tokens ? g_kvmem_params.block_tokens : 32u;
-    uint32_t budget = g_kvmem_params.budget;
-    if (budget == 0) {
-        budget = kvmem_align_tokens(cparams.n_ctx_seq, block_tokens_);
-        if (budget == 0) {
-            budget = block_tokens_;
-        }
-    } else {
-        budget = kvmem_align_tokens(budget, block_tokens_);
-    }
-
-    uint32_t gen_reserve = g_kvmem_params.gen_reserve ? g_kvmem_params.gen_reserve : 256u;
-    gen_reserve = kvmem_align_tokens(gen_reserve, block_tokens_);
-
-    const uint32_t n_layer = model.hparams.n_layer();
-    const uint32_t n_embd_k = model.hparams.n_embd_k_gqa(0);
-    const uint32_t n_embd_v = model.hparams.n_embd_v_gqa(0);
-    const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
-    const uint64_t v_row = ggml_row_size(params.type_v, n_embd_v);
-    const uint64_t block_bytes = static_cast<uint64_t>(n_layer) * (k_row + v_row) * block_tokens_;
-
-    const double ratio = kvmem_default_ratio(g_kvmem_params.gpu_memory_ratio, 0.50);
-    const uint64_t gpu_total = kvmem_first_gpu_total_bytes();
-    uint32_t cap_blocks = 0;
-    if (gpu_total > 0 && block_bytes > 0 && ratio > 0.0) {
-        cap_blocks = static_cast<uint32_t>(
-                (gpu_total * ratio) / std::max(block_bytes, uint64_t{1}));
-    }
-
-    uint32_t pool = budget + gen_reserve;
-    if (pool > cparams.n_ctx_seq && g_kvmem_params.budget == 0) {
-        pool = cparams.n_ctx_seq;
-    }
-    if (cap_blocks > 0) {
-        const uint32_t cap_tokens = cap_blocks * block_tokens_;
-        if (pool > cap_tokens) {
-            pool = cap_tokens;
-            if (budget >= pool) {
-                gen_reserve = std::min(gen_reserve, block_tokens_);
-                budget = pool > gen_reserve ? pool - gen_reserve : pool;
-            } else if (budget + gen_reserve > pool) {
-                gen_reserve = pool - budget;
-            }
-            budget = kvmem_align_tokens(std::max(budget, block_tokens_), block_tokens_);
-            gen_reserve = kvmem_align_tokens(std::max(gen_reserve, block_tokens_), block_tokens_);
-            pool = budget + gen_reserve;
-            if (pool > cap_tokens) {
-                pool = cap_tokens;
-            }
-        }
-    }
-    kv_size_ = std::max(pool, 1u);
-    n_slots_ = (kv_size_ + block_tokens_ - 1) / block_tokens_;
-    // Last slot may be a partial block when kv_size is not a multiple of BT.
-    if (n_slots_ * block_tokens_ < kv_size_) {
-        n_slots_ += 1;
-    }
-    // llama_kv_cache size is the cell count, not rounded up past kv_size_.
-    // If n_slots * BT > kv_size, extra cells in the last slot simply do not exist;
-    // fill_slot_info rejects cell >= kv_size.
+    const kvmem_pool_plan pool = kvmem_compute_pool(model, params, cparams);
+    block_tokens_ = pool.block_tokens;
+    kv_size_ = pool.kv_size;
+    n_slots_ = pool.n_slots;
 
     auto rt_cfg = make_runtime_cfg(
-            block_tokens_, budget, g_kvmem_params.sink_tokens, g_kvmem_params.recent_tokens,
-            block_bytes);
-    rt_cfg.store.estimated_gpu_block_capacity = cap_blocks;
+            block_tokens_, pool.budget, g_kvmem_params.sink_tokens, g_kvmem_params.recent_tokens,
+            pool.block_bytes);
+    rt_cfg.store.estimated_gpu_block_capacity = pool.cap_blocks;
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg, &backend_);
 
-    kv_ = std::make_unique<llama_kv_cache>(
-            model,
-            model.hparams,
-            params.type_k,
-            params.type_v,
-            !cparams.flash_attn,
-            cparams.offload_kqv,
-            /* unified */ true,
-            kv_size_,
-            /* n_seq_max */ 1,
-            /* n_pad */ 1,
-            model.hparams.n_swa,
-            model.hparams.swa_type,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            "kvmem");
+    if (ext_kv) {
+        kv_ = ext_kv;
+        if (kv_->get_size() != kv_size_) {
+            LLAMA_LOG_WARN("%s: borrowed attn cache size %u != planned pool %u\n",
+                    __func__, kv_->get_size(), kv_size_);
+            kv_size_ = kv_->get_size();
+            n_slots_ = (kv_size_ + block_tokens_ - 1) / block_tokens_;
+            if (n_slots_ * block_tokens_ < kv_size_) {
+                n_slots_ += 1;
+            }
+        }
+    } else {
+        kv_owned_ = std::make_unique<llama_kv_cache>(
+                model,
+                model.hparams,
+                params.type_k,
+                params.type_v,
+                !cparams.flash_attn,
+                cparams.offload_kqv,
+                /* unified */ true,
+                kv_size_,
+                /* n_seq_max */ 1,
+                /* n_pad */ 1,
+                model.hparams.n_swa,
+                model.hparams.swa_type,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                "kvmem");
+        kv_ = kv_owned_.get();
+    }
 
     reset_slots();
 
+    const uint32_t il0 = kvmem_first_attn_layer(model);
     n_layer_ = model.hparams.n_layer();
-    n_embd_head_ = model.hparams.n_embd_head_k(0);
-    n_head_kv_ = model.hparams.n_head_kv(0);
-    n_head_ = model.hparams.n_head(0);
-    n_embd_k_ = model.hparams.n_embd_k_gqa(0);
-    n_embd_v_ = model.hparams.n_embd_v_gqa(0);
-    rope_.n_rot = model.hparams.n_rot(0);
+    n_embd_head_ = model.hparams.n_embd_head_k(il0);
+    n_head_kv_ = model.hparams.n_head_kv(il0);
+    n_head_ = model.hparams.n_head(il0);
+    n_embd_k_ = model.hparams.n_embd_k_gqa(il0);
+    n_embd_v_ = model.hparams.n_embd_v_gqa(il0);
+    rope_.n_rot = model.hparams.n_rot(il0);
     rope_.n_embd_head = n_embd_head_;
     rope_.n_head_kv = n_head_kv_;
     rope_.freq_base = cparams.rope_freq_base;
@@ -284,25 +370,28 @@ llama_memory_kvmem::llama_memory_kvmem(
     kvmem_capture_bind(this);
 
     size_t kv_bytes = 0;
-    for (const auto & kv : kv_->memory_breakdown()) {
-        kv_bytes += kv.second;
+    if (kv_) {
+        for (const auto & kv : kv_->memory_breakdown()) {
+            kv_bytes += kv.second;
+        }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s n_embd_k=%u\n",
-            __func__, kv_size_, n_slots_, block_tokens_, budget, gen_reserve,
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s n_embd_k=%u attn_layers=%u%s\n",
+            __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
-            n_embd_k_);
+            n_embd_k_, kvmem_n_attn_layers(model),
+            ext_kv ? " hybrid_attn" : "");
     fprintf(stderr,
             "KVMEM_KV_BYTES bytes=%zu cells=%u slots=%u budget=%u pool=%u "
             "ratio=%.2f high=%.2f low=%.2f cap_blocks=%u gpu_total=%llu block_bytes=%llu\n",
-            kv_bytes, kv_size_, n_slots_, budget, kv_size_,
+            kv_bytes, kv_size_, n_slots_, pool.budget, kv_size_,
             rt_cfg.store.gpu_memory_ratio,
             rt_cfg.store.gpu_high_watermark,
             rt_cfg.store.gpu_low_watermark,
-            cap_blocks,
-            (unsigned long long) gpu_total,
-            (unsigned long long) block_bytes);
+            pool.cap_blocks,
+            (unsigned long long) pool.gpu_total,
+            (unsigned long long) pool.block_bytes);
 }
 
 llama_memory_kvmem::~llama_memory_kvmem() {
@@ -317,6 +406,14 @@ void llama_memory_kvmem::reset_slots() {
     for (int32_t i = static_cast<int32_t>(n_slots_) - 1; i >= 0; --i) {
         free_slots_.push_back(i);
     }
+}
+
+void llama_memory_kvmem::reset_policy() {
+    if (runtime_) {
+        runtime_->truncate_to(0);
+    }
+    reset_slots();
+    retrieval_pinned_ = false;
 }
 
 int32_t llama_memory_kvmem::alloc_slot() {
@@ -625,6 +722,33 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     return true;
 }
 
+bool llama_memory_kvmem::prepare_ubatches(
+        const std::vector<llama_ubatch> & ubatches,
+        uint32_t n_new_tokens,
+        llama_kv_cache::slot_info_vec_t & sinfos) {
+    if (!prepare_working_set(n_new_tokens)) {
+        return false;
+    }
+    sinfos.clear();
+    sinfos.reserve(ubatches.size());
+    for (const auto & ubatch : ubatches) {
+        llama_kv_cache::slot_info sinfo;
+        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo)) {
+            return false;
+        }
+        sinfos.push_back(std::move(sinfo));
+    }
+    pos_queue_.clear();
+    for (const auto & ubatch : ubatches) {
+        std::vector<llama_pos> p(ubatch.n_tokens);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            p[i] = ubatch.pos ? ubatch.pos[i] : static_cast<llama_pos>(i);
+        }
+        pos_queue_.push_back(std::move(p));
+    }
+    return true;
+}
+
 llama_memory_context_ptr llama_memory_kvmem::init_batch(
         llama_batch_allocr & balloc,
         uint32_t n_ubatch,
@@ -647,37 +771,13 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
             break;
         }
 
-        const uint32_t n_new = balloc.get_n_tokens();
-        if (!prepare_working_set(n_new)) {
-            break;
-        }
-
         llama_kv_cache::slot_info_vec_t sinfos;
-        sinfos.reserve(ubatches.size());
-        bool ok = true;
-        for (const auto & ubatch : ubatches) {
-            llama_kv_cache::slot_info sinfo;
-            if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo)) {
-                ok = false;
-                break;
-            }
-            sinfos.push_back(std::move(sinfo));
-        }
-        if (!ok) {
+        if (!prepare_ubatches(ubatches, balloc.get_n_tokens(), sinfos)) {
             break;
-        }
-
-        pos_queue_.clear();
-        for (const auto & ubatch : ubatches) {
-            std::vector<llama_pos> p(ubatch.n_tokens);
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                p[i] = ubatch.pos ? ubatch.pos[i] : static_cast<llama_pos>(i);
-            }
-            pos_queue_.push_back(std::move(p));
         }
 
         return std::make_unique<llama_kv_cache_context>(
-                kv_.get(), std::move(sinfos), std::move(ubatches));
+                kv_, std::move(sinfos), std::move(ubatches));
     } while (false);
 
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -692,10 +792,10 @@ llama_memory_context_ptr llama_memory_kvmem::init_update(llama_context * lctx, b
 }
 
 void llama_memory_kvmem::clear(bool data) {
-    kv_->clear(data);
-    runtime_->truncate_to(0);
-    reset_slots();
-    retrieval_pinned_ = false;
+    if (kv_) {
+        kv_->clear(data);
+    }
+    reset_policy();
 }
 
 bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1222,6 +1322,9 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     std::vector<ggml_fp16_t> k16(n_embd_k_);
     std::vector<ggml_fp16_t> v16(n_embd_v_);
     for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
         const float * rk = raw_->k(block_id, il);
         const float * rv = raw_->v(block_id, il);
         if (!rk) {
@@ -1269,6 +1372,9 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
     for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
         for (uint32_t t = 0; t < block_tokens_; ++t) {
@@ -1305,6 +1411,9 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
     for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
         for (uint32_t t = 0; t < block_tokens_; ++t) {
@@ -1484,6 +1593,11 @@ void llama_memory_kvmem::trace_working_set(const char * tag) const {
             tag,
             cells.get_used(), cells.used_max_p1(), cells.size(),
             kv_->seq_pos_min(0), kv_->seq_pos_max(0));
+    if (recr_) {
+        fprintf(stderr,
+                "KVMEM_TRACE %s recr_seq_pos=[%d,%d]\n",
+                tag, recr_->seq_pos_min(0), recr_->seq_pos_max(0));
+    }
     const auto & store = runtime_->store();
     for (const auto & b : store.blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens == 0) {
@@ -1532,7 +1646,8 @@ void llama_memory_kvmem::kv_stats(const char * tag, const float * a, const float
 bool llama_memory_kvmem::read_gpu_block(uint32_t block_id, uint32_t il, bool is_k,
                                         std::vector<float> & out) const {
     const auto & store = runtime_->store();
-    if (block_id >= store.block_count() || il >= n_layer_) {
+    if (block_id >= store.block_count() || il >= n_layer_ ||
+        !kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
         return false;
     }
     const kvmem::KvMemBlock & blk = store.blocks()[block_id];
@@ -1663,5 +1778,20 @@ void llama_kvmem_set_replay(bool replay) {
 void llama_kvmem_trace_cells(struct llama_context * /*ctx*/, const char * tag) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->trace_working_set(tag ? tag : "cells");
+    }
+}
+
+bool llama_kvmem_has_recurrent(void) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    return mem && mem->has_recurrent();
+}
+
+void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos) {
+    g_kvmem_params.query_begin = query_begin;
+    g_kvmem_params.query_end = query_end;
+    g_kvmem_params.force_pos = force_pos;
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->set_query_span(query_begin, query_end);
+        mem->set_force_pos(force_pos);
     }
 }

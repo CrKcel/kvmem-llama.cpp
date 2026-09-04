@@ -298,16 +298,51 @@ int main(int argc, char ** argv) {
         fflush(stdout);
     }
 
-    int n_pos = 0;
-    while (n_pos < n_prompt) {
-        const int n = std::min(n_batch, n_prompt - n_pos);
-        llama_batch batch = llama_batch_get_one(prompt_tokens.data() + n_pos, n);
-        const int rc = llama_decode(ctx, batch);
-        if (rc != 0) {
-            fprintf(stderr, "llama_decode(prefill) failed rc=%d at pos=%d n=%d\n", rc, n_pos, n);
+    auto decode_span = [&](int pos0, int pos1, const char * what) -> int {
+        int n_pos = pos0;
+        while (n_pos < pos1) {
+            const int n = std::min(n_batch, pos1 - n_pos);
+            llama_batch batch = llama_batch_get_one(prompt_tokens.data() + n_pos, n);
+            const int rc = llama_decode(ctx, batch);
+            if (rc != 0) {
+                fprintf(stderr, "llama_decode(%s) failed rc=%d at pos=%d n=%d\n",
+                        what, rc, n_pos, n);
+                return rc;
+            }
+            n_pos += n;
+        }
+        return 0;
+    };
+
+    const bool do_retr = kparams.enabled && kparams.method == 1 && kparams.query_begin > 0;
+    const bool recr_ckpt = do_retr && llama_kvmem_has_recurrent();
+    const int prefix_end = recr_ckpt ? kparams.query_begin : n_prompt;
+
+    if (decode_span(0, prefix_end, "prefill") != 0) {
+        return 1;
+    }
+
+    std::vector<uint8_t> gdn_ckpt;
+    if (recr_ckpt) {
+        llama_synchronize(ctx);
+        llama_kvmem_trace_cells(ctx, "before_gdn_ckpt");
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        const size_t sz = llama_state_seq_get_size_ext(ctx, 0, fl);
+        if (sz == 0) {
+            fprintf(stderr, "llama_state_seq_get_size_ext(PARTIAL_ONLY) returned 0\n");
             return 1;
         }
-        n_pos += n;
+        gdn_ckpt.resize(sz);
+        const size_t ncopy = llama_state_seq_get_data_ext(ctx, gdn_ckpt.data(), sz, 0, fl);
+        if (ncopy != sz) {
+            fprintf(stderr, "GDN checkpoint copy failed (%zu != %zu)\n", ncopy, sz);
+            return 1;
+        }
+        fprintf(stderr, "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu query_begin=%d\n",
+                prefix_end, sz, kparams.query_begin);
+        if (decode_span(prefix_end, n_prompt, "prefill-query") != 0) {
+            return 1;
+        }
     }
     llama_synchronize(ctx);
 
@@ -325,11 +360,22 @@ int main(int argc, char ** argv) {
         llama_kvmem_dump_kv_writeback(ctx, -1);
     }
 
-    if (kparams.enabled && kparams.method == 1 && kparams.query_begin > 0) {
+    if (do_retr) {
         const auto t0 = std::chrono::steady_clock::now();
         llama_kvmem_apply_retrieval(ctx);
         retrieval_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
+        if (recr_ckpt && !gdn_ckpt.empty()) {
+            const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            const size_t nset = llama_state_seq_set_data_ext(
+                    ctx, gdn_ckpt.data(), gdn_ckpt.size(), 0, fl);
+            if (nset != gdn_ckpt.size()) {
+                fprintf(stderr, "GDN restore failed (%zu != %zu)\n", nset, gdn_ckpt.size());
+                return 1;
+            }
+            fprintf(stderr, "KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
+            llama_kvmem_trace_cells(ctx, "after_gdn_restore");
+        }
         llama_memory_t mem = llama_get_memory(ctx);
         llama_kvmem_set_replay(true);
         if (mem) {
@@ -362,7 +408,8 @@ int main(int argc, char ** argv) {
             }
         }
         llama_kvmem_set_replay(false);
-        fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d\n", q0, qn);
+        fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
+                q0, qn, (int) recr_ckpt);
         llama_kvmem_trace_cells(ctx, "after_query_replay");
     }
 

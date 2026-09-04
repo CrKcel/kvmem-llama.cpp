@@ -8,13 +8,11 @@ bool kvmem_fill_slot_info(
         uint32_t kv_size,
         const llama_ubatch & ubatch,
         llama_kv_cache::slot_info & out) {
-    if (ubatch.n_tokens == 0 || block_tokens == 0) {
+    if (ubatch.n_tokens == 0 || block_tokens == 0 || !ubatch.pos) {
         return false;
     }
-    if (ubatch.n_pos > 1) {
-        LLAMA_LOG_ERROR("%s: KVMem P1 does not support multi-position (M-RoPE) batches\n", __func__);
-        return false;
-    }
+    // n_pos > 1 is M-RoPE. Dim 0 is the sequential token position (text
+    // tokens broadcast that value across the other dims).
 
     out.s0 = 0;
     out.s1 = 0;

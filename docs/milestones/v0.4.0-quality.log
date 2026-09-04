@@ -1,0 +1,70 @@
+# v0.4.0 quality excerpts (RTX 5050, 2026-09-04)
+# Device: NVIDIA GeForce RTX 5050 Laptop GPU, CUDA_DEVICE_ORDER=PCI_BUS_ID
+# UUID GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29
+
+========== host raw_kv_store_test ==========
+RAW_TEST_OK
+
+========== identity-0.8B (Qwen3.5-0.8B-Q8_0, recency, budget=n_ctx) ==========
+off [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 4862, 20316, 364, 821, 1118, 1007]
+on  [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 4862, 20316, 364, 821, 1118, 1007]
+PASS: identity (KVMem-on greedy tokens == KVMem-off)
+
+========== needle-recency-0.8B budget=256 bt=32 ==========
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=839
+PASS: recency budget=256 bt=32 did not recall the middle needle
+
+========== needle-retr-0.8B ranker (after RawKvStore any-layer-K fix) ==========
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=839
+   KVMEM_KV_BYTES bytes=4718592 cells=384 slots=12 budget=256 pool=384 ratio=0.50 high=0.95 low=0.85 cap_blocks=10867 gpu_total=8546549760 block_bytes=393216
+   KVMEM_TRACE gdn_ckpt pos_end=775 bytes=20201932 query_begin=775
+   KVMEM_TRACE retrieval stage_in=4 stage_out=4 skip=5 gpu_reused=4 window=231 free_slots=4
+   KVMEM_TRACE selected 0 1 4 5 13 24 25 26
+   KVMEM_KV L23 K rebuild_vs_gpu n=16384 cos=1.000000 rmse=0.000303 maxabs=0.001953 rms_gpu=1.459127
+   KVMEM_TRACE stage_in_raw block=13 slot=4 n=32 orig=416
+   KVMEM_KV --- after stage_in_raw block 1 ---
+   KVMEM_KV L23 K rebuild_vs_gpu n=16384 cos=1.000000 rmse=0.000297 maxabs=0.001931 rms_gpu=1.438801
+   KVMEM_KV L23 V raw_vs_gpu (no rope) n=16384 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=2.360393
+   KVMEM_TRACE occupy tag=after_retrieval block=13 slot=4 cell=128 empty=0 pos=416 last_empty=0 last_pos=447 n=32 orig=416
+   KVMEM_TRACE gdn_restore bytes=20201932
+   KVMEM_TRACE after_gdn_restore recr_seq_pos=[774,774]
+   KVMEM_TRACE query_replay begin=775 n=64 recr_ckpt=1
+   KVMEM_TRACE after_query_replay recr_seq_pos=[838,838]
+output:  BLUEBIRD-42.
+The secret code is BLUEBIRD-42.
+PASS: retrieval budget=256 bt=32 revived the middle needle
+
+========== needle-retr-0.6B dense regression ==========
+PASS: retrieval budget=256 bt=32 revived the middle needle
+
+========== needle-retr-4B ranker (Qwen3.5-4B-Q4_K_M) ==========
+     Device 0: NVIDIA GeForce RTX 5050 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+   KVMEM_TRACE n_prompt=839
+   KVMEM_TRACE gdn_ckpt pos_end=775 bytes=52691548 query_begin=775
+   KVMEM_TRACE retrieval stage_in=4 stage_out=4 skip=6 gpu_reused=4 window=231 free_slots=4
+   KVMEM_TRACE selected 0 1 2 12 13 24 25 26
+   KVMEM_KV L31 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000297 maxabs=0.001933 rms_gpu=1.444575
+   KVMEM_TRACE stage_in_raw block=12 slot=3 n=32 orig=384
+   KVMEM_TRACE stage_in_raw block=13 slot=4 n=32 orig=416
+   KVMEM_KV --- after stage_in_raw block 1 ---
+   KVMEM_KV L31 K rebuild_vs_gpu n=32768 cos=1.000000 rmse=0.000302 maxabs=0.001945 rms_gpu=1.438388
+   KVMEM_KV L31 V raw_vs_gpu (no rope) n=32768 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=3.295371
+   KVMEM_TRACE gdn_restore bytes=52691548
+   KVMEM_TRACE query_replay begin=775 n=64 recr_ckpt=1
+NOTE: retrieval budget=256 bt=32 did not print BLUEBIRD-42
+GO/NO-GO: retrieval needle miss at this budget — not an automatic stop
+
+========== P5 server_smoke.py (Qwen3.5-0.8B-Q8_0, port 18181) ==========
+llama-kvmem-server listening on http://127.0.0.1:18181  model=Qwen3.5-0.8B-Q8_0.gguf kvmem=1 method=retrieval n_ctx=2048
+PASS: greedy /v1/chat/completions -> Hello!
+PASS: streaming /v1/chat/completions
+PASS: query-conditioned request printed retrieval TRACE
+retrieval output: Based on the notes provided, the secret code is **BLUEBIRD-42**.
+SMOKE_RC:0
+   KVMEM_TRACE n_prompt=850 query=[835,850) force_pos=-1 last_user_chars=24
+   KVMEM_TRACE retrieval stage_in=6 stage_out=6 skip=6 gpu_reused=2 window=242 free_slots=8
+   KVMEM_TRACE selected 0 1 2 3 4 13 14 26
+   KVMEM_TRACE gdn_restore bytes=20201932
+   KVMEM_TRACE query_replay begin=835 n=15 recr_ckpt=1

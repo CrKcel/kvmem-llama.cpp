@@ -1,6 +1,6 @@
 # KVMem × llama.cpp 修改计划
 
-**状态（2026-09-04）：** P0–P3 已在本机打成 milestone **`v0.3.0`**（tag `v0.3.0`）。llama.cpp 能跑 KVMem；产品默认 `--kvmem` = retrieval + query-last 64。阶段测试记录见 [milestones/v0.3.0.md](milestones/v0.3.0.md)。**P4 未开始。**
+**状态（2026-09-05）：** P0–P3 已在本机打成 milestone **`v0.3.0`**。P4–P5 打成 **`v0.4.0`**（tag `v0.4.0`，v1.5 hybrid + serving）。llama.cpp 能跑 dense Qwen3 和 hybrid Qwen3.5；产品默认 `--kvmem` = retrieval + query-last 64。阶段测试记录见 [milestones/v0.4.0.md](milestones/v0.4.0.md)。**P4-1 已过关：** Qwen3.5-0.8B 短上下文 identity（RTX 5050，attn=KVMem 槽位池，recr=stock GDN）。**P4-2 已过关：** query 边界 `PARTIAL_ONLY` checkpoint GDN，只重放 query 后缀；0.8B ranker 召回 BLUEBIRD-42。**P5 已过关：** 独立 `llama-kvmem-server`，`/v1/chat/completions` greedy + streaming；last-user query span + retrieval TRACE。P6 未开始。
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**
 

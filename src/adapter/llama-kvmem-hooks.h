@@ -60,6 +60,10 @@ LLAMA_API bool llama_kvmem_capture_can_reuse(uint32_t n_tokens, uint32_t n_pos,
 LLAMA_API void llama_kvmem_apply_retrieval(struct llama_context * ctx);
 LLAMA_API void llama_kvmem_set_replay(bool replay);
 LLAMA_API void llama_kvmem_trace_cells(struct llama_context * ctx, const char * tag);
+// True when the active KVMem memory is hybrid (attn slot-pool + stock GDN).
+LLAMA_API bool llama_kvmem_has_recurrent(void);
+// Update query span / force_pos on the live memory (after llama_init_from_model).
+LLAMA_API void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos);
 // Compare never-evicted GPU KV vs host-rebuild from raw-K. block_id -1 = force_pos block.
 LLAMA_API void llama_kvmem_dump_kv_compare(struct llama_context * ctx, int32_t block_id);
 LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t block_id);

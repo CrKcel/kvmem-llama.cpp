@@ -52,15 +52,27 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
 }
 
 bool RawKvStore::has_block(uint32_t block_id) const {
-    return block_id < blocks_.size() && !blocks_[block_id].layers.empty() &&
-           blocks_[block_id].layers[0].n_tokens > 0;
+    if (block_id >= blocks_.size()) {
+        return false;
+    }
+    // Hybrid models only capture attention layers; layer 0 may be GDN.
+    for (const auto & lb : blocks_[block_id].layers) {
+        if (lb.n_tokens > 0 && !lb.k.empty()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
-    if (block_id >= blocks_.size() || blocks_[block_id].layers.empty()) {
+    if (block_id >= blocks_.size()) {
         return 0;
     }
-    return blocks_[block_id].layers[0].n_tokens;
+    uint32_t n = 0;
+    for (const auto & lb : blocks_[block_id].layers) {
+        n = std::max(n, lb.n_tokens);
+    }
+    return n;
 }
 
 const float * RawKvStore::k(uint32_t block_id, uint32_t il) const {

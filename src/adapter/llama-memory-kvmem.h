@@ -15,6 +15,7 @@ struct llama_model;
 struct llama_cparams;
 struct llama_memory_params;
 struct ggml_tensor;
+class llama_memory_recurrent;
 
 // Bounded block-slot pool over a llama_kv_cache.
 //
@@ -27,7 +28,8 @@ public:
     llama_memory_kvmem(
             const llama_model & model,
             const llama_memory_params & params,
-            const llama_cparams & cparams);
+            const llama_cparams & cparams,
+            llama_kv_cache * ext_kv = nullptr);
 
     ~llama_memory_kvmem() override;
 
@@ -58,13 +60,21 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
-    llama_kv_cache * get_kv() { return kv_.get(); }
+    llama_kv_cache * get_kv() { return kv_; }
     kvmem::KvMemRuntime & runtime() { return *runtime_; }
     const kvmem::KvMemRuntime & runtime() const { return *runtime_; }
 
     uint32_t kv_size() const { return kv_size_; }
     uint32_t block_tokens() const { return block_tokens_; }
     uint32_t n_slots() const { return n_slots_; }
+
+    // Slot-pool prepare used by both the dense KVMem memory and the hybrid
+    // wrapper (attn half). Fills per-ubatch slot_info and the capture pos queue.
+    bool prepare_ubatches(
+            const std::vector<llama_ubatch> & ubatches,
+            uint32_t n_new_tokens,
+            llama_kv_cache::slot_info_vec_t & sinfos);
+    void reset_policy();
 
     int32_t alloc_slot();
     void free_slot(int32_t slot);
@@ -82,6 +92,13 @@ public:
     void trace_working_set(const char * tag) const;
     void set_replay(bool replay) { replay_ = replay; }
     bool replay() const { return replay_; }
+    void set_recurrent(llama_memory_recurrent * recr) { recr_ = recr; }
+    bool has_recurrent() const { return recr_ != nullptr; }
+    void set_query_span(int32_t begin, int32_t end) {
+        query_begin_ = begin;
+        query_end_ = end;
+    }
+    void set_force_pos(int32_t pos) { force_pos_ = pos; }
 
     kvmem::RawKvStore & raw() { return *raw_; }
 
@@ -138,7 +155,9 @@ private:
     uint32_t n_slots_ = 0;
     bool trace_ = false;
 
-    std::unique_ptr<llama_kv_cache> kv_;
+    std::unique_ptr<llama_kv_cache> kv_owned_;
+    llama_kv_cache * kv_ = nullptr;
+    llama_memory_recurrent * recr_ = nullptr;
     SlotBackend backend_;
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
@@ -175,3 +194,11 @@ private:
     std::vector<std::vector<float>> q_sum_;
     std::vector<uint32_t> q_count_;
 };
+
+// GPU attn-cache cell count for a KVMem slot pool (budget + gen_reserve,
+// clamped to n_ctx on identity). Hybrid uses this as llama_memory_hybrid's
+// attn kv_size so the two halves agree.
+uint32_t llama_kvmem_pool_cells(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams);
