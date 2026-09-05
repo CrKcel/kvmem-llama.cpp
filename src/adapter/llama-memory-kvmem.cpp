@@ -336,6 +336,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     backend_.owner = this;
     trace_ = getenv("KVMEM_TRACE") != nullptr;
     perf_.enabled = kvmem_env_perf();
+    retr_.enabled = perf_.enabled;
     harvest_perf_emit_graph_line();
 
     const kvmem_pool_plan pool = kvmem_compute_pool(model, params, cparams);
@@ -696,6 +697,7 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             (ggml_row_size(type_k_, n_embd_k_) + ggml_row_size(type_v_, n_embd_v_)) *
             block_tokens_;
     std::vector<std::vector<uint8_t>> payloads(items.size());
+    const int64_t t_d2h = ggml_time_us();
     for (size_t i = 0; i < items.size(); ++i) {
         if (!items[i].resident || payload_bytes == 0) {
             continue;
@@ -703,6 +705,9 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         payloads[i].assign(static_cast<size_t>(payload_bytes), 0);
         copy_gpu_block_to_host(items[i].id, items[i].slot,
                                payloads[i].data(), payload_bytes);
+    }
+    if (retr_.enabled) {
+        retr_.layout_d2h_us += ggml_time_us() - t_d2h;
     }
     for (const auto & it : items) {
         kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
@@ -731,13 +736,22 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
                              store.blocks()[items[i].id].nvme_slot);
         if (items[i].resident && !payloads[i].empty()) {
             occupy_block_cells(items[i].id);
+            const int64_t t_h2d = ggml_time_us();
             copy_gpu_block_from_host(items[i].id, slot,
                                      payloads[i].data(), payload_bytes);
+            if (retr_.enabled) {
+                retr_.layout_h2d_us += ggml_time_us() - t_h2d;
+            }
             n_move++;
         } else {
             write_block_to_gpu(items[i].id);
             n_raw++;
         }
+    }
+    if (retr_.enabled) {
+        retr_.n_move += n_move;
+        retr_.n_raw += n_raw;
+        retr_.laid_out = 1;
     }
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u\n", n_move, n_raw);
@@ -1731,15 +1745,24 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
         }
+        const int64_t t_copy = ggml_time_us();
         if (!raw_->copy_k(block_id, il, rk.data())) {
             continue;
         }
         const bool have_v = raw_->copy_v(block_id, il, rv.data());
+        if (retr_.enabled) {
+            retr_.copy_us += ggml_time_us() - t_copy;
+        }
+        const int64_t t_rope = ggml_time_us();
         kvmem::rope_neox_apply(rope_, rk.data(), nt, static_cast<int32_t>(blk.orig_pos_start), roped.data());
+        if (retr_.enabled) {
+            retr_.rope_us += ggml_time_us() - t_rope;
+        }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
         const size_t krow = ggml_row_size(type_k_, n_embd_k_);
         const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+        const int64_t t_set = ggml_time_us();
         for (uint32_t t = 0; t < nt; ++t) {
             const uint32_t cell = sinfo.idxs[0][t];
             const float * src = roped.data() + t * n_embd_k_;
@@ -1758,6 +1781,9 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
                     ggml_backend_tensor_set(vt, vs, cell * vrow, vrow);
                 }
             }
+        }
+        if (retr_.enabled) {
+            retr_.set_us += ggml_time_us() - t_set;
         }
     }
     if (trace_) {
@@ -1893,16 +1919,55 @@ void llama_memory_kvmem::score_retrieval() {
     store.set_retrieval_scores(scores);
 }
 
+void llama_memory_kvmem::retr_perf_print() {
+    if (!retr_.enabled) {
+        return;
+    }
+    fprintf(stderr,
+            "KVMEM_RETR_SUM total_ms=%.3f flush_ms=%.3f score_ms=%.3f plan_ms=%.3f "
+            "stage_out_ms=%.3f layout_d2h_ms=%.3f layout_h2d_ms=%.3f "
+            "copy_ms=%.3f rope_ms=%.3f set_ms=%.3f mtp_ms=%.3f dump_ms=%.3f "
+            "n_move=%u n_raw=%u n_skip=%u n_stage_in=%u laid_out=%d\n",
+            retr_.total_us / 1000.0, retr_.flush_us / 1000.0, retr_.score_us / 1000.0,
+            retr_.plan_us / 1000.0, retr_.stage_out_us / 1000.0,
+            retr_.layout_d2h_us / 1000.0, retr_.layout_h2d_us / 1000.0,
+            retr_.copy_us / 1000.0, retr_.rope_us / 1000.0, retr_.set_us / 1000.0,
+            retr_.mtp_us / 1000.0, retr_.dump_us / 1000.0,
+            retr_.n_move, retr_.n_raw, retr_.n_skip, retr_.n_stage_in, retr_.laid_out);
+}
+
 void llama_memory_kvmem::apply_retrieval() {
-    harvest_flush();
+    const int64_t t_all = ggml_time_us();
+    if (retr_.enabled) {
+        const bool on = retr_.enabled;
+        retr_ = RetrPerf{};
+        retr_.enabled = on;
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        harvest_flush();
+        if (retr_.enabled) {
+            retr_.flush_us += ggml_time_us() - t0;
+        }
+    }
     if (trace_ && raw_) {
         fprintf(stderr, "KVMEM_TRACE raw_store bytes_k=%zu bytes_v=%zu\n",
                 raw_->bytes_k(), raw_->bytes_v());
     }
     if (method_ != 1) {
+        if (retr_.enabled) {
+            retr_.total_us = ggml_time_us() - t_all;
+            retr_perf_print();
+        }
         return;
     }
-    score_retrieval();
+    {
+        const int64_t t0 = ggml_time_us();
+        score_retrieval();
+        if (retr_.enabled) {
+            retr_.score_us += ggml_time_us() - t0;
+        }
+    }
     std::vector<uint32_t> mandatory;
     if (query_begin_ >= 0) {
         const uint32_t qe = query_end_ > 0 ? static_cast<uint32_t>(query_end_)
@@ -1923,7 +1988,20 @@ void llama_memory_kvmem::apply_retrieval() {
             }
         }
     }
-    const kvmem::KvMemPlan plan = runtime_->prepare_reselect(mandatory);
+    kvmem::KvMemPlan plan;
+    {
+        const int64_t t0 = ggml_time_us();
+        plan = runtime_->prepare_reselect(mandatory);
+        if (retr_.enabled) {
+            retr_.plan_us += ggml_time_us() - t0;
+            retr_.n_stage_in = static_cast<uint32_t>(plan.stage_in.size());
+            for (const auto & r : plan.remaps) {
+                if (r.skip) {
+                    retr_.n_skip++;
+                }
+            }
+        }
+    }
     trace_plan("retrieval", plan);
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE selected");
@@ -1932,16 +2010,27 @@ void llama_memory_kvmem::apply_retrieval() {
         }
         fprintf(stderr, "\n");
     }
-    apply_plan_to_kv(plan);
+    {
+        const int64_t t0 = ggml_time_us();
+        apply_plan_to_kv(plan);
+        if (retr_.enabled) {
+            retr_.stage_out_us += ggml_time_us() - t0;
+        }
+    }
     auto & store = runtime_->store();
     retrieval_pinned_ = true;
     if (mtp_) {
+        const int64_t t0 = ggml_time_us();
         mtp_->harvest_resident_v();
+        if (retr_.enabled) {
+            retr_.mtp_us += ggml_time_us() - t0;
+        }
     }
     // Native GPU KV of a reused block at orig_pos != 0 is the ground truth for
     // host RoPE + capture layout. Prefer a block that is NOT in stage_in so the
     // slot still holds prefill bytes. Must run before layout rewrite.
     if (trace_) {
+        const int64_t t_dump = ggml_time_us();
         std::vector<bool> is_stage_in(store.block_count(), false);
         for (uint32_t id : plan.stage_in) {
             if (id < is_stage_in.size()) {
@@ -1962,6 +2051,9 @@ void llama_memory_kvmem::apply_retrieval() {
             dump_kv_compare(static_cast<int32_t>(r.block_id), false);
             break;
         }
+        if (retr_.enabled) {
+            retr_.dump_us += ggml_time_us() - t_dump;
+        }
     }
     const bool laid_out = layout_gpu_slots_by_orig_pos();
     uint32_t n_raw = 0;
@@ -1978,12 +2070,18 @@ void llama_memory_kvmem::apply_retrieval() {
             write_block_to_gpu(id);
             n_raw++;
         }
+        if (retr_.enabled) {
+            retr_.n_raw += n_raw;
+            retr_.n_skip += n_skip;
+            retr_.laid_out = 0;
+        }
     }
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE writeback laid_out=%d raw=%u skip_resident=%u stage_in=%zu\n",
                 (int) laid_out, n_raw, n_skip, plan.stage_in.size());
     }
     if (trace_) {
+        const int64_t t_dump = ggml_time_us();
         for (uint32_t id : plan.stage_in) {
             if (id < store.block_count() && store.blocks()[id].gpu_slot >= 0) {
                 fprintf(stderr, "KVMEM_KV --- after stage_in_raw block %u ---\n", id);
@@ -1992,9 +2090,20 @@ void llama_memory_kvmem::apply_retrieval() {
             }
         }
         trace_working_set("after_retrieval");
+        if (retr_.enabled) {
+            retr_.dump_us += ggml_time_us() - t_dump;
+        }
     }
     if (mtp_) {
+        const int64_t t0 = ggml_time_us();
         mtp_->follow_retrieval();
+        if (retr_.enabled) {
+            retr_.mtp_us += ggml_time_us() - t0;
+        }
+    }
+    if (retr_.enabled) {
+        retr_.total_us = ggml_time_us() - t_all;
+        retr_perf_print();
     }
 }
 

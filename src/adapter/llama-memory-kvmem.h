@@ -178,6 +178,7 @@ private:
     bool d2h_submit(struct ggml_backend * be);
     bool harvest_perf_on() const { return perf_.enabled; }
     void harvest_perf_emit_graph_line();
+    void retr_perf_print();
     void harvest_worker_start();
     void harvest_worker_stop();
     void harvest_loop();
@@ -211,6 +212,27 @@ private:
         int64_t last_nvme_us = 0;
         uint64_t last_nvme_bytes = 0;
         uint64_t last_nvme_syscalls = 0;
+    };
+
+    struct RetrPerf {
+        bool enabled = false;
+        int64_t total_us = 0;
+        int64_t flush_us = 0;
+        int64_t score_us = 0;
+        int64_t plan_us = 0;
+        int64_t stage_out_us = 0;
+        int64_t layout_d2h_us = 0;
+        int64_t layout_h2d_us = 0;
+        int64_t copy_us = 0;
+        int64_t rope_us = 0;
+        int64_t set_us = 0;
+        int64_t mtp_us = 0;
+        int64_t dump_us = 0;
+        uint32_t n_move = 0;
+        uint32_t n_raw = 0;
+        uint32_t n_skip = 0;
+        uint32_t n_stage_in = 0;
+        int laid_out = 0;
     };
 
     const llama_model & model_;
@@ -266,6 +288,7 @@ private:
     };
     std::unique_ptr<HarvestWorker> harvest_w_;
     HarvestPerf perf_;
+    RetrPerf retr_;
     std::vector<std::vector<float>> q_sum_;
     std::vector<uint32_t> q_count_;
 };
