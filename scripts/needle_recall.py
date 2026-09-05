@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Needle canary: recency should miss a mid-prompt fact; retrieval may revive it.
 
-Uses RTX 5050 only.
+Default GPU is the 5050 (`--gpu small`). 27B must use `--gpu 27b` (5090).
 """
 from __future__ import annotations
 
@@ -29,21 +29,32 @@ def find_cli() -> Path:
     raise SystemExit("llama-kvmem-cli not found; run scripts/build-cuda.sh")
 
 
-def make_prompt() -> str:
+def make_prompt(no_think: bool = False) -> str:
     filler = " lorem ipsum dolor sit amet" * 80
-    return (
+    body = (
         "Read the following notes and then answer: what is the secret code?\n"
         + filler
         + "\n"
         + NEEDLE
         + "\n"
         + filler
-        + "\nQuestion: what is the secret code? Answer:"
+        + "\nQuestion: what is the secret code?"
+    )
+    if not no_think:
+        return body + " Answer:"
+    # Qwen3 / 3.5 / 3.8 enable_thinking=false: empty think block, then answer.
+    return (
+        "<|im_start|>user\n"
+        + body
+        + "<|im_end|>\n"
+        + "<|im_start|>assistant\n"
+        + "<think>\n\n</think>\n\n"
     )
 
 
-def run_text(cli: Path, model: Path, extra: list[str], prompt: str, n: int) -> tuple[str, str]:
-    env = gpu_env.apply_gpu(os.environ.copy(), "small")
+def run_text(cli: Path, model: Path, extra: list[str], prompt: str, n: int,
+             gpu: str = "small") -> tuple[str, str]:
+    env = gpu_env.apply_gpu(os.environ.copy(), gpu)
     env.setdefault("KVMEM_TRACE", "1")
     cmd = [
         str(cli), "-m", str(model), "-n", str(n), "-ngl", "99", "--no-prompt",
@@ -53,7 +64,7 @@ def run_text(cli: Path, model: Path, extra: list[str], prompt: str, n: int) -> t
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(f"command failed rc={proc.returncode}")
-    gpu_env.require_device(proc.stderr, "RTX 5050")
+    gpu_env.require_device(proc.stderr, env["KVMEM_GPU_NAME"])
     keys = (
         "KVMEM_TRACE retrieval",
         "stage_in_raw",
@@ -92,6 +103,10 @@ def main() -> int:
     ap.add_argument("--query-last", type=int, default=64)
     ap.add_argument("--force-substr", default="")
     ap.add_argument("-n", "--n-predict", type=int, default=48)
+    ap.add_argument("--gpu", choices=("small", "27b", "5050", "5090"), default="small",
+                    help="small/5050 = RTX 5050; 27b/5090 = RTX 5090 (27B only)")
+    ap.add_argument("--no-think", action="store_true",
+                    help="Qwen chat wrap with empty <think></think> (disable reasoning)")
     args = ap.parse_args()
 
     extra = [
@@ -109,7 +124,8 @@ def main() -> int:
     else:
         extra += ["--kvmem-method", "recency"]
 
-    out, _ = run_text(find_cli(), args.model, extra, make_prompt(), args.n_predict)
+    out, _ = run_text(find_cli(), args.model, extra, make_prompt(no_think=args.no_think),
+                      args.n_predict, gpu=args.gpu)
     print("output:", out[-500:])
     hit = "BLUEBIRD-42" in out
     tag = f"{args.method} budget={args.budget} bt={args.block_tokens}"

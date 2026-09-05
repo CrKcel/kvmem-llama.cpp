@@ -8,7 +8,7 @@ if [[ ! -x "$PY" ]]; then
     exit 1
 fi
 
-# stage: ci | all
+# stage: ci | mtp | all
 STAGE="${1:-ci}"
 
 download() {
@@ -26,6 +26,11 @@ PY
 # CI / daily: <27B → later run on RTX 5050 (GPU 0)
 download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf
 download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q8_0.gguf
+
+# P7 draft-mtp: the daily 0.8B Q8_0 has no nextn; Unsloth's MTP repo does.
+if [[ "$STAGE" == "all" || "$STAGE" == "mtp" ]]; then
+    download unsloth/Qwen3.5-0.8B-MTP-GGUF Qwen3.5-0.8B-Q8_0.gguf
+fi
 
 if [[ "$STAGE" == "all" ]]; then
     download unsloth/Qwen3-1.7B-GGUF Qwen3-1.7B-Q4_K_M.gguf

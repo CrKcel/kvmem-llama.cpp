@@ -46,15 +46,23 @@ LLAMA_API bool llama_kvmem_eval_callback(struct ggml_tensor * t, bool ask, void 
 
 // Graph-build / post-compute capture (LLAMA_KVMEM process_ubatch hook).
 LLAMA_API void llama_kvmem_register_capture(struct ggml_tensor * t, int il, char which);
-LLAMA_API void llama_kvmem_capture_on_new_graph(void);
-LLAMA_API void llama_kvmem_harvest_ubatch(struct ggml_backend_sched * sched);
+// is_mtp: 1 when the llama_context building this graph is the MTP draft.
+// Trunk and MTP must not clear each other's capture pending.
+LLAMA_API void llama_kvmem_capture_on_new_graph(int is_mtp);
+LLAMA_API void llama_kvmem_harvest_ubatch(struct ggml_backend_sched * sched, int is_mtp);
 // True when this ubatch overlaps [query_begin, query_end) and Q nodes should
 // be present. n_pos is the per-token position stride (1 for 1-D RoPE).
 LLAMA_API bool llama_kvmem_ubatch_needs_q_capture(uint32_t n_tokens, uint32_t n_pos,
                                                   const llama_pos * pos);
 // False if the last built graph's Q-capture topology would not match this ubatch.
+// MTP graphs do not capture Q; is_mtp=1 always allows reuse from KVMem's side.
 LLAMA_API bool llama_kvmem_capture_can_reuse(uint32_t n_tokens, uint32_t n_pos,
-                                             const llama_pos * pos);
+                                             const llama_pos * pos, int is_mtp);
+// True while prefill/query-span harvest is still allowed (retrieval, not pinned).
+// MTP verify is n>1 after pin; callers must not harvest those ubatches into raw-K.
+LLAMA_API bool llama_kvmem_want_prefill_capture(void);
+// Close prefill harvest before decode / speculative verify.
+LLAMA_API void llama_kvmem_end_prefill_capture(void);
 
 // Score + reselect + stage-in raw-K/V for retrieval. No-op if method is recency.
 LLAMA_API void llama_kvmem_apply_retrieval(struct llama_context * ctx);

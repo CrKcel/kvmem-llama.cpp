@@ -1,5 +1,6 @@
 #include "llama-memory-kvmem.h"
 #include "llama-memory-kvmem-hybrid.h"
+#include "llama-memory-kvmem-mtp.h"
 
 #include "llama-kvmem-batch.h"
 #include "llama-kvmem-capture.h"
@@ -11,6 +12,8 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 #include "llama-model.h"
+
+#include "llama.h"
 
 #include "ggml-backend.h"
 
@@ -261,9 +264,19 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-        // MTP draft heads stay on a plain attn KV cache. llama-kvmem-cli
-        // does not create an MTP context.
-        return nullptr;
+        llama_memory_kvmem * tgt = nullptr;
+        if (cparams.ctx_other) {
+            llama_memory_t mem = llama_get_memory(cparams.ctx_other);
+            if (auto * hyb = dynamic_cast<llama_memory_kvmem_hybrid *>(mem)) {
+                tgt = hyb->attn_kvmem();
+            } else {
+                tgt = dynamic_cast<llama_memory_kvmem *>(mem);
+            }
+        }
+        if (!tgt) {
+            return nullptr;
+        }
+        return new llama_memory_kvmem_mtp(model, params, cparams, tgt);
     }
     if (llm_arch_is_recurrent(model.arch)) {
         LLAMA_LOG_WARN("%s: KVMem skips purely recurrent arch %s\n",
@@ -397,6 +410,10 @@ llama_memory_kvmem::llama_memory_kvmem(
 llama_memory_kvmem::~llama_memory_kvmem() {
     harvest_flush();
     d2h_free();
+    if (mtp_) {
+        mtp_->detach_target();
+        mtp_ = nullptr;
+    }
     kvmem_capture_unbind(this);
 }
 
@@ -414,6 +431,7 @@ void llama_memory_kvmem::reset_policy() {
     }
     reset_slots();
     retrieval_pinned_ = false;
+    prefill_capture_ = true;
 }
 
 int32_t llama_memory_kvmem::alloc_slot() {
@@ -430,6 +448,51 @@ void llama_memory_kvmem::free_slot(int32_t slot) {
         return;
     }
     free_slots_.push_back(slot);
+}
+
+int32_t llama_memory_kvmem::peek_free_slot() const {
+    if (free_slots_.empty()) {
+        return -1;
+    }
+    return free_slots_.back();
+}
+
+bool llama_memory_kvmem::slot_for_orig_pos(llama_pos pos, int32_t * slot, uint32_t * off) const {
+    if (!slot || !off || pos < 0 || !runtime_) {
+        return false;
+    }
+    const auto & st = runtime_->store();
+    const uint32_t bt = block_tokens_;
+    if (bt == 0) {
+        return false;
+    }
+    const int32_t bid = st.block_id_containing(static_cast<uint32_t>(pos));
+    if (bid >= 0) {
+        const kvmem::KvMemBlock & b = st.blocks()[static_cast<uint32_t>(bid)];
+        if (b.gpu_slot < 0) {
+            return false;
+        }
+        *slot = b.gpu_slot;
+        *off = static_cast<uint32_t>(pos) - b.orig_pos_start;
+        return *off < bt;
+    }
+    // Token not yet on the target store (MTP draft before verify). Stay in
+    // the last GPU block if it still has room; otherwise peek the next free
+    // slot without popping so target's next alloc_slot() takes the same one.
+    if (!st.blocks().empty()) {
+        const kvmem::KvMemBlock & last = st.blocks().back();
+        if (last.gpu_slot >= 0 &&
+            static_cast<uint32_t>(pos) >= last.orig_pos_start &&
+            static_cast<uint32_t>(pos) < last.orig_pos_start + bt) {
+            *slot = last.gpu_slot;
+            *off = static_cast<uint32_t>(pos) - last.orig_pos_start;
+            return true;
+        }
+    }
+    const uint32_t orig = (static_cast<uint32_t>(pos) / bt) * bt;
+    *off = static_cast<uint32_t>(pos) - orig;
+    *slot = peek_free_slot();
+    return *slot >= 0 && *off < bt;
 }
 
 uint32_t llama_memory_kvmem::resident_tokens() const {
@@ -467,6 +530,9 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
     auto & store = runtime_->store();
     for (uint32_t id : plan.stage_out) {
         harvest_gpu_v(id);
+        if (mtp_) {
+            mtp_->on_stage_out(id);
+        }
     }
     runtime_->spill_outgoing();
     for (uint32_t id : plan.stage_out) {
@@ -1526,6 +1592,9 @@ void llama_memory_kvmem::apply_retrieval() {
     apply_plan_to_kv(plan);
     auto & store = runtime_->store();
     retrieval_pinned_ = true;
+    if (mtp_) {
+        mtp_->harvest_resident_v();
+    }
     // Native GPU KV of a reused block at orig_pos != 0 is the ground truth for
     // host RoPE + capture layout. Prefer a block that is NOT in stage_in so the
     // slot still holds prefill bytes. Must run before layout rewrite.
@@ -1580,6 +1649,9 @@ void llama_memory_kvmem::apply_retrieval() {
             }
         }
         trace_working_set("after_retrieval");
+    }
+    if (mtp_) {
+        mtp_->follow_retrieval();
     }
 }
 
@@ -1784,6 +1856,27 @@ void llama_kvmem_trace_cells(struct llama_context * /*ctx*/, const char * tag) {
 bool llama_kvmem_has_recurrent(void) {
     llama_memory_kvmem * mem = kvmem_capture_active();
     return mem && mem->has_recurrent();
+}
+
+bool llama_kvmem_want_prefill_capture(void) {
+    const llama_kvmem_params * kp = llama_kvmem_get_params();
+    if (!kp || !kp->enabled) {
+        return false;
+    }
+    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
+        return false;
+    }
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) {
+        return false;
+    }
+    return mem->want_prefill_capture();
+}
+
+void llama_kvmem_end_prefill_capture(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->end_prefill_capture();
+    }
 }
 
 void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos) {

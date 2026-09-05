@@ -16,6 +16,7 @@ struct llama_cparams;
 struct llama_memory_params;
 struct ggml_tensor;
 class llama_memory_recurrent;
+class llama_memory_kvmem_mtp;
 
 // Bounded block-slot pool over a llama_kv_cache.
 //
@@ -78,6 +79,12 @@ public:
 
     int32_t alloc_slot();
     void free_slot(int32_t slot);
+    int32_t peek_free_slot() const;
+    // Map original pos to (gpu_slot, offset in block). For a token the target
+    // has not appended yet (MTP draft), predict the slot the next alloc would
+    // take without popping the free list. Returns false if no mapping exists.
+    bool slot_for_orig_pos(llama_pos pos, int32_t * slot, uint32_t * off) const;
+    const kvmem::KvMemStore & store() const { return runtime_->store(); }
 
     void note_ubatch_pos(const std::vector<llama_pos> & pos);
     void reset_query_acc();
@@ -92,6 +99,10 @@ public:
     void trace_working_set(const char * tag) const;
     void set_replay(bool replay) { replay_ = replay; }
     bool replay() const { return replay_; }
+    bool want_prefill_capture() const {
+        return prefill_capture_ && !retrieval_pinned_;
+    }
+    void end_prefill_capture() { prefill_capture_ = false; }
     void set_recurrent(llama_memory_recurrent * recr) { recr_ = recr; }
     bool has_recurrent() const { return recr_ != nullptr; }
     void set_query_span(int32_t begin, int32_t end) {
@@ -99,6 +110,15 @@ public:
         query_end_ = end;
     }
     void set_force_pos(int32_t pos) { force_pos_ = pos; }
+    void set_mtp_follower(llama_memory_kvmem_mtp * mtp) { mtp_ = mtp; }
+    llama_memory_kvmem_mtp * mtp_follower() { return mtp_; }
+
+    const kvmem::RopeConfig & rope() const { return rope_; }
+    ggml_type type_k() const { return type_k_; }
+    ggml_type type_v() const { return type_v_; }
+    bool v_trans() const { return v_trans_; }
+    uint32_t n_embd_k() const { return n_embd_k_; }
+    uint32_t n_embd_v() const { return n_embd_v_; }
 
     kvmem::RawKvStore & raw() { return *raw_; }
 
@@ -158,6 +178,7 @@ private:
     std::unique_ptr<llama_kv_cache> kv_owned_;
     llama_kv_cache * kv_ = nullptr;
     llama_memory_recurrent * recr_ = nullptr;
+    llama_memory_kvmem_mtp * mtp_ = nullptr;
     SlotBackend backend_;
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
@@ -175,6 +196,7 @@ private:
     bool v_trans_ = false;
     bool replay_ = false;
     bool retrieval_pinned_ = false;
+    bool prefill_capture_ = true;
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;

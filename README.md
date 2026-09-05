@@ -3,16 +3,17 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.4.0`](docs/milestones/v0.4.0.md)** (2026-09-05).
-llama.cpp can run KVMem on dense Qwen3 and hybrid Qwen3.5. Product default
-`--kvmem` is retrieval + query-last 64. Identity and needle revival hold on
-Qwen3.5-0.8B (RTX 5050); independent `llama-kvmem-server` smokes greedy +
-streaming. P6 (Metal/Vulkan) is not started.
+**Current local milestone: [`v0.5.0`](docs/milestones/v0.5.0.md)** (2026-09-05).
+llama.cpp can run KVMem on dense Qwen3 and hybrid Qwen3.5, including optional
+`--spec-type draft-mtp` on the same slot-pool as the trunk (plan B). Product
+default `--kvmem` is retrieval + query-last 64. 0.8B (5050) and 27B (5090)
+retrieval+MTP revive BLUEBIRD-42 with `--no-think`. 27B 8k–64k: main KV 32 MiB
++ MTP KV 2 MiB, independent of T. P6 (Metal/Vulkan) is not started.
 
 ## Layout
 
 - `kvmem/` — host library (selection, CPU/NVMe tiers, runtime). No llama.cpp.
-- `src/adapter/` — `llama_memory_i` wrapper (dense slot-pool + hybrid).
+- `src/adapter/` — `llama_memory_i` wrapper (dense slot-pool + hybrid + MTP follower).
 - `tools/` — `llama-kvmem-cli`, `llama-kvmem-server`.
 - `scripts/` — ModelScope downloads and GPU device helpers.
 - `models/` — Unsloth GGUFs (gitignored).
@@ -29,11 +30,11 @@ streaming. P6 (Metal/Vulkan) is not started.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.4.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.5.0` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.4.0
+git checkout v0.5.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh
@@ -41,9 +42,7 @@ scripts/build-cuda.sh                # nvcc from ~/.cu13-env, sm_120
 .venv/bin/ctest --test-dir build --output-on-failure
 python3 scripts/identity_canary.py \
   -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
-python3 scripts/needle_recall.py \
-  -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
-  --method retrieval --budget 256 --block-tokens 32
+python3 scripts/mtp_canary.py --gpu small   # needs 0.8B-MTP-GGUF (has nextn)
 python3 scripts/server_smoke.py      # independent llama-kvmem-server
 ```
 

@@ -5,6 +5,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <limits>
 
 llama_memory_kvmem_hybrid::llama_memory_kvmem_hybrid(
         const llama_model & model,
@@ -96,15 +97,27 @@ void llama_memory_kvmem_hybrid::clear(bool data) {
 bool llama_memory_kvmem_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const llama_pos p0n = p0 < 0 ? 0 : p0;
     const bool full = seq_id <= 0 && p0n == 0 && p1 < 0;
-    // Partial attn eviction (holes / query replay of the attn cache) must not
-    // roll back GDN. Recurrent seq_rm of a suffix is a one-shot snapshot
-    // rollback and otherwise fails.
-    if (!full) {
+    llama_memory_recurrent * recr = get_mem_recr();
+    if (full) {
+        if (!recr->seq_rm(seq_id, p0, p1)) {
+            return false;
+        }
         return attn_kvmem_ ? attn_kvmem_->seq_rm(seq_id, p0, p1)
                            : get_mem_attn()->seq_rm(seq_id, p0, p1);
     }
-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
-        return false;
+    // Query-replay holes must not touch GDN (P4-2 restores it separately).
+    // MTP verify reject is a short open suffix (length 1..n_rs_seq): roll
+    // GDN back on the GPU snapshot planes instead of a 150 MiB host dump.
+    const uint32_t n_rs = recr->n_rs_seq;
+    const llama_pos rmax = recr->seq_pos_max(seq_id);
+    const llama_pos p1x = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    if (n_rs > 0 && p0n > 0 && rmax >= 0 && p0n <= rmax && p1x > rmax) {
+        const llama_pos rollback = rmax - (p0n - 1);
+        if (rollback >= 1 && rollback <= (llama_pos) n_rs) {
+            if (!recr->seq_rm(seq_id, p0, p1)) {
+                return false;
+            }
+        }
     }
     return attn_kvmem_ ? attn_kvmem_->seq_rm(seq_id, p0, p1)
                        : get_mem_attn()->seq_rm(seq_id, p0, p1);

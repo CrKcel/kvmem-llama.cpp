@@ -4,13 +4,13 @@ Date: Fri, 4 Sep 2026 22:46:16 +0800
 Subject: [PATCH 2/3] kvmem: capture pre-RoPE K/Q/V and expose V storage
 
 ---
- src/llama-context.cpp | 16 +++++++++++-
- src/llama-graph.cpp   | 61 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-context.cpp | 18 +++++++++++++-
+ src/llama-graph.cpp   | 70 +++++++++++++++++++++++++++++++++++++++++++
  src/llama-graph.h     |  8 ++++++
  src/llama-kv-cache.h  |  1 +
  src/models/qwen3.cpp  |  3 +++
- src/models/qwen35.cpp |  5 ++++
- 6 files changed, 93 insertions(+), 1 deletion(-)
+ src/models/qwen35.cpp |  6 +++++
+ 6 files changed, 96 insertions(+), 1 deletion(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index f286bd1..177e47a 100644
@@ -26,35 +26,36 @@ index f286bd1..177e47a 100644
  
  #include <cinttypes>
  #include <cmath>
-@@ -1344,7 +1347,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1344,7 +1347,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
 -    if (!graph_reuse_disable && res->can_reuse(gparams)) {
 +    if (!graph_reuse_disable && res->can_reuse(gparams)
 +#if defined(LLAMA_KVMEM)
-+        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, ubatch.n_pos, ubatch.pos)
++        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, ubatch.n_pos, ubatch.pos,
++                                         gtype == LLM_GRAPH_TYPE_DECODER_MTP)
 +#endif
 +            ) {
          //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
-@@ -1363,6 +1370,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1363,6 +1371,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
  
          //const auto t_start_us = ggml_time_us();
  
 +#if defined(LLAMA_KVMEM)
-+        llama_kvmem_capture_on_new_graph();
++        llama_kvmem_capture_on_new_graph(gtype == LLM_GRAPH_TYPE_DECODER_MTP);
 +#endif
          gf = model.build_graph(gparams);
  
          //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-@@ -1397,6 +1407,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1397,6 +1408,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
 +#if defined(LLAMA_KVMEM)
-+    llama_kvmem_harvest_ubatch(sched.get());
++    llama_kvmem_harvest_ubatch(sched.get(), gtype == LLM_GRAPH_TYPE_DECODER_MTP);
 +#endif
 +
      ret = GGML_STATUS_SUCCESS;
@@ -74,7 +75,7 @@ index 72db486..de59b4f 100644
  
  #include <cassert>
  #include <cmath>
-@@ -1500,6 +1503,64 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+@@ -1500,6 +1503,80 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
      }
  }
  
@@ -111,6 +112,12 @@ index 72db486..de59b4f 100644
 +    if (ubatch.n_tokens <= 1) {
 +        return;
 +    }
++#if defined(LLAMA_KVMEM)
++    // MTP verify is n>1 after pin; do not harvest those ubatches into raw-K.
++    if (!llama_kvmem_want_prefill_capture()) {
++        return;
++    }
++#endif
 +    kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
 +}
 +
@@ -118,9 +125,14 @@ index 72db486..de59b4f 100644
 +    if (ubatch.n_tokens <= 1) {
 +        return;
 +    }
++#if defined(LLAMA_KVMEM)
++    if (!llama_kvmem_want_prefill_capture()) {
++        return;
++    }
 +    if (!llama_kvmem_ubatch_needs_q_capture(ubatch.n_tokens, ubatch.n_pos, ubatch.pos)) {
 +        return;
 +    }
++#endif
 +    kvmem_capture_impl(ctx0, gf, q, il, "q");
 +}
 +
@@ -133,6 +145,11 @@ index 72db486..de59b4f 100644
 +    if (ubatch.n_tokens <= 1) {
 +        return;
 +    }
++#if defined(LLAMA_KVMEM)
++    if (!llama_kvmem_want_prefill_capture()) {
++        return;
++    }
++#endif
 +    kvmem_capture_impl(ctx0, gf, v, il, "v");
 +}
 +
@@ -228,3 +245,9 @@ index 0b92109..17a1c9b 100644
  
      // Attention computation
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+@@ -578,6 +583,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Kcur, "mtp_Kcur_normed", il);
++    kvmem_capture_k(Kcur, il);
+ 
+     ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);

@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
+#include "kvmem-spec.h"
 
 #include "chat.h"
 #include "common.h"
@@ -41,7 +42,10 @@ static void print_usage(const char * argv0) {
             "  --kvmem-block-tokens N     block size (default 32)\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
-            "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n",
+            "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
+            "  --spec-type TYPE           none | draft-mtp (default none)\n"
+            "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
+            "  --spec-draft-p-min P       min draft probability (default 0)\n",
             argv0);
 }
 
@@ -114,6 +118,10 @@ struct ServerState {
     int n_predict_default = 128;
     int query_last_fallback = 64;
     std::string model_name = "kvmem";
+    kvmem_spec_session spec;
+    bool spec_mtp = false;
+    int spec_n_max = 2;
+    float spec_p_min = 0.0f;
 };
 
 static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, int pos1, int n_batch, const char * what) {
@@ -131,21 +139,34 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
     return 0;
 }
 
+static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, int pos0, int pos1, const char * what) {
+    if (st.spec.ok) {
+        return kvmem_spec_decode_span(st.ctx, st.spec.spec, toks, pos0, pos1, st.n_batch, what);
+    }
+    return decode_span(st.ctx, toks, pos0, pos1, st.n_batch, what);
+}
+
 static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt) {
     const int n_prompt = (int) prompt.size();
-    const int n_batch = st.n_batch;
     llama_context * ctx = st.ctx;
+    const int eval_end = st.spec.ok ? n_prompt - 1 : n_prompt;
 
     llama_memory_t mem = llama_get_memory(ctx);
     if (mem) {
         llama_memory_clear(mem, true);
     }
+    if (st.spec.ctx_dft) {
+        llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+        if (md) {
+            llama_memory_clear(md, true);
+        }
+    }
 
     const bool do_retr = st.kparams.enabled && st.kparams.method == 1 && st.kparams.query_begin > 0;
     const bool recr_ckpt = do_retr && llama_kvmem_has_recurrent();
-    const int prefix_end = recr_ckpt ? st.kparams.query_begin : n_prompt;
+    const int prefix_end = recr_ckpt ? st.kparams.query_begin : eval_end;
 
-    if (decode_span(ctx, prompt.data(), 0, prefix_end, n_batch, "prefill") != 0) {
+    if (decode_span_maybe_spec(st, prompt.data(), 0, prefix_end, "prefill") != 0) {
         return false;
     }
 
@@ -165,7 +186,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         }
         fprintf(stderr, "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu query_begin=%d\n",
                 prefix_end, sz, st.kparams.query_begin);
-        if (decode_span(ctx, prompt.data(), prefix_end, n_prompt, n_batch, "prefill-query") != 0) {
+        if (decode_span_maybe_spec(st, prompt.data(), prefix_end, eval_end, "prefill-query") != 0) {
             return false;
         }
     }
@@ -195,12 +216,18 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                 llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
                 llama_memory_seq_pos_max(mem, 0) + 1);
     }
+    if (st.spec.ctx_dft) {
+        llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+        if (md) {
+            llama_memory_seq_rm(md, 0, st.kparams.query_begin, st.kparams.query_end);
+            fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
+                    llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+        }
+    }
     const int q0 = st.kparams.query_begin;
-    const int qn = n_prompt - q0;
+    const int qn = eval_end - q0;
     if (qn > 0) {
-        llama_batch qbatch = llama_batch_get_one(const_cast<llama_token *>(prompt.data() + q0), qn);
-        if (llama_decode(ctx, qbatch) != 0) {
-            fprintf(stderr, "llama_decode(query replay) failed\n");
+        if (decode_span_maybe_spec(st, prompt.data(), q0, q0 + qn, "query replay") != 0) {
             llama_kvmem_set_replay(false);
             return false;
         }
@@ -209,6 +236,13 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     llama_kvmem_set_replay(false);
     fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
             q0, qn, (int) recr_ckpt);
+    if (st.spec.ctx_dft) {
+        llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+        if (md) {
+            fprintf(stderr, "KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
+                    llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+        }
+    }
     return true;
 }
 
@@ -350,6 +384,20 @@ int main(int argc, char ** argv) {
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = std::atoi(need(arg));
+        } else if (eq(arg, "--spec-type")) {
+            const char * t = need(arg);
+            if (eq(t, "draft-mtp")) {
+                st.spec_mtp = true;
+            } else if (eq(t, "none")) {
+                st.spec_mtp = false;
+            } else {
+                fprintf(stderr, "unsupported --spec-type %s (P7-0: draft-mtp|none)\n", t);
+                return 1;
+            }
+        } else if (eq(arg, "--spec-draft-n-max")) {
+            st.spec_n_max = std::atoi(need(arg));
+        } else if (eq(arg, "--spec-draft-p-min")) {
+            st.spec_p_min = std::strtof(need(arg), nullptr);
         } else {
             fprintf(stderr, "unknown flag: %s\n", arg);
             print_usage(argv[0]);
@@ -381,6 +429,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    mparams.load_mtp = st.spec_mtp;
     st.model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!st.model) {
         fprintf(stderr, "failed to load model\n");
@@ -394,10 +443,29 @@ int main(int argc, char ** argv) {
     cparams.n_batch = (uint32_t) st.n_batch;
     cparams.n_ubatch = (uint32_t) st.n_batch;
     cparams.n_seq_max = 1;
+    if (st.spec_mtp) {
+        const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
+        cparams.n_outputs_max = n_out;
+        cparams.n_outputs_max_per_seq = n_out;
+        cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
+    }
     st.ctx = llama_init_from_model(st.model, cparams);
     if (!st.ctx) {
         fprintf(stderr, "failed to create context\n");
         return 1;
+    }
+    if (st.spec_mtp) {
+        kvmem_spec_opts sopts;
+        sopts.n_max = st.spec_n_max;
+        sopts.p_min = st.spec_p_min;
+        sopts.n_gpu_layers = ngl;
+        sopts.n_ctx = n_ctx;
+        sopts.n_batch = st.n_batch;
+        sopts.n_ubatch = st.n_batch;
+        sopts.kvmem_enabled = st.kparams.enabled;
+        if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
+            return 1;
+        }
     }
 
     httplib::Server svr;
@@ -484,6 +552,75 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        llama_kvmem_end_prefill_capture();
+
+        const std::string cid = "chatcmpl-kvmem";
+        llama_context * ctx = st.ctx;
+        const llama_vocab * vocab = st.vocab;
+
+        if (st.spec.ok) {
+            auto emit_json = [&](const std::string & content, int n_gen) {
+                json out = {
+                    {"id", cid},
+                    {"object", "chat.completion"},
+                    {"model", st.model_name},
+                    {"choices", json::array({json{
+                        {"index", 0},
+                        {"message", json{{"role", "assistant"}, {"content", content}}},
+                        {"finish_reason", "stop"},
+                    }})},
+                    {"usage", json{
+                        {"prompt_tokens", (int) toks.size()},
+                        {"completion_tokens", n_gen},
+                        {"total_tokens", (int) toks.size() + n_gen},
+                    }},
+                };
+                res.set_content(out.dump(), "application/json");
+            };
+            if (cr.stream) {
+                const int max_tokens = cr.max_tokens;
+                const float temperature = cr.temperature;
+                res.set_header("Cache-Control", "no-cache");
+                res.set_chunked_content_provider("text/event-stream",
+                    [slot, &st, toks, cid, max_tokens, temperature](size_t, httplib::DataSink & sink) mutable {
+                        auto send = [&](const std::string & payload) {
+                            const std::string line = "data: " + payload + "\n\n";
+                            sink.write(line.data(), line.size());
+                        };
+                        send(std::string("{\"id\":\"") + cid +
+                             "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}");
+                        kvmem_spec_generate(st.ctx, st.model, st.spec, toks, max_tokens, temperature,
+                            [&](llama_token, const std::string & piece, bool) {
+                                send(std::string("{\"id\":\"") + cid +
+                                     "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+                                     json_escape(piece) + "\"},\"finish_reason\":null}]}");
+                            });
+                        send(std::string("{\"id\":\"") + cid +
+                             "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
+                        sink.write("data: [DONE]\n\n", 15);
+                        slot->unlock();
+                        sink.done();
+                        return true;
+                    });
+                return;
+            }
+            std::string content;
+            int n_gen = 0;
+            const kvmem_spec_gen_stats gst = kvmem_spec_generate(
+                    ctx, st.model, st.spec, toks, cr.max_tokens, cr.temperature,
+                    [&](llama_token, const std::string & piece, bool) {
+                        content += piece;
+                        ++n_gen;
+                    });
+            if (gst.failed) {
+                res.status = 500;
+                res.set_content("{\"error\":\"speculative decode failed\"}", "application/json");
+                return;
+            }
+            emit_json(content, n_gen);
+            return;
+        }
+
         llama_sampler_chain_params sp = llama_sampler_chain_default_params();
         llama_sampler * smpl = llama_sampler_chain_init(sp);
         if (cr.temperature <= 0.0f) {
@@ -492,10 +629,6 @@ int main(int argc, char ** argv) {
             llama_sampler_chain_add(smpl, llama_sampler_init_temp(cr.temperature));
             llama_sampler_chain_add(smpl, llama_sampler_init_dist(0));
         }
-
-        const std::string cid = "chatcmpl-kvmem";
-        llama_context * ctx = st.ctx;
-        const llama_vocab * vocab = st.vocab;
         auto gen_one = [ctx, smpl, vocab](std::string & piece, bool & stopped) -> bool {
             llama_token id = llama_sampler_sample(smpl, ctx, -1);
             if (llama_vocab_is_eog(vocab, id)) {
@@ -587,13 +720,15 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/chat/completions", handle_chat);
     svr.Post("/chat/completions", handle_chat);
 
-    fprintf(stderr, "llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d\n",
+    fprintf(stderr, "llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
-            st.kparams.method == 1 ? "retrieval" : "recency", n_ctx);
+            st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
+            st.spec.ok ? "draft-mtp" : "off", st.spec_n_max);
     if (!svr.listen(host, port)) {
         fprintf(stderr, "listen failed\n");
         return 1;
     }
+    kvmem_spec_stop(st.spec);
     llama_free(st.ctx);
     llama_model_free(st.model);
     return 0;

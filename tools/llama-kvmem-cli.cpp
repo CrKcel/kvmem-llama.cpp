@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
+#include "kvmem-spec.h"
 
 #include <algorithm>
 #include <chrono>
@@ -41,7 +42,11 @@ static void print_usage(const char * argv0) {
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe spill file in GiB (0 = off)\n"
             "  --kvmem-nvme-dir PATH      NVMe spill directory (default /tmp/kvmem_nvme)\n"
-            "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n",
+            "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n"
+            "  --spec-type TYPE           none | draft-mtp (default none)\n"
+            "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
+            "  --spec-draft-p-min P       min draft probability (default 0)\n"
+            "  --spec-draft-model PATH    optional sidecar MTP GGUF\n",
             argv0);
 }
 
@@ -75,6 +80,10 @@ int main(int argc, char ** argv) {
     std::string force_substr;
     std::string nvme_dir;
     bool dump_kv = false;
+    bool spec_mtp = false;
+    int spec_n_max = 2;
+    float spec_p_min = 0.0f;
+    std::string spec_draft_model;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -151,6 +160,22 @@ int main(int argc, char ** argv) {
                 : static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
         } else if (eq(arg, "--kvmem-nvme-dir")) {
             nvme_dir = need(arg);
+        } else if (eq(arg, "--spec-type")) {
+            const char * t = need(arg);
+            if (eq(t, "draft-mtp")) {
+                spec_mtp = true;
+            } else if (eq(t, "none")) {
+                spec_mtp = false;
+            } else {
+                fprintf(stderr, "unsupported --spec-type %s (P7-0: draft-mtp|none)\n", t);
+                return 1;
+            }
+        } else if (eq(arg, "--spec-draft-n-max")) {
+            spec_n_max = std::atoi(need(arg));
+        } else if (eq(arg, "--spec-draft-p-min")) {
+            spec_p_min = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--spec-draft-model") || eq(arg, "-md")) {
+            spec_draft_model = need(arg);
         } else if (arg[0] == '-') {
             fprintf(stderr, "unknown flag: %s\n", arg);
             print_usage(argv[0]);
@@ -182,6 +207,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
+    model_params.load_mtp = spec_mtp;
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model) {
         fprintf(stderr, "failed to load model: %s\n", model_path.c_str());
@@ -268,11 +294,35 @@ int main(int argc, char ** argv) {
     ctx_params.n_ubatch = static_cast<uint32_t>(n_ubatch);
     ctx_params.n_seq_max = 1;
     ctx_params.no_perf = false;
+    if (spec_mtp) {
+        const uint32_t n_out = (uint32_t) (1 + std::max(0, spec_n_max));
+        ctx_params.n_outputs_max = n_out;
+        ctx_params.n_outputs_max_per_seq = n_out;
+        // GPU GDN snapshot planes for MTP verify reject (qw3-style). Host
+        // PARTIAL_ONLY is only used if the arch clamps this to 0.
+        ctx_params.n_rs_seq = (uint32_t) std::max(0, spec_n_max);
+    }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
         fprintf(stderr, "failed to create llama_context\n");
         return 1;
+    }
+
+    kvmem_spec_session spec_sess;
+    if (spec_mtp) {
+        kvmem_spec_opts sopts;
+        sopts.n_max = spec_n_max;
+        sopts.p_min = spec_p_min;
+        sopts.n_gpu_layers = ngl;
+        sopts.n_ctx = n_ctx;
+        sopts.n_batch = n_batch;
+        sopts.n_ubatch = n_ubatch;
+        sopts.kvmem_enabled = kparams.enabled;
+        sopts.draft_model = spec_draft_model;
+        if (!kvmem_spec_start(spec_sess, model, ctx, sopts)) {
+            return 1;
+        }
     }
 
     auto sparams = llama_sampler_chain_default_params();
@@ -299,6 +349,10 @@ int main(int argc, char ** argv) {
     }
 
     auto decode_span = [&](int pos0, int pos1, const char * what) -> int {
+        if (spec_sess.ok) {
+            return kvmem_spec_decode_span(ctx, spec_sess.spec, prompt_tokens.data(),
+                                          pos0, pos1, n_batch, what);
+        }
         int n_pos = pos0;
         while (n_pos < pos1) {
             const int n = std::min(n_batch, pos1 - n_pos);
@@ -314,9 +368,16 @@ int main(int argc, char ** argv) {
         return 0;
     };
 
+    // Speculative-simple leaves the last prompt token as id_last (not in KV).
+    const int eval_end = spec_sess.ok ? n_prompt - 1 : n_prompt;
+    if (spec_sess.ok && n_prompt < 1) {
+        fprintf(stderr, "speculative decode needs a non-empty prompt\n");
+        return 1;
+    }
+
     const bool do_retr = kparams.enabled && kparams.method == 1 && kparams.query_begin > 0;
     const bool recr_ckpt = do_retr && llama_kvmem_has_recurrent();
-    const int prefix_end = recr_ckpt ? kparams.query_begin : n_prompt;
+    const int prefix_end = recr_ckpt ? kparams.query_begin : eval_end;
 
     if (decode_span(0, prefix_end, "prefill") != 0) {
         return 1;
@@ -340,7 +401,7 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu query_begin=%d\n",
                 prefix_end, sz, kparams.query_begin);
-        if (decode_span(prefix_end, n_prompt, "prefill-query") != 0) {
+        if (decode_span(prefix_end, eval_end, "prefill-query") != 0) {
             return 1;
         }
     }
@@ -388,14 +449,21 @@ int main(int argc, char ** argv) {
                     llama_memory_seq_pos_max(mem, 0) + 1);
             llama_kvmem_trace_cells(ctx, "after_seq_rm");
         }
+        if (spec_sess.ctx_dft) {
+            llama_memory_t md = llama_get_memory(spec_sess.ctx_dft);
+            if (md) {
+                llama_memory_seq_rm(md, 0, kparams.query_begin, kparams.query_end);
+                fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
+                        llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+            }
+        }
         const int q0 = kparams.query_begin;
-        const int qn = n_prompt - q0;
+        const int qn = eval_end - q0;
         if (qn > 0) {
             llama_synchronize(ctx);
             const llama_perf_context_data before_replay = llama_perf_context(ctx);
             const auto r0 = std::chrono::steady_clock::now();
-            llama_batch qbatch = llama_batch_get_one(prompt_tokens.data() + q0, qn);
-            const int rc = llama_decode(ctx, qbatch);
+            const int rc = decode_span(q0, q0 + qn, "query replay");
             llama_synchronize(ctx);
             replay_wall_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - r0).count();
@@ -411,33 +479,64 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
                 q0, qn, (int) recr_ckpt);
         llama_kvmem_trace_cells(ctx, "after_query_replay");
+        if (spec_sess.ctx_dft) {
+            llama_memory_t md = llama_get_memory(spec_sess.ctx_dft);
+            if (md) {
+                fprintf(stderr, "KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
+                        llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+            }
+        }
     }
 
     std::vector<llama_token> gen;
     gen.reserve(static_cast<size_t>(n_predict));
-    for (int n_gen = 0; n_gen < n_predict; ++n_gen) {
-        const llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_vocab_is_eog(vocab, new_token)) {
-            break;
+    llama_kvmem_end_prefill_capture();
+    llama_synchronize(ctx);
+    const auto t_gen0 = std::chrono::steady_clock::now();
+    if (spec_sess.ok) {
+        const kvmem_spec_gen_stats gst = kvmem_spec_generate(
+                ctx, model, spec_sess, prompt_tokens, n_predict, temp,
+                [&](llama_token id, const std::string & piece, bool /*from_draft*/) {
+                    gen.push_back(id);
+                    if (tokens_only) {
+                        printf("%d\n", id);
+                    } else {
+                        fwrite(piece.data(), 1, piece.size(), stdout);
+                        fflush(stdout);
+                    }
+                });
+        if (gst.failed) {
+            kvmem_spec_stop(spec_sess);
+            llama_sampler_free(smpl);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
         }
-        gen.push_back(new_token);
-        if (tokens_only) {
-            printf("%d\n", new_token);
-        } else {
-            char buf[256];
-            const int n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, true);
-            if (n < 0) {
-                fprintf(stderr, "token_to_piece failed\n");
+    } else {
+        for (int n_gen = 0; n_gen < n_predict; ++n_gen) {
+            const llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(vocab, new_token)) {
+                break;
+            }
+            gen.push_back(new_token);
+            if (tokens_only) {
+                printf("%d\n", new_token);
+            } else {
+                char buf[256];
+                const int n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, true);
+                if (n < 0) {
+                    fprintf(stderr, "token_to_piece failed\n");
+                    return 1;
+                }
+                fwrite(buf, 1, static_cast<size_t>(n), stdout);
+                fflush(stdout);
+            }
+            llama_batch batch = llama_batch_get_one(&gen.back(), 1);
+            const int rc = llama_decode(ctx, batch);
+            if (rc != 0) {
+                fprintf(stderr, "llama_decode(gen) failed rc=%d\n", rc);
                 return 1;
             }
-            fwrite(buf, 1, static_cast<size_t>(n), stdout);
-            fflush(stdout);
-        }
-        llama_batch batch = llama_batch_get_one(&gen.back(), 1);
-        const int rc = llama_decode(ctx, batch);
-        if (rc != 0) {
-            fprintf(stderr, "llama_decode(gen) failed rc=%d\n", rc);
-            return 1;
         }
     }
     if (!tokens_only) {
@@ -445,6 +544,8 @@ int main(int argc, char ** argv) {
     }
 
     llama_synchronize(ctx);
+    const double gen_wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen0).count();
     llama_perf_context_print(ctx);
     {
         const llama_perf_context_data p = llama_perf_context(ctx);
@@ -463,8 +564,14 @@ int main(int argc, char ** argv) {
                 "retrieval_ms=%.2f replay_n=%d replay_eval_ms=%.2f replay_wall_ms=%.2f\n",
                 perf_prefill.n_p_eval, perf_prefill.t_p_eval_ms, prefill_tps,
                 retrieval_ms, replay_n, replay_eval_ms, replay_wall_ms);
+        const int n_out = (int) gen.size();
+        const double gen_wall_tps =
+            gen_wall_ms > 0.0 ? 1000.0 * static_cast<double>(n_out) / gen_wall_ms : 0.0;
+        fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n",
+                n_out, gen_wall_ms, gen_wall_tps);
     }
 
+    kvmem_spec_stop(spec_sess);
     llama_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);

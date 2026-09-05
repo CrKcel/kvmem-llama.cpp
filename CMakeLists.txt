@@ -31,14 +31,15 @@ if (KVMEM_BUILD_LLAMA)
 
     add_subdirectory(llama.cpp)
 
-    add_executable(llama-kvmem-cli tools/llama-kvmem-cli.cpp)
+    add_executable(llama-kvmem-cli tools/llama-kvmem-cli.cpp tools/kvmem-spec.cpp)
     target_include_directories(llama-kvmem-cli PRIVATE
         src/adapter
-        llama.cpp/include)
-    target_link_libraries(llama-kvmem-cli PRIVATE llama)
+        llama.cpp/include
+        llama.cpp/common)
+    target_link_libraries(llama-kvmem-cli PRIVATE llama llama-common)
     target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
 
-    add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp)
+    add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp tools/kvmem-spec.cpp)
     target_include_directories(llama-kvmem-server PRIVATE
         src/adapter
         llama.cpp/include

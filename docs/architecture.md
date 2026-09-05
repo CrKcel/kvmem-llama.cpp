@@ -40,3 +40,11 @@ Follow-up feature (not v1): when gen slots are exhausted, recycle **only**
 generation-occupied slots (or spill those gen blocks to CPU/NVMe) and
 keep the pinned retrieval working set. Recency decode still has the
 related `block_count() > budget` mis-trigger; same class of issue.
+
+## P7: MTP shares the slot-pool (plan B)
+
+Logically long context must not grow a full-length MTP KV (plan A). The
+draft context (`LLAMA_CONTEXT_TYPE_MTP`) gets a **follower** slot-pool
+the same size as the target attention cache, same block IDs and slot
+indices, original `pos` on cells. Speculative decoding stays in
+llama.cpp `draft-mtp`. Details: `docs/kvmem-mtp-plan.md`.

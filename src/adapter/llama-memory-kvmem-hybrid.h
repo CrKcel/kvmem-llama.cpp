@@ -9,7 +9,8 @@
 // recurrent half is stock llama_memory_recurrent.
 //
 // Graph still static_cast's to llama_memory_hybrid_context. GDN sees every
-// token; pressure reselect / seq_rm of attn holes must not roll back GDN.
+// token. Query-replay holes must not roll back GDN. MTP verify reject of a
+// short suffix (≤ n_rs_seq) uses GPU snapshot planes.
 class llama_memory_kvmem_hybrid : public llama_memory_hybrid {
 public:
     llama_memory_kvmem_hybrid(

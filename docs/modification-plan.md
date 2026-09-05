@@ -1,6 +1,6 @@
 # KVMem × llama.cpp 修改计划
 
-**状态（2026-09-05）：** P0–P3 已在本机打成 milestone **`v0.3.0`**。P4–P5 打成 **`v0.4.0`**（tag `v0.4.0`，v1.5 hybrid + serving）。llama.cpp 能跑 dense Qwen3 和 hybrid Qwen3.5；产品默认 `--kvmem` = retrieval + query-last 64。阶段测试记录见 [milestones/v0.4.0.md](milestones/v0.4.0.md)。**P4-1 已过关：** Qwen3.5-0.8B 短上下文 identity（RTX 5050，attn=KVMem 槽位池，recr=stock GDN）。**P4-2 已过关：** query 边界 `PARTIAL_ONLY` checkpoint GDN，只重放 query 后缀；0.8B ranker 召回 BLUEBIRD-42。**P5 已过关：** 独立 `llama-kvmem-server`，`/v1/chat/completions` greedy + streaming；last-user query span + retrieval TRACE。P6 未开始。
+**状态（2026-09-05）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7（KVMem + MTP 方案 B，含 `n_rs_seq`）打成 **`v0.5.0`**（tag `v0.5.0`）。产品默认 `--kvmem` = retrieval + query-last 64；MTP 可选 `--spec-type draft-mtp`。阶段测试：[milestones/v0.5.0.md](milestones/v0.5.0.md)。P6 未开始。详见 [kvmem-mtp-plan.md](kvmem-mtp-plan.md)。
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**
 
@@ -35,7 +35,7 @@
 | GPU 上保留全量历史、只用 mask 藏 token | 省不了显存，decode 仍 O(全量) |
 | 追上 qw3-native 在 Blackwell + Qwen3.6 的 tok/s | 那是 FlashInfer / MMQ / NVFP4，不是 KVMem |
 | KVMem + continuous batching / 多 slot | qw3 也未完成；和 unified KV 冲突 |
-| KVMem + draft-MTP | 两套推测解码状态机，单独立项 |
+| 自研 MTP 投机状态机 / 方案 A（MTP KV 跟 `-c` 涨） | 投机用 llama.cpp `draft-mtp`；显存必须方案 B。见 [kvmem-mtp-plan.md](kvmem-mtp-plan.md) |
 | 把整套 KVMem 合进 ggml-org/llama.cpp | 先 submodule；最多上游一个 hook PR |
 | 把 qw3 的 NVFP4 / MMQ / FlashInfer 搬过来 | 超出本项目 |
 
@@ -53,7 +53,7 @@
 6. **immutable raw-K 为 K 的权威**（P2 起）。不要从 q8 cache 反推 content key。
 7. **`kvmem/` 零 `#include` llama.cpp 头文件。** 所有 `llama-*.h` 只允许出现在 `src/adapter/`。
 8. **llama.cpp 补丁只允许三处：** memory 工厂、`build_attn` 的 Q/K capture、CLI/server 元数据。核心补丁超过约 300 行则 P1 fail。
-9. **v1 单序列 / 单 slot。** 关掉 SWA shift、unified 多 seq、MTP。
+9. **v1 单序列 / 单 slot。** 关掉 SWA shift、unified 多 seq。MTP 在 v1 关闭；**P7 在同一单 slot 上打开**，draft KV 走槽位池（方案 B），仍禁止 CB + KVMem + MTP。
 10. **成功标准是「llama.cpp 能跑 KVMem」，不是打败 qw3-native 的 decode 速度。**
 
 已知 v1 限制（后续单独立项，不挡当前 retrieval）：
@@ -100,6 +100,8 @@ kvmem_llamacpp/
   src/adapter/                    ← 唯一允许 include llama.cpp 的地方
     llama-memory-kvmem.h
     llama-memory-kvmem.cpp
+    llama-memory-kvmem-hybrid.h   ← P4
+    llama-memory-kvmem-mtp.h      ← P7，nextn 槽位条带
     llama-kvmem-hooks.h
     llama-kvmem-batch.cpp         ← 窗口坐标 vs 真实位置
   tools/
@@ -205,8 +207,10 @@ P0-2 ─┼─► P0-3 ─► P1-1 ─► P1-2 ─► P1-3 ─► P1-4 ─┬─
                                                  ├─► P3-1 ─► P3-2     （可与 P2 后期并行）
                                                  │
                                                  └─► P4-1 ─► P4-2     （P2 完成后）
-                                                          └─► P5
-                                                          └─► P6
+                                                          ├─► P5
+                                                          ├─► P6
+                                                          └─► P7-0 ─► P7-1 ─► P7-2 ─► P7-3
+                                                               KVMem + MTP 方案 B（P4-2 后）
 ```
 
 ---
@@ -517,6 +521,21 @@ P0-2 ─┼─► P0-3 ─► P1-1 ─► P1-2 ─► P1-3 ─► P1-4 ─┬─
 
 ---
 
+### PR P7 — KVMem + MTP 槽位条带（方案 B）
+
+详细阶段、工厂行为、lockstep 约束、退出标准见 **[kvmem-mtp-plan.md](kvmem-mtp-plan.md)**。此处只留总表。
+
+| PR | 标题 | 依赖 | 退出一句话 |
+|---|---|---|---|
+| P7-0 | 接 `draft-mtp`；verify 时 snapshot GDN | P4-2、P5 | 短 ctx 无 retrieval，0.8B `n_max=2` 能投机且 reject 可回滚 |
+| P7-1 | `llama_memory_kvmem_mtp` lockstep 池 | P7-0 | MTP `n_kv` == 主池；27B MTP KV 为池子量级 |
+| P7-2 | retrieval / query replay 同步 MTP 条带 | P7-1 | 0.8B retrieval + MTP 关思考后召回 BLUEBIRD-42 |
+| P7-3 | 长 ctx 两池都不随 T 涨 | P7-2 | 27B 固定 budget，主 KV + MTP KV 随 budget 不随 T |
+
+不搬 qw3 的 `generate_mtp`。独立 `MTP/mtp-*.gguf` 可选，主 Unsloth 27B GGUF 已焊 nextn。
+
+---
+
 ## 8. 测试策略与模型
 
 **大部分测试不需要真实模型。** 需要模型时，日常 CI 只用小 GGUF（≤2B，文件几百 MB 到 2GB）。27B 只做可选发布门，不进每次 PR。
@@ -626,6 +645,10 @@ P0 应附 `scripts/download-test-models.sh`，按阶段拉下表文件。ModelSc
 | hybrid identity | P4-1 | **Qwen3.5-0.8B** | 与裸 llama.cpp greedy 一致 |
 | hybrid replay + needle | P4-2 | Qwen3.5-0.8B | block 集合正确；GDN 未重放整段历史 |
 | 27B 抽样 | 里程碑 | Qwen3.8-27B Q4_K_M | 短 identity + 一条 needle，手动 |
+| MTP 短 ctx 投机 | P7-0 | Qwen3.5-0.8B | `draft-mtp` greedy；GDN reject restore |
+| MTP `n_kv` == 主池 | P7-1 | 0.8B；27B 抽检 | 随 budget，不随 `-c` |
+| retrieval + MTP needle | P7-2 | Qwen3.5-0.8B | 关思考后 BLUEBIRD-42 |
+| 长 ctx 两池封顶 | P7-3 | Qwen3.8-27B | 主 KV + MTP KV 随 budget |
 | bump llama.cpp tag | 每次升级 | 日常小模型 | `git am` + 金丝雀绿 |
 
 性能对照（记录，不当 P1 门禁）：
@@ -645,6 +668,7 @@ P0 应附 `scripts/download-test-models.sh`，按阶段拉下表文件。ModelSc
 | serving | 独立进程（P5），先不改 llama-server |
 | 是否立刻回接 qw3-native | 否。公共库主树在本仓库；qw3 回接另开任务 |
 | llama.cpp tag | P1 钉能跑 **Qwen3-0.6B** 的稳定 b 号；P4 再确认同一 tag（或一次 bump）能跑 **Qwen3.5-0.8B**。不追 master，不为 27B 单独锁 CI tag |
+| KVMem + MTP | **方案 B**（MTP 进同一槽位池）。投机用 llama.cpp `draft-mtp`，不自研。见 [kvmem-mtp-plan.md](kvmem-mtp-plan.md) |
 | 测试权重从哪下 | **只用 Unsloth GGUF，只从 ModelScope `unsloth/...` 拉**。日常 `Q8_0`，抽检 `Q4_K_M`/`UD-Q4_K_*`。禁止 Hugging Face 默认源 |
 | 用哪张卡 | **<27B → RTX 5050（CUDA 0）**；**27B → RTX 5090（CUDA 1）**。`source scripts/gpu.sh small\|27b` |
 
@@ -661,6 +685,7 @@ P0 应附 `scripts/download-test-models.sh`，按阶段拉下表文件。ModelSc
 | P4 | 3–6 周 | Qwen3.6 hybrid v1.5 |
 | P5 | 2–3 周 | 可对 harness 的单 slot 服务 |
 | P6 | 1–2 周 | 非 CUDA 冒烟 |
+| P7 | 3–5 周 | KVMem + MTP 方案 B（槽位条带） |
 
 P1 失败则停止扩检索，先修位置/mask 模型。不要用 P2 掩盖 P1 的接口问题。
 
@@ -690,6 +715,7 @@ P1 失败则停止扩检索，先修位置/mask 模型。不要用 P2 掩盖 P1 
 - [ ] 有没有改 FA kernel？
 - [ ] `kvmem/` 里有没有 `#include "llama-*.h"`？
 - [ ] identity 金丝雀过了没有？
+- [ ] MTP 若开启：`n_kv` 是否仍是 budget 量级？主干与 MTP 是否同一 slot / 同一 pos？
 
 ---
 
@@ -713,5 +739,9 @@ P1 失败则停止扩检索，先修位置/mask 模型。不要用 P2 掩盖 P1 
 | P4-2 | hybrid query replay | P4-1 | adapter + state_seq |
 | P5 | independent OpenAI server | P2-3（hybrid 需 P4-2） | `tools/llama-kvmem-server.cpp` |
 | P6 | Metal/Vulkan smoke | P2-3 | scripts / CI |
+| P7-0 | wire draft-mtp + GDN verify snapshot | P4-2, P5 | tools + hybrid snapshot |
+| P7-1 | MTP lockstep slot-pool | P7-0 | `llama-memory-kvmem-mtp.cpp` |
+| P7-2 | MTP follows retrieval/replay | P7-1 | adapter |
+| P7-3 | long-ctx MTP VRAM canary | P7-2 | scripts |
 
-第一刀从 **P0-1** 开始。P1-4 打上 `p1-go` 之前，不把 retrieval、hybrid、server 混进主路径。
+第一刀从 **P0-1** 开始。P1-4 打上 `p1-go` 之前，不把 retrieval、hybrid、server 混进主路径。P7 在 P4-2 之后单独开，不回头改 FA。

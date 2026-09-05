@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""P1 identity canary: greedy tokens with KVMem-off vs KVMem-on (budget >= prompt).
+"""Identity canary: greedy tokens with KVMem-off vs KVMem-on (budget >= prompt).
 
-Uses GPU 0 (RTX 5050) via CUDA_VISIBLE_DEVICES. Never touches GPU 1.
+Default GPU is the 5050 (`--gpu small`). 27B must use `--gpu 27b` (5090).
 """
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ def find_cli() -> Path:
     raise SystemExit("llama-kvmem-cli not found; run scripts/build-cuda.sh")
 
 
-def run(cli: Path, model: Path, extra: list[str], prompt: str) -> list[int]:
-    env = gpu_env.apply_gpu(os.environ.copy(), "small")
+def run(cli: Path, model: Path, extra: list[str], prompt: str, gpu: str) -> list[int]:
+    env = gpu_env.apply_gpu(os.environ.copy(), gpu)
     cmd = [
         str(cli),
         "-m",
@@ -47,7 +47,7 @@ def run(cli: Path, model: Path, extra: list[str], prompt: str) -> list[int]:
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(f"command failed rc={proc.returncode}: {' '.join(cmd)}")
-    gpu_env.require_device(proc.stderr, "RTX 5050")
+    gpu_env.require_device(proc.stderr, env["KVMEM_GPU_NAME"])
     ids = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -62,14 +62,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", type=Path, default=DEFAULT_MODEL)
     ap.add_argument("-p", "--prompt", default=DEFAULT_PROMPT)
+    ap.add_argument("--gpu", choices=("small", "27b", "5050", "5090"), default="small",
+                    help="small/5050 = RTX 5050; 27b/5090 = RTX 5090 (27B only)")
     args = ap.parse_args()
     if not args.model.is_file():
         raise SystemExit(f"missing model {args.model}")
 
     cli = find_cli()
-    off = run(cli, args.model, [], args.prompt)
+    off = run(cli, args.model, [], args.prompt, args.gpu)
     on = run(cli, args.model, ["--kvmem", "--kvmem-method", "recency",
-                               "--kvmem-block-tokens", "32"], args.prompt)
+                               "--kvmem-block-tokens", "32"], args.prompt, args.gpu)
     print("off", off)
     print("on ", on)
     if off != on:

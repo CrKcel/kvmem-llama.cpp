@@ -1,0 +1,42 @@
+# v0.5.0 quality excerpts
+# 0.8B: RTX 5050 (UUID GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29)
+# 27B:  RTX 5090 (UUID GPU-58a7c28b-e698-307f-c149-24d4ecd88bf4)
+# 2026-09-05  CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+========== P7 0.8B mtp_canary.py (Qwen3.5-0.8B-MTP-GGUF Q8_0, 5050) ==========
+off [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 4862, 20316, 364, 821, 1118, 1007]
+on  [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 4862, 20316, 364, 821, 1118, 1007]
+PASS: identity (KVMem-on greedy tokens == KVMem-off)
+PASS: identity without MTP
+PASS: no-kvmem MTP generated
+PASS: kvmem MTP generated
+  KVMEM_TRACE spec_ckpt tgt=RS n_rs_seq=2 (GPU GDN planes; host ckpt if draft > n_rs)
+  KVMEM_TRACE spec_stats n_gen=32 n_drafted=32 n_accept=18 n_restore=0 accept_pct=56.2
+  KVMEM_TRACE mtp_pool cells=512 target_cells=512 n_ctx=8192 bytes=1048576 layers=1 block_tokens=32
+PASS: MTP pool follows budget+reserve, not -c
+PASS: recency+MTP did not recall the middle needle
+  KVMEM_TRACE force_pos=428 needle_block=13
+  KVMEM_TRACE selected 0 1 3 4 13 24 25 26
+  KVMEM_TRACE mtp_selected 0 1 3 4 13 24 25 26
+  KVMEM_TRACE mtp_follow n_gpu=8 n_writeback=8 n_no_raw=0 seq_pos=[0,847]
+  KVMEM_TRACE mtp_after_query_replay seq_pos=[0,847]
+PASS: retrieval+MTP ranker/follow TRACE
+PASS: MTP prefix after query replay
+PASS: retrieval+MTP generated BLUEBIRD-42
+PASS: GDN n_rs_seq GPU planes
+PASS: P7-2 mtp canary
+
+========== P7 27B needle (Qwen3.8-27B-UD-Q4_K_M, 5090, --no-think, n_max=2) ==========
+Device 0: NVIDIA GeForce RTX 5090 Laptop GPU
+llama_context: n_rs_seq = 2
+KVMEM_TRACE mtp_pool cells=512 target_cells=512 n_ctx=2048 bytes=2097152
+KVMEM_TRACE spec_ckpt tgt=RS n_rs_seq=2
+recency: spec_verify=19 ckpt_bytes=0:19 n_restore=0
+output: there is **no secret code**.
+PASS: recency miss
+retrieval: needle_block=13 selected 0 1 2 13 14 24 25 26
+mtp_follow n_gpu=8 n_writeback=8 n_no_raw=0
+mtp_after_query_replay seq_pos=[0,847]
+spec_verify=7 ckpt_bytes=0:7 n_restore=0
+output: the secret code is **BLUEBIRD-42**.
+PASS: 27B retrieval+MTP BLUEBIRD-42
