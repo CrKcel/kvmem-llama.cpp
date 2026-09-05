@@ -7,8 +7,11 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/rope.hpp"
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -93,6 +96,7 @@ public:
     bool capture_can_reuse(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) const;
     void harvest_pending(struct ggml_backend_sched * sched);
     void harvest_flush();
+    void harvest_perf_print_sum();
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
     void dump_kv_compare(int32_t block_id, bool writeback_test = false);
@@ -161,6 +165,10 @@ private:
                                          int64_t d, int64_t h, int64_t n,
                                          size_t nb0, size_t nb1, size_t nb2,
                                          std::vector<float> & out);
+    static void bytes_to_f16_token_major(const uint8_t * data, ggml_type type,
+                                         int64_t d, int64_t h, int64_t n,
+                                         size_t nb0, size_t nb1, size_t nb2,
+                                         std::vector<uint16_t> & out);
     void harvest_from_host(int il, char which, const uint8_t * host,
                            ggml_type type, int64_t d, int64_t h, int64_t n,
                            size_t nb0, size_t nb1, size_t nb2);
@@ -168,6 +176,42 @@ private:
     void d2h_free();
     void d2h_commit(int slot);
     bool d2h_submit(struct ggml_backend * be);
+    bool harvest_perf_on() const { return perf_.enabled; }
+    void harvest_perf_emit_graph_line();
+    void harvest_worker_start();
+    void harvest_worker_stop();
+    void harvest_loop();
+    void harvest_wait_slot(int slot);
+    bool harvest_worker_on() const;
+
+    struct HarvestPerf {
+        bool enabled = false;
+        bool sum_printed = false;
+        bool graph_line_printed = false;
+        uint32_t n_ubatch = 0;
+        uint32_t n_tok = 0;
+        int64_t harvest_entry_us = 0;
+        int64_t sync_us = 0;
+        int64_t d2d_us = 0;
+        int64_t snap_wait_us = 0;
+        int64_t d2h_submit_us = 0;
+        int64_t commit_us = 0;
+        int64_t d2h_wait_us = 0;
+        int64_t pack_us = 0;
+        int64_t nvme_us = 0;
+        uint64_t nvme_bytes = 0;
+        uint64_t nvme_syscalls = 0;
+        int64_t last_sync_us = 0;
+        int64_t last_d2d_us = 0;
+        int64_t last_snap_wait_us = 0;
+        int64_t last_d2h_submit_us = 0;
+        int64_t last_commit_us = 0;
+        int64_t last_d2h_wait_us = 0;
+        int64_t last_pack_us = 0;
+        int64_t last_nvme_us = 0;
+        uint64_t last_nvme_bytes = 0;
+        uint64_t last_nvme_syscalls = 0;
+    };
 
     const llama_model & model_;
     uint32_t block_tokens_ = 128;
@@ -213,6 +257,15 @@ private:
     bool graph_has_q_ = false;
     struct CaptureD2hPipe;
     std::unique_ptr<CaptureD2hPipe> d2h_;
+    struct HarvestWorker {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<int> q;
+        std::thread th;
+        bool stop = false;
+    };
+    std::unique_ptr<HarvestWorker> harvest_w_;
+    HarvestPerf perf_;
     std::vector<std::vector<float>> q_sum_;
     std::vector<uint32_t> q_count_;
 };
