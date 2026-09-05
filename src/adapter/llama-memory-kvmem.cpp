@@ -1726,21 +1726,13 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     }
     occupy_block_cells(block_id);
     const uint32_t nt = blk.n_tokens;
-    llama_kv_cache::slot_info sinfo;
-    sinfo.s0 = 0;
-    sinfo.s1 = 0;
-    sinfo.resize(1);
-    sinfo.strm[0] = 0;
-    sinfo.idxs[0].resize(nt);
-    for (uint32_t t = 0; t < nt; ++t) {
-        sinfo.idxs[0][t] = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_ + t;
-    }
 
     std::vector<float> rk(static_cast<size_t>(nt) * n_embd_k_);
     std::vector<float> rv(static_cast<size_t>(nt) * n_embd_v_);
     std::vector<float> roped(static_cast<size_t>(nt) * n_embd_k_);
-    std::vector<ggml_fp16_t> k16(n_embd_k_);
-    std::vector<ggml_fp16_t> v16(n_embd_v_);
+    std::vector<ggml_fp16_t> k16(static_cast<size_t>(nt) * n_embd_k_);
+    std::vector<ggml_fp16_t> v16(static_cast<size_t>(nt) * n_embd_v_);
+    const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -1763,23 +1755,22 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         const size_t krow = ggml_row_size(type_k_, n_embd_k_);
         const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
         const int64_t t_set = ggml_time_us();
-        for (uint32_t t = 0; t < nt; ++t) {
-            const uint32_t cell = sinfo.idxs[0][t];
-            const float * src = roped.data() + t * n_embd_k_;
+        if (kt && cell0 < kv_size_) {
             if (type_k_ == GGML_TYPE_F16) {
-                ggml_fp32_to_fp16_row(src, k16.data(), static_cast<int64_t>(n_embd_k_));
-                ggml_backend_tensor_set(kt, k16.data(), cell * krow, krow);
+                ggml_fp32_to_fp16_row(roped.data(), k16.data(),
+                                      static_cast<int64_t>(nt) * n_embd_k_);
+                ggml_backend_tensor_set(kt, k16.data(), cell0 * krow, nt * krow);
             } else {
-                ggml_backend_tensor_set(kt, src, cell * krow, krow);
+                ggml_backend_tensor_set(kt, roped.data(), cell0 * krow, nt * krow);
             }
-            if (have_v && vt && !v_trans_) {
-                const float * vs = rv.data() + t * n_embd_v_;
-                if (type_v_ == GGML_TYPE_F16) {
-                    ggml_fp32_to_fp16_row(vs, v16.data(), static_cast<int64_t>(n_embd_v_));
-                    ggml_backend_tensor_set(vt, v16.data(), cell * vrow, vrow);
-                } else {
-                    ggml_backend_tensor_set(vt, vs, cell * vrow, vrow);
-                }
+        }
+        if (have_v && vt && !v_trans_ && cell0 < kv_size_) {
+            if (type_v_ == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row(rv.data(), v16.data(),
+                                      static_cast<int64_t>(nt) * n_embd_v_);
+                ggml_backend_tensor_set(vt, v16.data(), cell0 * vrow, nt * vrow);
+            } else {
+                ggml_backend_tensor_set(vt, rv.data(), cell0 * vrow, nt * vrow);
             }
         }
         if (retr_.enabled) {
@@ -1802,32 +1793,31 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
     uint64_t off = 0;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
+    const uint32_t nget = (cell0 < kv_size_)
+            ? std::min(block_tokens_, kv_size_ - cell0) : 0;
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
         }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
-        for (uint32_t t = 0; t < block_tokens_; ++t) {
-            const uint32_t cell = static_cast<uint32_t>(gpu_slot) * block_tokens_ + t;
-            if (off + krow > bytes) {
-                return;
-            }
-            if (kt && cell < kv_size_) {
-                ggml_backend_tensor_get(kt, dst + off, cell * krow, krow);
-            }
-            off += krow;
+        if (off + kspan > bytes) {
+            return;
         }
-        for (uint32_t t = 0; t < block_tokens_; ++t) {
-            if (off + vrow > bytes) {
-                return;
-            }
-            const uint32_t cell = static_cast<uint32_t>(gpu_slot) * block_tokens_ + t;
-            if (vt && !v_trans_ && cell < kv_size_) {
-                ggml_backend_tensor_get(vt, dst + off, cell * vrow, vrow);
-            }
-            off += vrow;
+        if (kt && nget > 0) {
+            ggml_backend_tensor_get(kt, dst + off, cell0 * krow, nget * krow);
         }
+        off += kspan;
+        if (off + vspan > bytes) {
+            return;
+        }
+        if (vt && !v_trans_ && nget > 0) {
+            ggml_backend_tensor_get(vt, dst + off, cell0 * vrow, nget * vrow);
+        }
+        off += vspan;
     }
 }
 
@@ -1841,32 +1831,31 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     uint64_t off = 0;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
+    const uint32_t nset = (cell0 < kv_size_)
+            ? std::min(block_tokens_, kv_size_ - cell0) : 0;
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
         }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
-        for (uint32_t t = 0; t < block_tokens_; ++t) {
-            const uint32_t cell = static_cast<uint32_t>(gpu_slot) * block_tokens_ + t;
-            if (off + krow > bytes) {
-                return;
-            }
-            if (kt && cell < kv_size_) {
-                ggml_backend_tensor_set(kt, src + off, cell * krow, krow);
-            }
-            off += krow;
+        if (off + kspan > bytes) {
+            return;
         }
-        for (uint32_t t = 0; t < block_tokens_; ++t) {
-            if (off + vrow > bytes) {
-                return;
-            }
-            const uint32_t cell = static_cast<uint32_t>(gpu_slot) * block_tokens_ + t;
-            if (vt && !v_trans_ && cell < kv_size_) {
-                ggml_backend_tensor_set(vt, src + off, cell * vrow, vrow);
-            }
-            off += vrow;
+        if (kt && nset > 0) {
+            ggml_backend_tensor_set(kt, src + off, cell0 * krow, nset * krow);
         }
+        off += kspan;
+        if (off + vspan > bytes) {
+            return;
+        }
+        if (vt && !v_trans_ && nset > 0) {
+            ggml_backend_tensor_set(vt, src + off, cell0 * vrow, nset * vrow);
+        }
+        off += vspan;
     }
 }
 
@@ -2187,20 +2176,20 @@ bool llama_memory_kvmem::read_gpu_block(uint32_t block_id, uint32_t il, bool is_
     const ggml_type ty = is_k ? type_k_ : type_v_;
     const size_t row = ggml_row_size(ty, dim);
     const uint32_t nt = blk.n_tokens;
+    const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
     out.assign(static_cast<size_t>(nt) * dim, 0.0f);
-    std::vector<uint8_t> raw(row);
-    for (uint32_t t_i = 0; t_i < nt; ++t_i) {
-        const uint32_t cell = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_ + t_i;
-        ggml_backend_tensor_get(t, raw.data(), static_cast<size_t>(cell) * row, row);
-        float * dst = out.data() + t_i * dim;
-        if (ty == GGML_TYPE_F16) {
-            const ggml_fp16_t * src = reinterpret_cast<const ggml_fp16_t *>(raw.data());
-            for (uint32_t d = 0; d < dim; ++d) {
-                dst[d] = ggml_fp16_to_fp32(src[d]);
-            }
-        } else if (ty == GGML_TYPE_F32) {
-            std::memcpy(dst, raw.data(), row);
-        }
+    if (nt == 0 || cell0 >= kv_size_) {
+        return false;
+    }
+    const uint32_t nget = std::min(nt, kv_size_ - cell0);
+    std::vector<uint8_t> raw(static_cast<size_t>(nget) * row);
+    ggml_backend_tensor_get(t, raw.data(), static_cast<size_t>(cell0) * row,
+                            static_cast<size_t>(nget) * row);
+    if (ty == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(raw.data()),
+                              out.data(), static_cast<int64_t>(nget) * dim);
+    } else if (ty == GGML_TYPE_F32) {
+        std::memcpy(out.data(), raw.data(), static_cast<size_t>(nget) * row);
     }
     return true;
 }

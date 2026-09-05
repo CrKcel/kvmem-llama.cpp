@@ -128,10 +128,10 @@ Independently reviewable. Do not mix compact-window RoPE into copy PRs.
 
 ### PR 1 — `kvmem: batched tensor_get/set for a contiguous slot span`
 
-- **Files:** `copy_gpu_block_to_host` / `from_host` / `write_block_to_gpu` (+ MTP twins)
+- **Files:** `read_gpu_block` (`harvest_gpu_v`), `copy_gpu_block_to_host` / `from_host`, `write_block_to_gpu`; MTP `harvest_v` / `write_block_to_gpu`
 - **Depends on:** PR 0
-- **Changes:** cells `slot*bt .. slot*bt+nt-1` are contiguous rows. One `ggml_backend_tensor_{get,set}(..., nt * row)` per `(layer, K|V)`. Host RoPE unchanged. Bit-identical.
-- **Gate:** identity; retrieval needle; record 16k/128k `retr_ms` + SUM. Expect fewer syncs; resident path may still be tens of seconds (PCIe still carries baked KV).
+- **Changes:** cells `slot*bt .. slot*bt+nt-1` are contiguous rows. One `ggml_backend_tensor_{get,set}(..., n * row)` per `(layer, K|V)`. Host RoPE unchanged. Bit-identical. **16k IQ3 SUM (budget 8192): `stage_out` 47% is `read_gpu_block`; omitting it leaves the largest bucket.**
+- **Gate:** identity; retrieval needle; 16k `KVMEM_RETR_SUM`. Expect `stage_out`/`set`/`layout_*` to drop; resident layout may still pay PCIe.
 
 ### PR 2 — `kvmem: layout resident blocks with GPU D2D`
 

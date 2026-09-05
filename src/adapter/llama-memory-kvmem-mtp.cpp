@@ -9,6 +9,7 @@
 
 #include "llama.h"
 
+#include "ggml.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -69,6 +70,19 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     rcfg.n_embd_k = model.hparams.n_embd_k_gqa(il_mtp);
     rcfg.n_embd_v = model.hparams.n_embd_v_gqa(il_mtp);
     rcfg.block_tokens = block_tokens_;
+    const llama_kvmem_params * kp = llama_kvmem_get_params();
+    if (kp && kp->raw_k_nvme) {
+        const uint64_t ntok = std::max<uint64_t>(cparams.n_ctx, kv_size_);
+        const uint64_t need =
+                static_cast<uint64_t>(rcfg.n_layer) * ntok *
+                (static_cast<uint64_t>(rcfg.n_embd_k) + rcfg.n_embd_v) *
+                sizeof(uint16_t);
+        rcfg.nvme_bytes = need + 32ull * 1024ull * 1024ull;
+        rcfg.nvme_dir = (kp->nvme_dir && kp->nvme_dir[0])
+                ? kp->nvme_dir
+                : "/tmp/kvmem_nvme";
+        rcfg.nvme_file = "kvmem_raw_mtp_k.bin";
+    }
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);
 
     size_t bytes = 0;
@@ -250,6 +264,12 @@ void llama_memory_kvmem_mtp::capture_on_new_graph() {
     pending_capture_.clear();
 }
 
+void llama_memory_kvmem_mtp::harvest_flush() {
+    if (raw_) {
+        raw_->wait_writes();
+    }
+}
+
 void llama_memory_kvmem_mtp::harvest_capture(struct ggml_tensor * t, char which) {
     if (!t || cur_pos_.empty() || !raw_) {
         return;
@@ -258,7 +278,9 @@ void llama_memory_kvmem_mtp::harvest_capture(struct ggml_tensor * t, char which)
         return;
     }
     std::vector<uint8_t> tmp(ggml_nbytes(t));
+    const int64_t t0 = ggml_time_us();
     ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
+    perf_sync_us_ += ggml_time_us() - t0;
     const uint32_t n = (uint32_t) cur_pos_.size();
     const uint32_t pos0 = (uint32_t) cur_pos_[0];
     const int64_t d = t->ne[0];
@@ -287,12 +309,17 @@ void llama_memory_kvmem_mtp::harvest_capture(struct ggml_tensor * t, char which)
             }
         }
     }
-    const float * kptr = which == 'k' ? flat.data() : nullptr;
-    const float * vptr = which == 'v' ? flat.data() : nullptr;
-    raw_->write_layer_tokens(pos0, n, 0, kptr, vptr);
+    if (which != 'k') {
+        return;
+    }
+    const uint64_t b0 = raw_->nvme_bytes_written();
+    const uint64_t sc0 = raw_->nvme_syscalls();
+    raw_->write_layer_tokens(pos0, n, 0, flat.data(), nullptr);
+    perf_nvme_bytes_ += raw_->nvme_bytes_written() - b0;
+    perf_nvme_syscalls_ += raw_->nvme_syscalls() - sc0;
 }
 
-void llama_memory_kvmem_mtp::harvest_pending(struct ggml_backend_sched * /*sched*/) {
+void llama_memory_kvmem_mtp::harvest_pending(struct ggml_backend_sched * sched) {
     // Match trunk: keep pending tensors across graph reuse. Clearing them
     // here drops MTP K for every ubatch after the first of a given size.
     if (!llama_kvmem_want_prefill_capture()) {
@@ -307,10 +334,52 @@ void llama_memory_kvmem_mtp::harvest_pending(struct ggml_backend_sched * /*sched
     if (pos_queue_.empty()) {
         return;
     }
+    ggml_backend_t be = nullptr;
+    if (sched) {
+        for (const CaptureNode & n : pending_capture_) {
+            if (n.t) {
+                be = ggml_backend_sched_get_tensor_backend(sched, n.t);
+                if (be) {
+                    break;
+                }
+            }
+        }
+    }
+    if (be) {
+        const char * sync_old = getenv("KVMEM_HARVEST_SYNC");
+        const bool old = sync_old && sync_old[0] != '\0' && sync_old[0] != '0';
+        const int64_t t0 = ggml_time_us();
+        if (old) {
+            ggml_backend_synchronize(be);
+        } else {
+            ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(be));
+            if (ev) {
+                ggml_backend_event_record(ev, be);
+                ggml_backend_event_synchronize(ev);
+                ggml_backend_event_free(ev);
+            } else {
+                ggml_backend_synchronize(be);
+            }
+        }
+        perf_sync_us_ += ggml_time_us() - t0;
+    }
     cur_pos_ = std::move(pos_queue_.front());
     pos_queue_.erase(pos_queue_.begin());
     for (const CaptureNode & n : pending_capture_) {
         harvest_capture(n.t, n.which);
+    }
+    perf_n_ubatch_ += 1;
+    const char * perf = getenv("KVMEM_PERF");
+    if (perf && perf[0] != '\0' && perf[0] != '0') {
+        fprintf(stderr,
+                "KVMEM_HARVEST ubatch=%u n=%zu is_mtp=1 "
+                "harvest_entry_us=0 sync_us=%lld d2d_us=0 snap_wait_us=0 "
+                "d2h_submit_us=0 commit_us=0 pack_us=0 "
+                "nvme_us=0 nvme_bytes=%llu nvme_syscalls=%llu\n",
+                perf_n_ubatch_, cur_pos_.size(),
+                (long long) perf_sync_us_,
+                (unsigned long long) perf_nvme_bytes_,
+                (unsigned long long) perf_nvme_syscalls_);
     }
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE mtp_harvest n=%zu which=%zu queue=%zu\n",
@@ -398,20 +467,15 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     }
     const uint32_t nt = blk.n_tokens;
     const size_t row = ggml_row_size(type_v_, n_embd_v_);
+    const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
     std::vector<float> v((size_t) nt * n_embd_v_, 0.0f);
-    std::vector<uint8_t> raw(row);
-    for (uint32_t t = 0; t < nt; ++t) {
-        const uint32_t cell = (uint32_t) blk.gpu_slot * block_tokens_ + t;
-        ggml_backend_tensor_get(vt, raw.data(), (size_t) cell * row, row);
-        float * dst = v.data() + t * n_embd_v_;
-        if (type_v_ == GGML_TYPE_F16) {
-            const ggml_fp16_t * src = reinterpret_cast<const ggml_fp16_t *>(raw.data());
-            for (uint32_t d = 0; d < n_embd_v_; ++d) {
-                dst[d] = ggml_fp16_to_fp32(src[d]);
-            }
-        } else if (type_v_ == GGML_TYPE_F32) {
-            std::memcpy(dst, raw.data(), row);
-        }
+    std::vector<uint8_t> raw((size_t) nt * row);
+    ggml_backend_tensor_get(vt, raw.data(), (size_t) cell0 * row, (size_t) nt * row);
+    if (type_v_ == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(raw.data()),
+                              v.data(), (int64_t) nt * n_embd_v_);
+    } else if (type_v_ == GGML_TYPE_F32) {
+        std::memcpy(v.data(), raw.data(), (size_t) nt * row);
     }
     raw_->write_layer_tokens(blk.orig_pos_start, nt, 0, nullptr, v.data());
 }
@@ -428,14 +492,14 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     if (blk.gpu_slot < 0) {
         return;
     }
-    const float * rk = raw_->k(block_id, 0);
-    if (!rk) {
+    const uint32_t nt = blk.n_tokens;
+    std::vector<float> rk((size_t) nt * n_embd_k_);
+    if (!raw_->copy_k(block_id, 0, rk.data())) {
         return;
     }
     occupy_block(block_id);
-    const uint32_t nt = blk.n_tokens;
     std::vector<float> roped((size_t) nt * n_embd_k_);
-    kvmem::rope_neox_apply(rope_, rk, nt, (int32_t) blk.orig_pos_start, roped.data());
+    kvmem::rope_neox_apply(rope_, rk.data(), nt, (int32_t) blk.orig_pos_start, roped.data());
     ggml_tensor * kt = kv_->get_k_storage((int32_t) il_graph_);
     ggml_tensor * vt = kv_->get_v_storage((int32_t) il_graph_);
     if (!kt) {
@@ -443,26 +507,23 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     }
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
-    std::vector<ggml_fp16_t> k16(n_embd_k_);
-    std::vector<ggml_fp16_t> v16(n_embd_v_);
-    const float * rv = raw_->v(block_id, 0);
-    for (uint32_t t = 0; t < nt; ++t) {
-        const uint32_t cell = (uint32_t) blk.gpu_slot * block_tokens_ + t;
-        const float * src = roped.data() + t * n_embd_k_;
-        if (type_k_ == GGML_TYPE_F16) {
-            ggml_fp32_to_fp16_row(src, k16.data(), (int64_t) n_embd_k_);
-            ggml_backend_tensor_set(kt, k16.data(), cell * krow, krow);
+    const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
+    std::vector<ggml_fp16_t> k16((size_t) nt * n_embd_k_);
+    std::vector<ggml_fp16_t> v16((size_t) nt * n_embd_v_);
+    std::vector<float> rv((size_t) nt * n_embd_v_);
+    const bool have_v = raw_->copy_v(block_id, 0, rv.data());
+    if (type_k_ == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(roped.data(), k16.data(), (int64_t) nt * n_embd_k_);
+        ggml_backend_tensor_set(kt, k16.data(), cell0 * krow, nt * krow);
+    } else {
+        ggml_backend_tensor_set(kt, roped.data(), cell0 * krow, nt * krow);
+    }
+    if (have_v && vt && !v_trans_) {
+        if (type_v_ == GGML_TYPE_F16) {
+            ggml_fp32_to_fp16_row(rv.data(), v16.data(), (int64_t) nt * n_embd_v_);
+            ggml_backend_tensor_set(vt, v16.data(), cell0 * vrow, nt * vrow);
         } else {
-            ggml_backend_tensor_set(kt, src, cell * krow, krow);
-        }
-        if (rv && vt && !v_trans_) {
-            const float * vs = rv + t * n_embd_v_;
-            if (type_v_ == GGML_TYPE_F16) {
-                ggml_fp32_to_fp16_row(vs, v16.data(), (int64_t) n_embd_v_);
-                ggml_backend_tensor_set(vt, v16.data(), cell * vrow, vrow);
-            } else {
-                ggml_backend_tensor_set(vt, vs, cell * vrow, vrow);
-            }
+            ggml_backend_tensor_set(vt, rv.data(), cell0 * vrow, nt * vrow);
         }
     }
 }
@@ -513,21 +574,27 @@ void llama_memory_kvmem_mtp::follow_retrieval() {
     uint32_t n_gpu = 0;
     uint32_t n_wb = 0;
     uint32_t n_miss = 0;
-    fprintf(stderr, "KVMEM_TRACE mtp_selected");
+    if (trace_) {
+        fprintf(stderr, "KVMEM_TRACE mtp_selected");
+    }
     for (const auto & b : target_->store().blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens == 0) {
             continue;
         }
         n_gpu++;
-        fprintf(stderr, " %u", b.block_id);
-        if (raw_ && raw_->has_block(b.block_id) && raw_->k(b.block_id, 0)) {
+        if (trace_) {
+            fprintf(stderr, " %u", b.block_id);
+        }
+        if (raw_ && raw_->has_block(b.block_id) && raw_->has_k(b.block_id, 0)) {
             write_block_to_gpu(b.block_id);
             n_wb++;
         } else {
             n_miss++;
         }
     }
-    fprintf(stderr, "\n");
+    if (trace_) {
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr,
             "KVMEM_TRACE mtp_follow n_gpu=%u n_writeback=%u n_no_raw=%u seq_pos=[%d,%d]\n",
             n_gpu, n_wb, n_miss,
