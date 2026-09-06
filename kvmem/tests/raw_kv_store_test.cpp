@@ -122,5 +122,40 @@ int main() {
     raw16.mean_k(0, 0, m16.data());
     CHECK(std::fabs(m16[0] - 1.0f) < 1e-3f);
     CHECK(std::fabs(m16[3] - 1.0f) < 1e-3f);
+
+    kvmem::RawKvStoreConfig gcfg = cfg;
+    gcfg.v_gpu_row_bytes = 6;
+    kvmem::RawKvStore rawg(gcfg);
+    std::vector<uint8_t> packed(12);
+    for (int i = 0; i < 12; ++i) {
+        packed[static_cast<size_t>(i)] = static_cast<uint8_t>(i + 1);
+    }
+    rawg.write_layer_v_gpu(0, 2, 0, packed.data());
+    CHECK(rawg.has_v(0, 0));
+    std::vector<uint8_t> gout(12, 0);
+    CHECK(rawg.copy_v_gpu(0, 0, gout.data(), 2));
+    CHECK(gout[0] == 1);
+    CHECK(gout[11] == 12);
+    std::vector<float> no_f32(8, 0.0f);
+    CHECK(!rawg.copy_v(0, 0, no_f32.data()));
+
+    kvmem::RawKvStoreConfig ngcfg = cfg;
+    ngcfg.v_gpu_row_bytes = 6;
+    ngcfg.nvme_dir = "/tmp/kvmem_raw_vgpu_test";
+    ngcfg.nvme_file = "raw_vgpu.bin";
+    ngcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
+    kvmem::RawKvStore rawgn(ngcfg);
+    CHECK(rawgn.nvme_enabled());
+    std::vector<uint8_t> packed4(24);
+    for (int i = 0; i < 24; ++i) {
+        packed4[static_cast<size_t>(i)] = static_cast<uint8_t>(i + 1);
+    }
+    rawgn.write_layer_v_gpu(0, 4, 0, packed4.data());
+    CHECK(rawgn.has_v(0, 0));
+    std::vector<uint8_t> gout4(24, 0);
+    CHECK(rawgn.copy_v_gpu(0, 0, gout4.data(), 4));
+    CHECK(gout4[0] == 1);
+    CHECK(gout4[23] == 24);
+    CHECK(!rawgn.copy_v(0, 0, no_f32.data()));
     return 0;
 }

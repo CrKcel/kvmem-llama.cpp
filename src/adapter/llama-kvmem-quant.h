@@ -1,8 +1,8 @@
 #pragma once
 
 // Pack/unpack one token-major span of GPU KV cache rows (n_embd_k/v per row).
-// Used by stage-in / harvest_gpu_v. Prefill still writes the cache via the
-// llama.cpp graph (which already quantizes). Raw-K/V stay unrotated FP16.
+// Used by stage-in of raw FP16 K (and harvest-v FP16 V). Prefill writes the
+// cache via the llama.cpp graph. Default V spill is packed GPU rows as-is.
 //
 // Quantized llama.cpp caches apply a Walsh-Hadamard rotation per head before
 // quantize (attn_rot_k/v when n_embd_head % 64 == 0). Stage-in/out must match.

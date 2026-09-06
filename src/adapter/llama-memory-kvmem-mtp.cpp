@@ -71,6 +71,9 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     rcfg.n_embd_k = model.hparams.n_embd_k_gqa(il_mtp);
     rcfg.n_embd_v = model.hparams.n_embd_v_gqa(il_mtp);
     rcfg.block_tokens = block_tokens_;
+    if (!v_trans_) {
+        rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
+    }
     const llama_kvmem_params * kp = llama_kvmem_get_params();
     if (kp && kp->raw_k_nvme) {
         const uint64_t ntok = std::max<uint64_t>(cparams.n_ctx, kv_size_);
@@ -476,20 +479,9 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     const uint32_t nt = blk.n_tokens;
     const size_t row = ggml_row_size(type_v_, n_embd_v_);
     const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
-    std::vector<float> v((size_t) nt * n_embd_v_, 0.0f);
-    std::vector<uint8_t> raw((size_t) nt * row);
-    ggml_backend_tensor_get(vt, raw.data(), (size_t) cell0 * row, (size_t) nt * row);
-    if (!kvmem_cache_unpack_rows(type_v_, raw.data(), v.data(),
-                                 (int64_t) nt, (int64_t) n_embd_v_)) {
-        return;
-    }
-    const int n_head = static_cast<int>(rope_.n_head_kv);
-    const int n_eh = static_cast<int>(rope_.n_embd_head);
-    if (kvmem_attn_rot_on(type_v_, n_eh)) {
-        kvmem_hadamard_rows(v.data(), (int64_t) nt, n_head, n_eh,
-                            kvmem_hadamard_nrot_v(n_eh));
-    }
-    raw_->write_layer_tokens(blk.orig_pos_start, nt, 0, nullptr, v.data());
+    std::vector<uint8_t> packed((size_t) nt * row);
+    ggml_backend_tensor_get(vt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
+    raw_->write_layer_v_gpu(blk.orig_pos_start, nt, 0, packed.data());
 }
 
 void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
@@ -528,19 +520,26 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
     std::vector<uint8_t> kpack((size_t) nt * krow);
     std::vector<uint8_t> vpack((size_t) nt * vrow);
-    std::vector<float> rv((size_t) nt * n_embd_v_);
-    const bool have_v = raw_->copy_v(block_id, 0, rv.data());
-    if (have_v && kvmem_attn_rot_on(type_v_, n_eh)) {
-        kvmem_hadamard_rows(rv.data(), (int64_t) nt, n_head, n_eh,
-                            kvmem_hadamard_nrot_v(n_eh));
+    std::vector<float> rv;
+    const bool have_gpu_v = raw_->copy_v_gpu(block_id, 0, vpack.data(), nt);
+    bool have_v = have_gpu_v;
+    if (!have_gpu_v) {
+        rv.assign((size_t) nt * n_embd_v_, 0.0f);
+        have_v = raw_->copy_v(block_id, 0, rv.data());
+        if (have_v && kvmem_attn_rot_on(type_v_, n_eh)) {
+            kvmem_hadamard_rows(rv.data(), (int64_t) nt, n_head, n_eh,
+                                kvmem_hadamard_nrot_v(n_eh));
+        }
     }
     if (kvmem_cache_pack_rows(type_k_, roped.data(), kpack.data(),
                               (int64_t) nt, (int64_t) n_embd_k_)) {
         ggml_backend_tensor_set(kt, kpack.data(), cell0 * krow, nt * krow);
     }
     if (have_v && vt && !v_trans_) {
-        if (kvmem_cache_pack_rows(type_v_, rv.data(), vpack.data(),
-                                  (int64_t) nt, (int64_t) n_embd_v_)) {
+        if (have_gpu_v) {
+            ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+        } else if (kvmem_cache_pack_rows(type_v_, rv.data(), vpack.data(),
+                                         (int64_t) nt, (int64_t) n_embd_v_)) {
             ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
         }
     }
