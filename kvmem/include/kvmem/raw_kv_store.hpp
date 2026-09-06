@@ -2,11 +2,10 @@
 
 // CPU/NVMe immutable raw-K (pre-RoPE). Indexed by logical block, then layer.
 //
-// K is FP16 authority. Mean-K is captured on every K write so RAM scoring is
-// a memcpy of the cached mean. When NVMe is configured, completed blocks are
-// flushed to SSD and dropped from RAM; the mean stays in RAM.
-// GPU-format V (qw3-style): stage-out copies packed cache rows as-is
-// (`v_gpu_row_bytes`); optional FP16 V is the harvest-v / F32 path.
+// Default K rows are unrotated FP16. When `k_row_bytes` is set (adapter: ggml
+// row size of GPU type_k), K rows are opaque unrotated quant (q8_0/q4_0) with
+// no Hadamard. Mean-K is captured from F16/F32 at write, never from quant rows.
+// GPU-format V (qw3-style): stage-out copies packed working-V rows as-is.
 
 #include <atomic>
 #include <condition_variable>
@@ -27,6 +26,7 @@ struct RawKvStoreConfig {
     uint32_t n_embd_k = 0;
     uint32_t n_embd_v = 0;
     uint32_t block_tokens = 128;
+    uint64_t k_row_bytes = 0;      // 0 = FP16 (n_embd_k * 2); else opaque K row
     uint64_t v_gpu_row_bytes = 0;  // 0 = no packed GPU V; else bytes per token row
     uint64_t nvme_bytes = 0;
     std::string nvme_dir;
@@ -50,7 +50,9 @@ public:
                             const float * k, const float * v);
     void write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
                                 const uint16_t * k, const uint16_t * v);
-    // Packed GPU-cache V rows (same dtype/layout as the working V tensor).
+    // Opaque unrotated K rows (`k_row_bytes`). Optional F32 is mean only.
+    void write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
+                            const uint8_t * k, const float * k_f32);
     void write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il, const uint8_t * v);
 
     bool has_block(uint32_t block_id) const;
@@ -60,6 +62,7 @@ public:
 
     bool copy_k(uint32_t block_id, uint32_t il, float * out) const;
     bool copy_v(uint32_t block_id, uint32_t il, float * out) const;
+    bool copy_k_rows(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
     bool copy_v_gpu(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
 
     void mean_k(uint32_t block_id, uint32_t il, float * out) const;
@@ -77,13 +80,14 @@ public:
 private:
     struct LayerBlk {
         uint32_t n_tokens = 0;
-        std::vector<uint16_t> k;
+        std::vector<uint8_t> k;
         std::vector<uint16_t> v;
         std::vector<uint8_t> v_gpu;
         std::vector<float> mean;
+        std::vector<float> k_sum;
         bool k_on_nvme = false;
         bool v_on_nvme = false;
-        bool v_gpu_fmt = false;  // NVMe/RAM V is packed GPU rows, not FP16
+        bool v_gpu_fmt = false;
         bool k_flushing = false;
         bool v_flushing = false;
     };
@@ -92,13 +96,16 @@ private:
     };
 
     uint32_t nvme_key(uint32_t block_id, uint32_t il, bool is_v) const;
+    uint64_t k_row_bytes() const;
     uint64_t k_slot_bytes() const;
     uint64_t v_slot_bytes() const;
     uint64_t v_gpu_slot_bytes() const;
+    bool k_is_f16() const;
     void maybe_flush_k(uint32_t block_id, uint32_t il);
     void maybe_flush_v(uint32_t block_id, uint32_t il);
-    void capture_mean(LayerBlk & lb) const;
-    bool load_k_nvme(uint32_t block_id, uint32_t il, uint16_t * dst) const;
+    void capture_mean_f16(LayerBlk & lb) const;
+    void add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take, const float * k);
+    bool load_k_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const;
     bool load_v_nvme(uint32_t block_id, uint32_t il, uint16_t * dst) const;
     bool load_v_gpu_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const;
     void enqueue_flush(uint32_t key, std::vector<uint8_t> && data, uint64_t bytes,

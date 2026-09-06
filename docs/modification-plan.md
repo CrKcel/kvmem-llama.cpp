@@ -1,6 +1,6 @@
 # KVMem × llama.cpp 修改计划
 
-**状态（2026-09-05）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7（KVMem + MTP 方案 B，含 `n_rs_seq`）打成 **`v0.5.0`**（tag `v0.5.0`）。产品默认 `--kvmem` = retrieval + query-last 64；MTP 可选 `--spec-type draft-mtp`。阶段测试：[milestones/v0.5.0.md](milestones/v0.5.0.md)。P6 未开始。详见 [kvmem-mtp-plan.md](kvmem-mtp-plan.md)。
+**状态（2026-09-06）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7 **`v0.5.0`**。量化 KV spill / unrotated q8 raw-K 打成 **`v0.6.0`**（tag `v0.6.0`）。产品默认 `--kvmem` = retrieval + query-last 64，GPU KV **q8_0**；MTP 可选 `--spec-type draft-mtp`（默认 **none**）。ISTA IQ3_S 不开 MTP。阶段测试：[milestones/v0.6.0.md](milestones/v0.6.0.md)。P6 未开始。
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**
 

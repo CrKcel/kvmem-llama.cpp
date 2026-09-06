@@ -428,6 +428,9 @@ llama_memory_kvmem::llama_memory_kvmem(
     rcfg.n_embd_k = n_embd_k_;
     rcfg.n_embd_v = n_embd_v_;
     rcfg.block_tokens = block_tokens_;
+    if (ggml_is_quantized(type_k_)) {
+        rcfg.k_row_bytes = ggml_row_size(type_k_, n_embd_k_);
+    }
     if (!v_trans_) {
         rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
     }
@@ -1754,7 +1757,27 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
     const uint32_t n = static_cast<uint32_t>(cur_pos_.size());
     const uint32_t pos0 = static_cast<uint32_t>(cur_pos_[0]);
     if (which == 'k') {
-        if (type == GGML_TYPE_F16) {
+        if (ggml_is_quantized(type_k_)) {
+            std::vector<float> flat;
+            if (type == GGML_TYPE_F16) {
+                std::vector<uint16_t> flat16;
+                bytes_to_f16_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat16);
+                flat.resize(flat16.size());
+                ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(flat16.data()),
+                                      flat.data(), static_cast<int64_t>(flat16.size()));
+            } else {
+                bytes_to_f32_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat);
+            }
+            const size_t krow = ggml_row_size(type_k_, n_embd_k_);
+            std::vector<uint8_t> packed(static_cast<size_t>(n) * krow);
+            if (!kvmem_cache_pack_rows(type_k_, flat.data(), packed.data(),
+                                       static_cast<int64_t>(n),
+                                       static_cast<int64_t>(n_embd_k_))) {
+                return;
+            }
+            raw_->write_layer_k_rows(pos0, n, static_cast<uint32_t>(il),
+                                     packed.data(), flat.data());
+        } else if (type == GGML_TYPE_F16) {
             std::vector<uint16_t> flat16;
             bytes_to_f16_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat16);
             raw_->write_layer_tokens_f16(pos0, n, static_cast<uint32_t>(il),
@@ -1821,7 +1844,18 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
     const uint32_t pos0 = static_cast<uint32_t>(cur_pos_[0]);
 
     if (which == 'k') {
-        raw_->write_layer_tokens(pos0, n, static_cast<uint32_t>(il), flat.data(), nullptr);
+        if (ggml_is_quantized(type_k_)) {
+            const size_t krow = ggml_row_size(type_k_, n_embd_k_);
+            std::vector<uint8_t> packed(static_cast<size_t>(n) * krow);
+            if (kvmem_cache_pack_rows(type_k_, flat.data(), packed.data(),
+                                      static_cast<int64_t>(n),
+                                      static_cast<int64_t>(n_embd_k_))) {
+                raw_->write_layer_k_rows(pos0, n, static_cast<uint32_t>(il),
+                                         packed.data(), flat.data());
+            }
+        } else {
+            raw_->write_layer_tokens(pos0, n, static_cast<uint32_t>(il), flat.data(), nullptr);
+        }
         static bool dumped = false;
         if (!dumped && getenv("KVMEM_DUMP_CAPTURE") && il == 0) {
             dumped = true;
@@ -1935,7 +1969,16 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
             continue;
         }
         const int64_t t_copy = ggml_time_us();
-        if (!raw_->copy_k(block_id, il, rk.data())) {
+        bool have_k = false;
+        if (ggml_is_quantized(type_k_)) {
+            have_k = raw_->copy_k_rows(block_id, il, kpack.data(), nt) &&
+                    kvmem_cache_unpack_rows(type_k_, kpack.data(), rk.data(),
+                                            static_cast<int64_t>(nt),
+                                            static_cast<int64_t>(n_embd_k_));
+        } else {
+            have_k = raw_->copy_k(block_id, il, rk.data());
+        }
+        if (!have_k) {
             continue;
         }
         const bool have_gpu_v = raw_->copy_v_gpu(block_id, il, vpack.data(), nt);
@@ -2447,7 +2490,16 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
             continue;
         }
         std::vector<float> rk(nk), rvbuf(nv);
-        if (!raw_->copy_k(bid, il, rk.data())) {
+        bool have_raw_k = raw_->copy_k(bid, il, rk.data());
+        if (!have_raw_k && ggml_is_quantized(type_k_)) {
+            const size_t krow = ggml_row_size(type_k_, n_embd_k_);
+            std::vector<uint8_t> kpack(static_cast<size_t>(nt) * krow);
+            have_raw_k = raw_->copy_k_rows(bid, il, kpack.data(), nt) &&
+                    kvmem_cache_unpack_rows(type_k_, kpack.data(), rk.data(),
+                                            static_cast<int64_t>(nt),
+                                            static_cast<int64_t>(n_embd_k_));
+        }
+        if (!have_raw_k) {
             fprintf(stderr, "KVMEM_KV L%u no raw K\n", il);
             continue;
         }
@@ -2469,12 +2521,10 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
                 have_v = true;
             }
         }
-        kvmem::rope_neox_apply(rope_, rk.data(), nt, static_cast<int32_t>(blk.orig_pos_start), rec_k.data());
-
         char tag[64];
+        kvmem::rope_neox_apply(rope_, rk.data(), nt, static_cast<int32_t>(blk.orig_pos_start), rec_k.data());
         snprintf(tag, sizeof(tag), "L%u K rebuild_vs_gpu", il);
         kv_stats(tag, gpu_k.data(), rec_k.data(), nk);
-
         snprintf(tag, sizeof(tag), "L%u K raw_vs_gpu (no rope; ~1 only at pos0)", il);
         kv_stats(tag, gpu_k.data(), rk.data(), n_embd_k_);
 

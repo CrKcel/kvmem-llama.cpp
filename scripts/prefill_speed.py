@@ -54,7 +54,8 @@ def find_cli() -> Path:
 
 
 def run_once(cli: Path, model: Path, extra: list[str], prompt: str, n_ctx: int,
-             n_predict: int, gpu: str = "small") -> dict:
+             n_predict: int, gpu: str = "small",
+             n_batch: int = 256, n_ubatch: int = 0) -> dict:
     env = gpu_env.apply_gpu(os.environ.copy(), gpu)
     env.pop("KVMEM_TRACE", None)
     with tempfile.NamedTemporaryFile("w", prefix="kvmem_prefill_", suffix=".txt",
@@ -62,9 +63,11 @@ def run_once(cli: Path, model: Path, extra: list[str], prompt: str, n_ctx: int,
         fh.write(prompt)
         path = fh.name
     try:
+        ub = n_ubatch if n_ubatch > 0 else n_batch
         cmd = [
             str(cli), "-m", str(model), "-n", str(n_predict), "-c", str(n_ctx),
-            "-b", "256", "-ngl", "99", "--temp", "0", "--no-prompt", "-f", path, *extra,
+            "-b", str(n_batch), "-ub", str(ub), "-ngl", "99", "--temp", "0",
+            "--no-prompt", "-f", path, *extra,
         ]
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
     finally:
@@ -165,6 +168,10 @@ def main() -> int:
                     help="--kvmem-gen-reserve for kvmem modes; 0 = CLI default")
     ap.add_argument("--gpu", choices=("small", "27b", "5050", "5090"), default="small",
                     help="small/5050 = RTX 5050; 27b/5090 = RTX 5090 (27B only)")
+    ap.add_argument("-b", "--batch", type=int, default=256,
+                    help="llama.cpp -b (n_batch). 27B comparisons should use 512.")
+    ap.add_argument("-ub", "--ubatch", type=int, default=0,
+                    help="llama.cpp -ub (n_ubatch). 0 = same as --batch.")
     args = ap.parse_args()
     if not args.model.is_file():
         raise SystemExit(f"missing model {args.model}")
@@ -176,7 +183,8 @@ def main() -> int:
 
     gpu_name = "RTX 5090" if args.gpu in ("27b", "5090") else "RTX 5050"
     print(f"model={args.model.name} warmup={args.warmup} runs={args.runs} "
-          f"n_predict={args.n_predict} device={gpu_name} spec_n_max={args.spec_n_max}")
+          f"n_predict={args.n_predict} device={gpu_name} spec_n_max={args.spec_n_max} "
+          f"batch={args.batch} ubatch={args.ubatch or args.batch}")
     print("modes: off | recency | cap | retr | off+mtp | rec+mtp | retr+mtp")
     print("decode = KVMEM_GEN_WALL (emitted tokens / wall); MTP verify is n>1 so "
           "llama_perf gen_toks is not comparable.")
@@ -202,10 +210,10 @@ def main() -> int:
             try:
                 for _ in range(args.warmup):
                     run_once(cli, args.model, extra, prompt, n_ctx, args.n_predict,
-                             gpu=args.gpu)
+                             gpu=args.gpu, n_batch=args.batch, n_ubatch=args.ubatch)
                 rows = [
                     run_once(cli, args.model, extra, prompt, n_ctx, args.n_predict,
-                             gpu=args.gpu)
+                             gpu=args.gpu, n_batch=args.batch, n_ubatch=args.ubatch)
                     for _ in range(args.runs)
                 ]
             except RuntimeError as exc:

@@ -3,12 +3,11 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.5.0`](docs/milestones/v0.5.0.md)** (2026-09-05).
-llama.cpp can run KVMem on dense Qwen3 and hybrid Qwen3.5, including optional
-`--spec-type draft-mtp` on the same slot-pool as the trunk (plan B). Product
-default `--kvmem` is retrieval + query-last 64, GPU KV **q8_0** (`--kv-dtype f16|q4_0` to override). 0.8B (5050) and 27B (5090)
-retrieval+MTP revive BLUEBIRD-42 with `--no-think`. 27B 8k–64k: main KV 32 MiB
-+ MTP KV 2 MiB, independent of T. P6 (Metal/Vulkan) is not started.
+**Current local milestone: [`v0.6.0`](docs/milestones/v0.6.0.md)** (2026-09-06).
+GPU KV default **q8_0**; V spill is packed working-cache rows; raw-K is
+unrotated q8_0 (same ggml type as GPU, no RoPE/Hadamard) with F32 mean-K.
+`--kvmem` is retrieval + query-last 64. MTP remains optional (`v0.5.0`).
+0.8B identity + BLUEBIRD-42 GO. Speed recorded. P6 is not started.
 
 ## Layout
 
@@ -30,11 +29,11 @@ retrieval+MTP revive BLUEBIRD-42 with `--no-think`. 27B 8k–64k: main KV 32 MiB
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.5.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.6.0` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.5.0
+git checkout v0.6.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh

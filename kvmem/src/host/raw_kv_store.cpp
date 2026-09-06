@@ -149,8 +149,17 @@ uint32_t RawKvStore::nvme_key(uint32_t block_id, uint32_t il, bool is_v) const {
     return block_id * (cfg_.n_layer * 2u + 2u) + il * 2u + (is_v ? 1u : 0u);
 }
 
+uint64_t RawKvStore::k_row_bytes() const {
+    return cfg_.k_row_bytes ? cfg_.k_row_bytes
+                            : static_cast<uint64_t>(cfg_.n_embd_k) * sizeof(uint16_t);
+}
+
+bool RawKvStore::k_is_f16() const {
+    return k_row_bytes() == static_cast<uint64_t>(cfg_.n_embd_k) * sizeof(uint16_t);
+}
+
 uint64_t RawKvStore::k_slot_bytes() const {
-    return static_cast<uint64_t>(cfg_.block_tokens) * cfg_.n_embd_k * sizeof(uint16_t);
+    return static_cast<uint64_t>(cfg_.block_tokens) * k_row_bytes();
 }
 
 uint64_t RawKvStore::v_slot_bytes() const {
@@ -172,24 +181,54 @@ void RawKvStore::ensure_blocks(uint32_t block_count) {
     }
 }
 
-void RawKvStore::capture_mean(LayerBlk & lb) const {
-    if (lb.k.empty() || cfg_.n_embd_k == 0) {
+void RawKvStore::capture_mean_f16(LayerBlk & lb) const {
+    if (!k_is_f16() || lb.k.empty() || cfg_.n_embd_k == 0) {
         return;
     }
     const uint32_t nt = lb.n_tokens;
     if (nt == 0) {
         return;
     }
+    const uint64_t row = k_row_bytes();
     lb.mean.assign(cfg_.n_embd_k, 0.0f);
     for (uint32_t t = 0; t < nt; ++t) {
-        const uint16_t * row = lb.k.data() + t * cfg_.n_embd_k;
+        const auto * src = reinterpret_cast<const uint16_t *>(
+                lb.k.data() + static_cast<size_t>(t) * static_cast<size_t>(row));
         for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-            lb.mean[d] += f16_to_f32(row[d]);
+            lb.mean[d] += f16_to_f32(src[d]);
         }
     }
     const float inv = 1.0f / static_cast<float>(nt);
     for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
         lb.mean[d] *= inv;
+    }
+}
+
+void RawKvStore::add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take,
+                              const float * k) {
+    if (!k || take == 0 || cfg_.n_embd_k == 0) {
+        return;
+    }
+    if (lb.k_sum.size() != cfg_.n_embd_k) {
+        lb.k_sum.assign(cfg_.n_embd_k, 0.0f);
+    }
+    if (off == 0 && lb.n_tokens == 0) {
+        std::fill(lb.k_sum.begin(), lb.k_sum.end(), 0.0f);
+    }
+    for (uint32_t t = 0; t < take; ++t) {
+        const float * row = k + t * cfg_.n_embd_k;
+        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
+            lb.k_sum[d] += row[d];
+        }
+    }
+    const uint32_t nt = std::max(lb.n_tokens, off + take);
+    lb.mean.assign(cfg_.n_embd_k, 0.0f);
+    if (nt == 0) {
+        return;
+    }
+    const float inv = 1.0f / static_cast<float>(nt);
+    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
+        lb.mean[d] = lb.k_sum[d] * inv;
     }
 }
 
@@ -216,10 +255,12 @@ void RawKvStore::maybe_flush_k(uint32_t block_id, uint32_t il) {
         lb.n_tokens < cfg_.block_tokens) {
         return;
     }
-    capture_mean(lb);
     const uint64_t nbytes = k_slot_bytes();
-    if (lb.k.size() * sizeof(uint16_t) < nbytes) {
+    if (lb.k.size() < nbytes) {
         return;
+    }
+    if (k_is_f16() && lb.mean.size() != cfg_.n_embd_k) {
+        capture_mean_f16(lb);
     }
     if (io_sync_inline() || !io_thread_.joinable()) {
         const uint64_t t0 = monotonic_ns();
@@ -394,12 +435,16 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
+        if (k) {
+            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
+        }
         if (v) {
             cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
         }
         LayerBlk & lb = blocks_[bid].layers[il];
-        if (k) {
-            const size_t need = static_cast<size_t>(bt) * cfg_.n_embd_k;
+        if (k && k_is_f16()) {
+            const uint64_t row = k_row_bytes();
+            const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
             if (lb.k.size() < need) {
                 if (lb.k_on_nvme) {
                     lb.k.assign(need, 0);
@@ -410,8 +455,10 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
                 }
             }
             pack_f32(k + done * cfg_.n_embd_k,
-                     lb.k.data() + off * cfg_.n_embd_k,
+                     reinterpret_cast<uint16_t *>(
+                             lb.k.data() + static_cast<size_t>(off) * static_cast<size_t>(row)),
                      static_cast<size_t>(take) * cfg_.n_embd_k);
+            add_mean_f32(lb, off, take, k + done * cfg_.n_embd_k);
         }
         if (v) {
             lb.v_gpu.clear();
@@ -435,9 +482,6 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
             lb.v_gpu_fmt = false;
         }
         lb.n_tokens = std::max(lb.n_tokens, off + take);
-        if (k) {
-            capture_mean(lb);
-        }
         maybe_flush_k(bid, il);
         maybe_flush_v(bid, il);
         done += take;
@@ -458,12 +502,16 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
+        if (k) {
+            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
+        }
         if (v) {
             cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
         }
         LayerBlk & lb = blocks_[bid].layers[il];
-        if (k) {
-            const size_t need = static_cast<size_t>(bt) * cfg_.n_embd_k;
+        if (k && k_is_f16()) {
+            const uint64_t row = k_row_bytes();
+            const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
             if (lb.k.size() < need) {
                 if (lb.k_on_nvme) {
                     lb.k.assign(need, 0);
@@ -473,9 +521,9 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
                     lb.k.assign(need, 0);
                 }
             }
-            std::memcpy(lb.k.data() + off * cfg_.n_embd_k,
+            std::memcpy(lb.k.data() + static_cast<size_t>(off) * static_cast<size_t>(row),
                         k + done * cfg_.n_embd_k,
-                        static_cast<size_t>(take) * cfg_.n_embd_k * sizeof(uint16_t));
+                        static_cast<size_t>(take) * static_cast<size_t>(row));
         }
         if (v) {
             lb.v_gpu.clear();
@@ -499,11 +547,51 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
             lb.v_gpu_fmt = false;
         }
         lb.n_tokens = std::max(lb.n_tokens, off + take);
-        if (k) {
-            capture_mean(lb);
+        if (k && k_is_f16()) {
+            capture_mean_f16(lb);
         }
         maybe_flush_k(bid, il);
         maybe_flush_v(bid, il);
+        done += take;
+    }
+}
+
+void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
+                                    const uint8_t * k, const float * k_f32) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (!k || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
+        k_row_bytes() == 0) {
+        return;
+    }
+    const uint32_t bt = cfg_.block_tokens;
+    const uint64_t row = k_row_bytes();
+    uint32_t done = 0;
+    while (done < n) {
+        const uint32_t pos = pos0 + done;
+        const uint32_t bid = pos / bt;
+        const uint32_t off = pos % bt;
+        const uint32_t take = std::min(n - done, bt - off);
+        ensure_blocks(bid + 1);
+        cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
+        LayerBlk & lb = blocks_[bid].layers[il];
+        const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
+        if (lb.k.size() < need) {
+            if (lb.k_on_nvme) {
+                lb.k.assign(need, 0);
+                load_k_nvme(bid, il, lb.k.data());
+                lb.k_on_nvme = false;
+            } else {
+                lb.k.assign(need, 0);
+            }
+        }
+        std::memcpy(lb.k.data() + static_cast<size_t>(off) * static_cast<size_t>(row),
+                    k + static_cast<size_t>(done) * static_cast<size_t>(row),
+                    static_cast<size_t>(take) * static_cast<size_t>(row));
+        if (k_f32) {
+            add_mean_f32(lb, off, take, k_f32 + done * cfg_.n_embd_k);
+        }
+        lb.n_tokens = std::max(lb.n_tokens, off + take);
+        maybe_flush_k(bid, il);
         done += take;
     }
 }
@@ -595,7 +683,7 @@ uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
     return n;
 }
 
-bool RawKvStore::load_k_nvme(uint32_t block_id, uint32_t il, uint16_t * dst) const {
+bool RawKvStore::load_k_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const {
     if (!nvme_enabled() || !dst) {
         return false;
     }
@@ -632,7 +720,7 @@ bool RawKvStore::load_v_gpu_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) 
 }
 
 bool RawKvStore::copy_k(uint32_t block_id, uint32_t il, float * out) const {
-    if (!out) {
+    if (!out || !k_is_f16()) {
         return false;
     }
     std::unique_lock<std::mutex> lk(mu_);
@@ -648,17 +736,18 @@ bool RawKvStore::copy_k(uint32_t block_id, uint32_t il, float * out) const {
         return false;
     }
     const uint32_t nt = lb.n_tokens;
-    const uint16_t * src = nullptr;
+    const uint8_t * raw = nullptr;
     if (!lb.k.empty()) {
-        src = lb.k.data();
+        raw = lb.k.data();
     } else {
-        io_.assign(static_cast<size_t>(cfg_.block_tokens) * cfg_.n_embd_k, 0);
-        if (!load_k_nvme(block_id, il, io_.data())) {
+        io8_.assign(static_cast<size_t>(k_slot_bytes()), 0);
+        if (!load_k_nvme(block_id, il, io8_.data())) {
             return false;
         }
-        src = io_.data();
+        raw = io8_.data();
     }
-    unpack_f16(src, out, static_cast<size_t>(nt) * cfg_.n_embd_k);
+    unpack_f16(reinterpret_cast<const uint16_t *>(raw), out,
+               static_cast<size_t>(nt) * cfg_.n_embd_k);
     return true;
 }
 
@@ -693,6 +782,38 @@ bool RawKvStore::copy_v(uint32_t block_id, uint32_t il, float * out) const {
         src = io_.data();
     }
     unpack_f16(src, out, static_cast<size_t>(nt) * cfg_.n_embd_v);
+    return true;
+}
+
+bool RawKvStore::copy_k_rows(uint32_t block_id, uint32_t il, uint8_t * out,
+                             uint32_t n) const {
+    if (!out || n == 0 || k_row_bytes() == 0) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
+        return false;
+    }
+    cv_.wait(lk, [&] {
+        const LayerBlk & x = blocks_[block_id].layers[il];
+        return !x.k_flushing;
+    });
+    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const uint64_t row = k_row_bytes();
+    const uint32_t nt = std::min(n, lb.n_tokens);
+    const uint8_t * src = nullptr;
+    if (!lb.k.empty()) {
+        src = lb.k.data();
+    } else if (lb.k_on_nvme) {
+        io8_.assign(static_cast<size_t>(k_slot_bytes()), 0);
+        if (!load_k_nvme(block_id, il, io8_.data())) {
+            return false;
+        }
+        src = io8_.data();
+    } else {
+        return false;
+    }
+    std::memcpy(out, src, static_cast<size_t>(nt) * static_cast<size_t>(row));
     return true;
 }
 
@@ -740,11 +861,11 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
         return;
     }
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (lb.k.empty() && !lb.k_on_nvme && !lb.k_flushing) {
-        return;
-    }
     if (lb.mean.size() == cfg_.n_embd_k) {
         std::memcpy(out, lb.mean.data(), cfg_.n_embd_k * sizeof(float));
+        return;
+    }
+    if (!k_is_f16()) {
         return;
     }
     cv_.wait(lk, [&] {
@@ -759,21 +880,25 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
     if (nt == 0 || cfg_.n_embd_k == 0) {
         return;
     }
-    const uint16_t * src = nullptr;
+    const uint8_t * raw = nullptr;
     if (!lb.k.empty()) {
-        src = lb.k.data();
-    } else {
-        io_.assign(static_cast<size_t>(cfg_.block_tokens) * cfg_.n_embd_k, 0);
-        if (!load_k_nvme(block_id, il, io_.data())) {
+        raw = lb.k.data();
+    } else if (lb.k_on_nvme) {
+        io8_.assign(static_cast<size_t>(k_slot_bytes()), 0);
+        if (!load_k_nvme(block_id, il, io8_.data())) {
             return;
         }
-        src = io_.data();
+        raw = io8_.data();
+    } else {
+        return;
     }
+    const uint64_t row = k_row_bytes();
     std::fill(out, out + cfg_.n_embd_k, 0.0f);
     for (uint32_t t = 0; t < nt; ++t) {
-        const uint16_t * row = src + t * cfg_.n_embd_k;
+        const auto * src = reinterpret_cast<const uint16_t *>(
+                raw + static_cast<size_t>(t) * static_cast<size_t>(row));
         for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-            out[d] += f16_to_f32(row[d]);
+            out[d] += f16_to_f32(src[d]);
         }
     }
     const float inv = 1.0f / static_cast<float>(nt);
@@ -787,7 +912,7 @@ size_t RawKvStore::bytes_k() const {
     size_t n = nvme_k_bytes_;
     for (const auto & b : blocks_) {
         for (const auto & lb : b.layers) {
-            n += lb.k.size() * sizeof(uint16_t);
+            n += lb.k.size();
             n += lb.mean.size() * sizeof(float);
         }
     }

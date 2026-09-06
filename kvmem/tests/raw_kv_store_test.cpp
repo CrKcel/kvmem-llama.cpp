@@ -157,5 +157,41 @@ int main() {
     CHECK(gout4[0] == 1);
     CHECK(gout4[23] == 24);
     CHECK(!rawgn.copy_v(0, 0, no_f32.data()));
+
+    kvmem::RawKvStoreConfig kcfg = cfg;
+    kcfg.k_row_bytes = 6;
+    kvmem::RawKvStore rawk(kcfg);
+    rawk.write_layer_k_rows(0, 2, 0, packed.data(), k.data());
+    CHECK(rawk.has_k(0, 0));
+    std::vector<uint8_t> kout(12, 0);
+    CHECK(rawk.copy_k_rows(0, 0, kout.data(), 2));
+    CHECK(kout[0] == 1);
+    CHECK(kout[11] == 12);
+    CHECK(!rawk.copy_k(0, 0, no_f32.data()));
+    std::vector<float> mk(4, 0.0f);
+    rawk.mean_k(0, 0, mk.data());
+    CHECK(std::fabs(mk[0] - 2.0f) < 1e-3f);
+
+    kvmem::RawKvStoreConfig nkcfg = cfg;
+    nkcfg.k_row_bytes = 6;
+    nkcfg.nvme_dir = "/tmp/kvmem_raw_krow_test";
+    nkcfg.nvme_file = "raw_krow.bin";
+    nkcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
+    kvmem::RawKvStore rawkn(nkcfg);
+    CHECK(rawkn.nvme_enabled());
+    std::vector<float> krowf(16, 0.0f);
+    for (int i = 0; i < 16; ++i) {
+        krowf[static_cast<size_t>(i)] = static_cast<float>(i);
+    }
+    rawkn.write_layer_k_rows(0, 4, 0, packed4.data(), krowf.data());
+    CHECK(rawkn.has_k(0, 0));
+    std::vector<uint8_t> kout4(24, 0);
+    CHECK(rawkn.copy_k_rows(0, 0, kout4.data(), 4));
+    CHECK(kout4[0] == 1);
+    CHECK(kout4[23] == 24);
+    CHECK(!rawkn.copy_k(0, 0, no_f32.data()));
+    std::vector<float> krowmean(4, 0.0f);
+    rawkn.mean_k(0, 0, krowmean.data());
+    CHECK(std::fabs(krowmean[0] - 6.0f) < 1e-3f);
     return 0;
 }
