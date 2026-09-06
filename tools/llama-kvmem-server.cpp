@@ -43,6 +43,12 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
             "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
+            "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
+            "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
+            "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
+            "  --kvmem-nvme-dir PATH      NVMe directory (default /tmp/kvmem_nvme)\n"
+            "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
+            "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n",
@@ -331,6 +337,7 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string host = "127.0.0.1";
+    std::string nvme_dir;
     int port = 8080;
     int n_ctx = 2048;
     int ngl = 99;
@@ -384,6 +391,22 @@ int main(int argc, char ** argv) {
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = std::atoi(need(arg));
+        } else if (eq(arg, "--kvmem-gpu-ratio")) {
+            st.kparams.gpu_memory_ratio = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--kvmem-cpu-gb")) {
+            const double gb = std::atof(need(arg));
+            st.kparams.cpu_bytes = gb <= 0.0 ? 0
+                : static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
+        } else if (eq(arg, "--kvmem-nvme-gb")) {
+            const double gb = std::atof(need(arg));
+            st.kparams.nvme_bytes = gb <= 0.0 ? 0
+                : static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
+        } else if (eq(arg, "--kvmem-nvme-dir")) {
+            nvme_dir = need(arg);
+        } else if (eq(arg, "--kvmem-harvest-v")) {
+            st.kparams.harvest_v = true;
+        } else if (eq(arg, "--kvmem-raw-k-nvme")) {
+            st.kparams.raw_k_nvme = true;
         } else if (eq(arg, "--spec-type")) {
             const char * t = need(arg);
             if (eq(t, "draft-mtp")) {
@@ -424,6 +447,9 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     if (st.kparams.enabled) {
+        if (!nvme_dir.empty()) {
+            st.kparams.nvme_dir = nvme_dir.c_str();
+        }
         llama_kvmem_set_params(&st.kparams);
     }
 

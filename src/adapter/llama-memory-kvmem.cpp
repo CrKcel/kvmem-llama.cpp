@@ -448,10 +448,11 @@ llama_memory_kvmem::llama_memory_kvmem(
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s n_embd_k=%u attn_layers=%u%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d n_embd_k=%u attn_layers=%u%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
+            (int) g_kvmem_params.harvest_v,
             n_embd_k_, kvmem_n_attn_layers(model),
             ext_kv ? " hybrid_attn" : "");
     fprintf(stderr,
@@ -1759,7 +1760,16 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
             raw_->write_layer_tokens(pos0, n, static_cast<uint32_t>(il), flat.data(), nullptr);
         }
     } else if (which == 'v') {
-        return;
+        if (type == GGML_TYPE_F16) {
+            std::vector<uint16_t> flat16;
+            bytes_to_f16_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat16);
+            raw_->write_layer_tokens_f16(pos0, n, static_cast<uint32_t>(il),
+                                         nullptr, flat16.data());
+        } else {
+            std::vector<float> flat;
+            bytes_to_f32_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat);
+            raw_->write_layer_tokens(pos0, n, static_cast<uint32_t>(il), nullptr, flat.data());
+        }
     } else if (which == 'q') {
         std::vector<float> flat;
         bytes_to_f32_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat);
@@ -1818,7 +1828,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
                     n, std::sqrt(acc / std::max<size_t>(flat.size(), 1)), flat.size());
         }
     } else if (which == 'v') {
-        return;
+        raw_->write_layer_tokens(pos0, n, static_cast<uint32_t>(il), nullptr, flat.data());
     } else if (which == 'q') {
         const uint32_t qdim = n_head_ * n_embd_head_;
         if (flat.size() < static_cast<size_t>(n) * qdim) {
@@ -1866,7 +1876,15 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     }
     std::vector<float> v;
     uint32_t n_ok = 0;
+    uint32_t n_skip = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
+        if (raw_->has_v(block_id, il)) {
+            n_skip++;
+            continue;
+        }
         if (!read_gpu_block(block_id, il, false, v)) {
             continue;
         }
@@ -1874,8 +1892,8 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
         n_ok++;
     }
     if (trace_) {
-        fprintf(stderr, "KVMEM_TRACE harvest_v block=%u slot=%d n=%u layers=%u\n",
-                block_id, blk.gpu_slot, blk.n_tokens, n_ok);
+        fprintf(stderr, "KVMEM_TRACE harvest_v block=%u slot=%d n=%u layers=%u skip=%u\n",
+                block_id, blk.gpu_slot, blk.n_tokens, n_ok, n_skip);
     }
 }
 
@@ -2470,7 +2488,7 @@ bool llama_kvmem_want_prefill_capture(void) {
     if (!kp || !kp->enabled) {
         return false;
     }
-    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
+    if (kp->method != 1 && !kp->harvest_v && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
         return false;
     }
     llama_memory_kvmem * mem = kvmem_capture_active();

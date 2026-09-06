@@ -42,6 +42,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe spill file in GiB (0 = off)\n"
             "  --kvmem-nvme-dir PATH      NVMe spill directory (default /tmp/kvmem_nvme)\n"
+            "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
+            "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
@@ -160,6 +162,10 @@ int main(int argc, char ** argv) {
                 : static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
         } else if (eq(arg, "--kvmem-nvme-dir")) {
             nvme_dir = need(arg);
+        } else if (eq(arg, "--kvmem-harvest-v")) {
+            kparams.harvest_v = true;
+        } else if (eq(arg, "--kvmem-raw-k-nvme")) {
+            kparams.raw_k_nvme = true;
         } else if (eq(arg, "--spec-type")) {
             const char * t = need(arg);
             if (eq(t, "draft-mtp")) {

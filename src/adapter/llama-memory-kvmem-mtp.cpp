@@ -277,6 +277,9 @@ void llama_memory_kvmem_mtp::harvest_capture(struct ggml_tensor * t, char which)
     if (!llama_kvmem_want_prefill_capture()) {
         return;
     }
+    if (which != 'k' && which != 'v') {
+        return;
+    }
     std::vector<uint8_t> tmp(ggml_nbytes(t));
     const int64_t t0 = ggml_time_us();
     ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
@@ -286,7 +289,7 @@ void llama_memory_kvmem_mtp::harvest_capture(struct ggml_tensor * t, char which)
     const int64_t d = t->ne[0];
     const int64_t h = t->ne[1] > 0 ? t->ne[1] : 1;
     const int64_t ntok = t->ne[2] > 0 ? t->ne[2] : 1;
-    const uint32_t dim = n_embd_k_;
+    const uint32_t dim = which == 'v' ? n_embd_v_ : n_embd_k_;
     std::vector<float> flat((size_t) n * dim, 0.0f);
     const uint32_t n_use = std::min(n, (uint32_t) ntok);
     for (uint32_t tok = 0; tok < n_use; ++tok) {
@@ -309,12 +312,13 @@ void llama_memory_kvmem_mtp::harvest_capture(struct ggml_tensor * t, char which)
             }
         }
     }
-    if (which != 'k') {
-        return;
-    }
     const uint64_t b0 = raw_->nvme_bytes_written();
     const uint64_t sc0 = raw_->nvme_syscalls();
-    raw_->write_layer_tokens(pos0, n, 0, flat.data(), nullptr);
+    if (which == 'k') {
+        raw_->write_layer_tokens(pos0, n, 0, flat.data(), nullptr);
+    } else {
+        raw_->write_layer_tokens(pos0, n, 0, nullptr, flat.data());
+    }
     perf_nvme_bytes_ += raw_->nvme_bytes_written() - b0;
     perf_nvme_syscalls_ += raw_->nvme_syscalls() - sc0;
 }
@@ -453,6 +457,9 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     }
     const kvmem::KvMemBlock & blk = st.blocks()[block_id];
     if (blk.gpu_slot < 0 || blk.n_tokens == 0) {
+        return;
+    }
+    if (raw_->has_v(block_id, 0)) {
         return;
     }
     const llama_kv_cells & cells = kv_->get_cells(0);

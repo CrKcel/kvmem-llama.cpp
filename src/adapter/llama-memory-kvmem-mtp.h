@@ -62,6 +62,11 @@ public:
     void register_capture(struct ggml_tensor * t, int il, char which);
     void capture_on_new_graph();
     void harvest_pending(struct ggml_backend_sched * sched);
+    void harvest_flush();
+    uint32_t harvest_perf_n_ubatch() const { return perf_n_ubatch_; }
+    int64_t harvest_perf_sync_us() const { return perf_sync_us_; }
+    uint64_t harvest_perf_nvme_bytes() const { return perf_nvme_bytes_; }
+    uint64_t harvest_perf_nvme_syscalls() const { return perf_nvme_syscalls_; }
     void on_stage_out(uint32_t block_id);
     void harvest_resident_v();
     void follow_retrieval();
@@ -97,4 +102,8 @@ private:
     std::vector<CaptureNode> pending_capture_;
     std::vector<std::vector<llama_pos>> pos_queue_;
     std::vector<llama_pos> cur_pos_;
+    uint32_t perf_n_ubatch_ = 0;
+    int64_t perf_sync_us_ = 0;
+    uint64_t perf_nvme_bytes_ = 0;
+    uint64_t perf_nvme_syscalls_ = 0;
 };

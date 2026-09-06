@@ -4,7 +4,7 @@
 |---|---|
 | **Title** | Next staged plan after harvest: `apply_retrieval` layout + cold stage-in |
 | **Date** | 2026-09-06 |
-| **Status** | Active (rev 2: harvest-V + NVMe with raw-K). PR 0–2 landed. |
+| **Status** | Active (rev 2: harvest-V + NVMe with raw-K). PR 0–3 landed. |
 | **Repo** | `/home/leye/kvmem_llamacpp` (v0.5.0) |
 | **Reference (read-only)** | `/home/leye/kvmem_qw3` |
 | **Prior plan** | `docs/prefill-harvest-optimization.md` (Stage 1 harvest/NVMe; do not implement further harvest PRs from it) |
@@ -38,6 +38,7 @@ This plan is: time the 229 s, then stop using host as a scratchpad for **already
 | PR 0 `KVMEM_RETR_SUM` | — | split exists |
 | PR 1 batched get/set | **20.6 s** | also 371→792 tok/s prefill (evict V harvest) |
 | PR 2 layout D2D | 16k layout 1.07 s→70 ms | 128k not re-run; expect ~8.4 s layout gone |
+| PR 3 `--kvmem-harvest-v` | 16k `stage_out` 905→414 ms | remaining is `seq_rm`/admit, not `read_gpu_block` |
 
 128k PR 1 SUM (`n_move=795` `n_raw=1080` `laid_out=1`): layout_d2h+h2d 8.4 s, **stage_out 6.4 s**, set 3.5 s, copy 1.5 s, rope 0.3 s, score 0.2 s. After PR 2 the remaining ceiling is ~**stage_out + cold set**.
 
@@ -184,6 +185,7 @@ Independently reviewable. Do not mix compact-window RoPE into copy PRs.
 - **Why not only `--kvmem-raw-k-nvme`:** that flag already flushes V **after** D2H. 128k `stage_out=6.4 s` is the D2H at reselect. Harvest-V moves that copy to prefill ubatches.
 - **Prefill trade:** every ubatch D2H’s V, including the first 60k where nothing is evicted yet. 128k second-half util may improve (evict skip); first-half may lose a little SM. Speed never auto-fails.
 - **Gate:** identity with flag off (default) **and** once on; retrieval BLUEBIRD-42 both; 16k IQ3 SUM with `--kvmem-harvest-v` expects `stage_out_ms` ≪ PR 2 baseline (~905 ms → near flush-only). One 16k/128k with `--kvmem-raw-k-nvme --kvmem-harvest-v`: `has_v` after evict, RSS not holding full V, `n_no_raw` N/A (no MTP on IQ3).
+- **Landed:** 0.8B identity off+on PASS; recency miss; retrieval BLUEBIRD-42 both (`V raw_vs_gpu cos=1.000`). TRACE: prefill `k=6 v=6`; `harvest_gpu_v skip=6` except the inflight ubatch’s last blocks (fallback D2H). 16k IQ3 `logs/ista_iq3_16k_retr_sum_pr3.log`: `retr_ms` 1.69→1.31 s, `stage_out` 905→414 ms (`harvest_v=1`). Remaining `stage_out` is `apply_plan_to_kv` `seq_rm`/admit after `harvest_flush`, not `read_gpu_block`. Prefill `d2h_wait` 6.0 s / `pack` 3.6 s (V on the K pipe). NVMe 16k (`logs/ista_iq3_16k_retr_sum_pr3_nvme.log`): `nvme_bytes=994 MiB` (K+V), `stage_out` 396 ms, cold `copy_ms` 1.29 s (NVMe `copy_v`). File unlinked in dtor.
 
 ### PR 4 — `kvmem: cold stage-in batched H2D + GPU RoPE at orig_pos`
 
@@ -210,7 +212,7 @@ Independently reviewable. Do not mix compact-window RoPE into copy PRs.
 PR 0 timers                         // landed
 PR 1 batched get/set                // landed
 PR 2 layout D2D                     // landed
-  ├─ PR 3 harvest-V + raw-K NVMe    // stage_out; independent of PR 4
+PR 3 harvest-V + raw-K NVMe         // landed; remaining stage_out is seq_rm
   └─ PR 4 GPU orig RoPE H2D         // n_raw / set
 PR 5 MTP
 PR 6 optional ubatch

@@ -33,6 +33,8 @@ struct llama_kvmem_params {
     uint64_t cpu_bytes;            // CPU spill arena; 0 = disabled
     uint64_t nvme_bytes;           // NVMe spill file; 0 = disabled
     const char * nvme_dir;         // directory for the ephemeral NVMe file
+    bool     raw_k_nvme;           // put raw-K/V authority on NVMe (qw3-style)
+    bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults
