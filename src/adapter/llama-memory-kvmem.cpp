@@ -74,6 +74,24 @@ static bool kvmem_cuda_ok(cudaError_t e, const char * what) {
     return false;
 }
 
+static uint8_t * kvmem_cuda_tensor_ptr(ggml_tensor * t) {
+    if (!t || !t->data) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    if (!buf || ggml_backend_buffer_is_host(buf)) {
+        return nullptr;
+    }
+    return static_cast<uint8_t *>(t->data);
+}
+
+static bool kvmem_d2d(uint8_t * dst, const uint8_t * src, size_t n, cudaStream_t st) {
+    if (!dst || !src || n == 0) {
+        return true;
+    }
+    return kvmem_cuda_ok(cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToDevice, st), "layout D2D");
+}
+
 static bool kvmem_harvest_sync_old() {
     const char * e = getenv("KVMEM_HARVEST_SYNC");
     return e && e[0] != '\0' && e[0] != '0';
@@ -692,23 +710,174 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
     if (sorted) {
         return false;
     }
-    const uint64_t payload_bytes =
-            static_cast<uint64_t>(n_layer_) *
-            (ggml_row_size(type_k_, n_embd_k_) + ggml_row_size(type_v_, n_embd_v_)) *
-            block_tokens_;
-    std::vector<std::vector<uint8_t>> payloads(items.size());
-    const int64_t t_d2h = ggml_time_us();
+
+    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
+    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    const uint64_t scratch_stride = kspan + vspan;
+
+    std::vector<size_t> res_ix(items.size(), static_cast<size_t>(-1));
+    size_t n_res = 0;
     for (size_t i = 0; i < items.size(); ++i) {
-        if (!items[i].resident || payload_bytes == 0) {
-            continue;
+        if (items[i].resident) {
+            res_ix[i] = n_res++;
         }
-        payloads[i].assign(static_cast<size_t>(payload_bytes), 0);
-        copy_gpu_block_to_host(items[i].id, items[i].slot,
-                               payloads[i].data(), payload_bytes);
     }
-    if (retr_.enabled) {
-        retr_.layout_d2h_us += ggml_time_us() - t_d2h;
+
+    bool d2d_ok = n_res > 0;
+    uint8_t * scratch = nullptr;
+    if (d2d_ok) {
+        if (cudaMalloc(reinterpret_cast<void **>(&scratch),
+                       static_cast<size_t>(n_res) * scratch_stride) != cudaSuccess) {
+            scratch = nullptr;
+            d2d_ok = false;
+            LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+        }
     }
+
+    if (d2d_ok) {
+        cudaStream_t st = cudaStreamPerThread;
+        bool copy_ok = true;
+        for (uint32_t il = 0; il < n_layer_ && copy_ok; ++il) {
+            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+                continue;
+            }
+            ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
+            ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
+            uint8_t * kbase = kt ? kvmem_cuda_tensor_ptr(kt) : nullptr;
+            uint8_t * vbase = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
+            if (kt && !kbase) {
+                copy_ok = false;
+                break;
+            }
+            if (vt && !v_trans_ && !vbase) {
+                copy_ok = false;
+                break;
+            }
+            const int64_t t_g = ggml_time_us();
+            for (size_t i = 0; i < items.size() && copy_ok; ++i) {
+                if (res_ix[i] == static_cast<size_t>(-1)) {
+                    continue;
+                }
+                const uint32_t nt = items[i].n;
+                const uint32_t src0 = static_cast<uint32_t>(items[i].slot) * block_tokens_;
+                uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
+                if (kbase && krow) {
+                    copy_ok = kvmem_d2d(slot_sc, kbase + static_cast<size_t>(src0) * krow,
+                                        static_cast<size_t>(nt) * krow, st);
+                }
+                if (copy_ok && vbase && vrow) {
+                    copy_ok = kvmem_d2d(slot_sc + kspan,
+                                        vbase + static_cast<size_t>(src0) * vrow,
+                                        static_cast<size_t>(nt) * vrow, st);
+                }
+            }
+            if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
+                copy_ok = false;
+                break;
+            }
+            if (retr_.enabled) {
+                retr_.layout_d2h_us += ggml_time_us() - t_g;
+            }
+            const int64_t t_s = ggml_time_us();
+            for (size_t i = 0; i < items.size() && copy_ok; ++i) {
+                if (res_ix[i] == static_cast<size_t>(-1)) {
+                    continue;
+                }
+                const uint32_t nt = items[i].n;
+                const uint32_t dst0 = static_cast<uint32_t>(i) * block_tokens_;
+                uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
+                if (kbase && krow) {
+                    copy_ok = kvmem_d2d(kbase + static_cast<size_t>(dst0) * krow, slot_sc,
+                                        static_cast<size_t>(nt) * krow, st);
+                }
+                if (copy_ok && vbase && vrow) {
+                    copy_ok = kvmem_d2d(vbase + static_cast<size_t>(dst0) * vrow,
+                                        slot_sc + kspan,
+                                        static_cast<size_t>(nt) * vrow, st);
+                }
+            }
+            if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
+                copy_ok = false;
+                break;
+            }
+            if (retr_.enabled) {
+                retr_.layout_h2d_us += ggml_time_us() - t_s;
+            }
+        }
+        cudaFree(scratch);
+        scratch = nullptr;
+        d2d_ok = copy_ok;
+        if (!copy_ok) {
+            LLAMA_LOG_ERROR("%s: layout D2D failed; reloading residents from raw-K\n", __func__);
+        }
+    } else if (n_res > 0) {
+        const uint64_t payload_bytes =
+                static_cast<uint64_t>(n_layer_) * (krow + vrow) * block_tokens_;
+        std::vector<std::vector<uint8_t>> payloads(items.size());
+        const int64_t t_d2h = ggml_time_us();
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (res_ix[i] == static_cast<size_t>(-1) || payload_bytes == 0) {
+                continue;
+            }
+            payloads[i].assign(static_cast<size_t>(payload_bytes), 0);
+            copy_gpu_block_to_host(items[i].id, items[i].slot,
+                                   payloads[i].data(), payload_bytes);
+        }
+        if (retr_.enabled) {
+            retr_.layout_d2h_us += ggml_time_us() - t_d2h;
+        }
+        for (const auto & it : items) {
+            kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
+                        static_cast<llama_pos>(it.orig + it.n));
+            store.set_block_gpu_slot(it.id, -1);
+        }
+        reset_slots();
+        if (trace_) {
+            fprintf(stderr, "KVMEM_TRACE layout_orig_pos");
+            for (size_t i = 0; i < items.size(); ++i) {
+                fprintf(stderr, " %u", items[i].id);
+            }
+            fprintf(stderr, "\n");
+        }
+        uint32_t n_move = 0;
+        uint32_t n_raw = 0;
+        for (size_t i = 0; i < items.size(); ++i) {
+            const int32_t slot = alloc_slot();
+            if (slot < 0) {
+                LLAMA_LOG_ERROR("%s: no GPU slot while laying out block %u\n",
+                                __func__, items[i].id);
+                return false;
+            }
+            store.set_block_gpu_slot(items[i].id, slot);
+            store.set_block_tier(items[i].id, kvmem::KvTier::GPU, -1,
+                                 store.blocks()[items[i].id].nvme_slot);
+            if (items[i].resident && !payloads[i].empty()) {
+                occupy_block_cells(items[i].id);
+                const int64_t t_h2d = ggml_time_us();
+                copy_gpu_block_from_host(items[i].id, slot,
+                                         payloads[i].data(), payload_bytes);
+                if (retr_.enabled) {
+                    retr_.layout_h2d_us += ggml_time_us() - t_h2d;
+                }
+                n_move++;
+            } else {
+                write_block_to_gpu(items[i].id);
+                n_raw++;
+            }
+        }
+        if (retr_.enabled) {
+            retr_.n_move += n_move;
+            retr_.n_raw += n_raw;
+            retr_.laid_out = 1;
+        }
+        if (trace_) {
+            fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u\n", n_move, n_raw);
+        }
+        return true;
+    }
+
     for (const auto & it : items) {
         kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
                     static_cast<llama_pos>(it.orig + it.n));
@@ -734,14 +903,8 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         store.set_block_gpu_slot(items[i].id, slot);
         store.set_block_tier(items[i].id, kvmem::KvTier::GPU, -1,
                              store.blocks()[items[i].id].nvme_slot);
-        if (items[i].resident && !payloads[i].empty()) {
+        if (items[i].resident && d2d_ok) {
             occupy_block_cells(items[i].id);
-            const int64_t t_h2d = ggml_time_us();
-            copy_gpu_block_from_host(items[i].id, slot,
-                                     payloads[i].data(), payload_bytes);
-            if (retr_.enabled) {
-                retr_.layout_h2d_us += ggml_time_us() - t_h2d;
-            }
             n_move++;
         } else {
             write_block_to_gpu(items[i].id);
@@ -754,7 +917,8 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         retr_.laid_out = 1;
     }
     if (trace_) {
-        fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u\n", n_move, n_raw);
+        fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u d2d=%d\n",
+                n_move, n_raw, (int) d2d_ok);
     }
     return true;
 }

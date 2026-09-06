@@ -139,7 +139,7 @@ Independently reviewable. Do not mix compact-window RoPE into copy PRs.
 - **Depends on:** PR 0 numbers; PR 1’s contiguous-span assumption
 - **Changes:** resident moves use `cudaMemcpyAsync` of `nt*row` per layer. Overlap → per-layer GPU scratch (not a full-window multi-layer arena). Stop `copy_gpu_block_to_host` of baked K. Cold still `write_block_to_gpu`. Fence before return.
 - **Gate:** identity (full-budget often skips layout — **insufficient**). 0.8B retrieval needle + 16k or 128k 27B retr. Optional `rebuild_vs_gpu cos≈1`.
-- **Hypothesis:** 128k `n_move` is the bulk of 229 s.
+- **Hypothesis:** After PR 1, 128k layout_d2h+h2d is ~8.4 s of 20.6 s (`n_move=795`). D2D should drop that toward host-idle HBM copies, not PCIe. `stage_out` / cold `set` remain.
 
 ### PR 3 — `kvmem: cold stage-in batched H2D + GPU RoPE at orig_pos`
 
