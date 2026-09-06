@@ -4,7 +4,7 @@
 |---|---|
 | **Title** | Next staged plan after harvest: `apply_retrieval` layout + cold stage-in |
 | **Date** | 2026-09-06 |
-| **Status** | Active (rev 1). Harvest IO is landed; this document supersedes it as the roadmap. |
+| **Status** | Active (rev 2: harvest-V + NVMe with raw-K). PR 0–2 landed. |
 | **Repo** | `/home/leye/kvmem_llamacpp` (v0.5.0) |
 | **Reference (read-only)** | `/home/leye/kvmem_qw3` |
 | **Prior plan** | `docs/prefill-harvest-optimization.md` (Stage 1 harvest/NVMe; do not implement further harvest PRs from it) |
@@ -28,7 +28,18 @@ ISTA IQ3_S 128k on the RTX 5090 (`logs/ista_iq3_128k_speed_harvest.log`) after t
 
 The remaining KVMem-local bill is **`llama_kvmem_apply_retrieval`**, not cosine mean-K and not NVMe. Prefill still ~2× stock because harvest **host-waits `compute_done`** so ubatch N+1 `set_input` (`cudaStreamPerThread`) cannot overlap graph N, plus a 4087-node ggml graph. That prefill gap is **out of this plan** (see Non-Goals).
 
-This plan is: time the 229 s, then stop using host as a scratchpad for **already-baked GPU KV**, then batch cold H2D and optionally GPU-RoPE at **orig_pos**. It is not qw3 compact-window assembly.
+This plan is: time the 229 s, then stop using host as a scratchpad for **already-baked GPU KV**, then batch cold H2D / GPU-RoPE at **orig_pos**, and optionally **harvest V with raw-K** so `stage_out` is not a second D2H. It is not qw3 compact-window assembly.
+
+### Landed (do not re-litigate)
+
+| Step | 128k IQ3 `retr_ms` | Notes |
+|---|---|---|
+| Harvest thread + RAM mean-K | 229 s | pack off compute; score not the bill |
+| PR 0 `KVMEM_RETR_SUM` | — | split exists |
+| PR 1 batched get/set | **20.6 s** | also 371→792 tok/s prefill (evict V harvest) |
+| PR 2 layout D2D | 16k layout 1.07 s→70 ms | 128k not re-run; expect ~8.4 s layout gone |
+
+128k PR 1 SUM (`n_move=795` `n_raw=1080` `laid_out=1`): layout_d2h+h2d 8.4 s, **stage_out 6.4 s**, set 3.5 s, copy 1.5 s, rope 0.3 s, score 0.2 s. After PR 2 the remaining ceiling is ~**stage_out + cold set**.
 
 ---
 
@@ -54,7 +65,18 @@ Two different jobs share the 229 s wall:
 
 Raw-K is already immutable (pre-RoPE FP16). qw3 additionally bakes GPU working K at **compact window** positions and remaps via page tables. llama.cpp Q RoPE and `ggml_flash_attn_ext` stay on **orig `llama_pos`**. Compact-window re-RoPE is incompatible with the FA freeze.
 
-PR 0 must split the 229 s **before** choosing whether PR 1 (batch get/set), PR 2 (D2D layout), or a score fix goes first.
+PR 0 split that 229 s. Score is noise. PR 1–2 removed the per-token sync and resident host round-trip. **`stage_out` is D2H of V at evict/reselect, not “V has nowhere to live.”**
+
+### Two spill paths (do not add a third)
+
+| Path | Flag | What it stores |
+|---|---|---|
+| GPU-format block spill (ad-hoc RSS) | `--kvmem-cpu-gb` / `--kvmem-nvme-gb` | Packed baked K+V (~2 MiB/block) |
+| Raw authority | `--kvmem-raw-k-nvme` (needs `--kvmem-nvme-gb`) | Unrotated K **and** V in the same `NvmeKvTier` (interleaved keys) |
+
+When `raw_k_nvme` is on, GPU-format NVMe is **disabled** (`make_runtime_cfg`): V is supposed to live in raw, not a second SSD copy. `maybe_flush_v` already runs after `write_layer_tokens(..., v)`. The 128k speed recipe **did not** pass `--kvmem-raw-k-nvme`, so V stayed in RAM `LayerBlk.v`.
+
+NVMe flush happens **after** `harvest_gpu_v` has already D2H’d. It drops RSS; it does **not** delete the 6.4 s `stage_out` bucket. To delete that bucket, V must be in raw **before** reselect, i.e. harvested with K during prefill.
 
 ---
 
@@ -68,6 +90,7 @@ PR 0 must split the 229 s **before** choosing whether PR 1 (batch get/set), PR 2
 - Cold `stage_in`: bounded batched H2D; GPU RoPE at orig_pos is PR 3, not PR 1.
 - If slots must be packed: **GPU D2D**, not host round-trip of baked KV.
 - MTP uses the same helpers (0.8B canary). IQ3 recipes stay `--spec-type none`.
+- Optional prefill harvest of V with raw-K; `--kvmem-raw-k-nvme` remains the NVMe sink for both (no third spill format).
 - Identity PASS; retrieval BLUEBIRD-42 with `--no-think` is GO/NO-GO.
 
 ### Non-Goals
@@ -92,20 +115,26 @@ PR 0 must split the 229 s **before** choosing whether PR 1 (batch get/set), PR 2
 7. **CUDA graphs:** copies sit at the prefill→decode boundary. Use a copy stream; do not inject into compute-stream capture. Wait before the first decode graph.
 8. **Coordinate system stays orig_pos.** Same convention as graph Q RoPE and cell mask. No qw3 window remap.
 9. **Prefill 2× is not this plan.** Optional later: `-b 2048 -ub 2048` after copies are gone; default stays 512.
+10. **Do not add a third V spill.** GPU-format NVMe stays off when raw-K owns the SSD. `--kvmem-raw-k-nvme` already `maybe_flush_v`. The missing piece is **when** V is D2H’d, not a new file format.
+11. **`--kvmem-harvest-v` (default off).** Prefill D2H V on the existing capture pipe with K. `harvest_gpu_v` is a no-op if `raw_->has_v`. Spreads V copies across ubatches (first-half prefill slower / more D2H) so evict and `apply_retrieval` `stage_out` skip `read_gpu_block`. With `--kvmem-raw-k-nvme`, `maybe_flush_v` then drops RAM. Typical long-ctx recipe: both flags. Do not imply harvest-V on just because NVMe is on (RAM-only 16k/128k speed runs must stay comparable).
 
 ---
 
-## Proposed Design (after PR 2–3)
+## Proposed Design (after remaining PRs)
 
 ```text
+prefill harvest (optional --kvmem-harvest-v)
+  same pipe as K: F16 V token-major → write_layer_tokens_f16(..., v)
+  --kvmem-raw-k-nvme: maybe_flush_v enqueues; no wait_writes on evict
+
 apply_retrieval
   harvest_flush
   score_retrieval          // mean memcpy + dots
-  apply_plan_to_kv         // stage_out V enqueue; no wait_writes
+  apply_plan_to_kv         // stage_out: harvest_gpu_v only if !has_v
   layout only if slots are not orig_pos-ordered
      resident: GPU D2D slot → slot (scratch one layer if overlap)
      cold:     unrotated K H2D → GPU RoPE(orig_pos) → dest slot
-               V H2D, no RoPE
+               V H2D from raw (RAM or NVMe), no RoPE
   occupy_block_cells       // n_tokens only
   fence copy/RoPE stream
   MTP follow (same helpers)
@@ -140,21 +169,36 @@ Independently reviewable. Do not mix compact-window RoPE into copy PRs.
 - **Changes:** resident moves use `cudaMemcpyAsync` of `nt*row` per layer. Overlap → per-layer GPU scratch (not a full-window multi-layer arena). Stop `copy_gpu_block_to_host` of baked K. Cold still `write_block_to_gpu`. Fence before return.
 - **Gate:** identity (full-budget often skips layout — **insufficient**). 0.8B retrieval needle + 16k or 128k 27B retr. Optional `rebuild_vs_gpu cos≈1`.
 - **Hypothesis:** After PR 1, 128k layout_d2h+h2d is ~8.4 s of 20.6 s (`n_move=795`). D2D should drop that toward host-idle HBM copies, not PCIe. `stage_out` / cold `set` remain.
+- **Landed** (`48c9baf`): 16k layout 1.07 s → 70 ms; `retr_ms` 2.63 s → 1.69 s. `d2d=1`. Host fallback if `cudaMalloc` scratch fails.
 
-### PR 3 — `kvmem: cold stage-in batched H2D + GPU RoPE at orig_pos`
+### PR 3 — `kvmem: harvest V with raw-K; NVMe via existing --kvmem-raw-k-nvme`
+
+- **Files:** `src/adapter/llama-kvmem-hooks.h`, `llama-memory-kvmem.cpp` (`d2h_submit` items, `harvest_from_host` `which=='v'`, `harvest_gpu_v`), CLI/server flag parse + help; MTP `harvest_v` skip if `has_v`. Docs: `--kvmem-raw-k-nvme` already stores K **and** V.
+- **Depends on:** PR 1 (batched F16 gather). Independent of PR 2.
+- **Changes:**
+  - New flag **`--kvmem-harvest-v`** (default **off**). Do not auto-enable from `raw_k_nvme`.
+  - When on: prefill capture includes V (`kvmem_capture_v` on the same graph outputs / pipe as K; FA path `!v_trans_`). `harvest_from_host` writes `write_layer_tokens_f16(..., v)` (no RoPE). Q still reduced before pin recycle.
+  - `harvest_gpu_v` / MTP `harvest_v`: if `raw_->has_v(block, il)` for all attn layers, skip `read_gpu_block`. Partial miss still harvests missing layers only.
+  - `--kvmem-raw-k-nvme`: unchanged `maybe_flush_v` after write; still **no** `wait_writes` on prefill `apply_plan_to_kv`. Help text: “raw-K **and** V”. Do **not** re-enable GPU-format NVMe alongside it.
+  - Pinned slot cap grows (~2× if K+V+Q). Document RSS: RAM-only harvest-V keeps history V in `LayerBlk.v` until NVMe flush.
+- **Why not only `--kvmem-raw-k-nvme`:** that flag already flushes V **after** D2H. 128k `stage_out=6.4 s` is the D2H at reselect. Harvest-V moves that copy to prefill ubatches.
+- **Prefill trade:** every ubatch D2H’s V, including the first 60k where nothing is evicted yet. 128k second-half util may improve (evict skip); first-half may lose a little SM. Speed never auto-fails.
+- **Gate:** identity with flag off (default) **and** once on; retrieval BLUEBIRD-42 both; 16k IQ3 SUM with `--kvmem-harvest-v` expects `stage_out_ms` ≪ PR 2 baseline (~905 ms → near flush-only). One 16k/128k with `--kvmem-raw-k-nvme --kvmem-harvest-v`: `has_v` after evict, RSS not holding full V, `n_no_raw` N/A (no MTP on IQ3).
+
+### PR 4 — `kvmem: cold stage-in batched H2D + GPU RoPE at orig_pos`
 
 - **Files:** `write_block_to_gpu`; small adapter CUDA or ggml RoPE helper (`src/adapter/` only; `kvmem/` stays llama-free)
-- **Depends on:** PR 1. Parallel with PR 2
-- **Changes:** H2D unrotated F16 K (no F32 round-trip if `copy_k` can be skipped). Pinned staging, chunked. GPU NeoX (Qwen3.5: same convention as today’s host path that already matches MRoPE empirically). V H2D only. Partial blocks: `n_tokens` rows. Fence. `v_trans_` (non-FA) does not use this batch shape.
+- **Depends on:** PR 1. Parallel with PR 2–3
+- **Changes:** H2D unrotated F16 K (no F32 round-trip if `copy_k` can be skipped). Pinned staging, chunked. GPU NeoX (Qwen3.5: same convention as today’s host path that already matches MRoPE empirically). V H2D only (from raw RAM or NVMe). Partial blocks: `n_tokens` rows. Fence. `v_trans_` (non-FA) does not use this batch shape.
 - **Gate:** identity; retrieval GO/NO-GO; 0.8B Qwen3.5 dump cos≈1 vs GPU cache.
 
-### PR 4 — `kvmem: MTP uses the same D2D / batch / fence helpers`
+### PR 5 — `kvmem: MTP uses the same D2D / batch / fence helpers`
 
 - **Files:** `llama-memory-kvmem-mtp.cpp`
-- **Depends on:** PR 2–3 helpers (no third per-token loop)
+- **Depends on:** PR 2–4 helpers (no third per-token loop)
 - **Gate:** `mtp_canary.py` 0.8B; `n_no_raw=0` hard fail. No IQ3 MTP.
 
-### PR 5 (optional) — document `-b 2048` if VRAM-safe
+### PR 6 (optional) — document `-b 2048` if VRAM-safe
 
 - Default remains 512. Does not close the 4087-node / `compute_done` prefill gap.
 
@@ -163,14 +207,13 @@ Independently reviewable. Do not mix compact-window RoPE into copy PRs.
 ## Sequence
 
 ```text
-PR 0 timers
-  └─ if score_ms dominates: scoring fix (unplanned PR, not FA)
-  └─ else:
-        PR 1 batched get/set
-          ├─ PR 2 layout D2D          // n_move
-          └─ PR 3 GPU orig RoPE H2D   // n_raw; can parallel PR 2
-        PR 4 MTP
-        PR 5 optional ubatch
+PR 0 timers                         // landed
+PR 1 batched get/set                // landed
+PR 2 layout D2D                     // landed
+  ├─ PR 3 harvest-V + raw-K NVMe    // stage_out; independent of PR 4
+  └─ PR 4 GPU orig RoPE H2D         // n_raw / set
+PR 5 MTP
+PR 6 optional ubatch
 ```
 
 ---
@@ -181,11 +224,13 @@ PR 0 timers
 |---|---|---|
 | `raw_kv_store_test` | CPU | every copy PR |
 | identity 0.8B | 5050 | every PR |
-| retrieval BLUEBIRD-42 `--no-think` | 5050 | PR 1–4 |
+| retrieval BLUEBIRD-42 `--no-think` | 5050 | PR 1–5 |
 | recency must miss | 5050 | every PR |
-| MTP canary `n_no_raw=0` | 5050 | PR 4 only |
+| MTP canary `n_no_raw=0` | 5050 | PR 5 only |
 | 16k IQ3 + `KVMEM_RETR_SUM` | 5090 | after PR 0, then after each copy PR |
-| 128k IQ3 `retr_ms` + SUM | 5090 | after PR 2 and PR 3 (milestone, not auto-fail) |
+| 16k/128k with `--kvmem-harvest-v` | 5090 | PR 3: `stage_out_ms` collapse |
+| 16k/128k `--kvmem-raw-k-nvme --kvmem-harvest-v` | 5090 | PR 3: V not all in RSS |
+| 128k IQ3 `retr_ms` + SUM | 5090 | after PR 2–4 (milestone, not auto-fail) |
 
 Hardware: 5050 UUID `GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29` for **< 27B**; 5090 UUID `GPU-58a7c28b-e698-307f-c149-24d4ecd88bf4` for **27B only**. `source scripts/gpu.sh small|27b`.
 
@@ -193,4 +238,4 @@ Hardware: 5050 UUID `GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29` for **< 27B**; 50
 
 ## Open Questions
 
-None that block PR 0. After PR 0, `KVMEM_RETR_SUM` chooses the next PR; do not start PR 1–3 until that line exists in-tree (16k is enough to see which bucket is non-zero; 128k remains the magnitude check).
+None that block PR 3. Default `--kvmem-harvest-v` is **off** so RAM-only speed recipes stay comparable; long-ctx NVMe recipes pass both `--kvmem-harvest-v` and `--kvmem-raw-k-nvme`.
