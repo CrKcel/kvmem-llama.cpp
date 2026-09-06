@@ -6,7 +6,7 @@ KVMem as a standalone library, attached to llama.cpp through
 **Current local milestone: [`v0.5.0`](docs/milestones/v0.5.0.md)** (2026-09-05).
 llama.cpp can run KVMem on dense Qwen3 and hybrid Qwen3.5, including optional
 `--spec-type draft-mtp` on the same slot-pool as the trunk (plan B). Product
-default `--kvmem` is retrieval + query-last 64. 0.8B (5050) and 27B (5090)
+default `--kvmem` is retrieval + query-last 64, GPU KV **q8_0** (`--kv-dtype f16|q4_0` to override). 0.8B (5050) and 27B (5090)
 retrieval+MTP revive BLUEBIRD-42 with `--no-think`. 27B 8k–64k: main KV 32 MiB
 + MTP KV 2 MiB, independent of T. P6 (Metal/Vulkan) is not started.
 

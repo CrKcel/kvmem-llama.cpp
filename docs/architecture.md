@@ -10,7 +10,9 @@ llama.cpp/      submodule + thin patches (P1+)
 ```
 
 GPU attention cache is a **bounded block-slot pool** of size
-`budget + gen_reserve`. Each logical block occupies one slot of
+`budget + gen_reserve`. Product default GPU KV type is llama.cpp **q8_0**
+for K and V (`--kv-dtype q8_0`; `f16` or `q4_0` to override). Raw-K/V
+authority stays unrotated FP16. Each logical block occupies one slot of
 `block_tokens` cells. Slot index is not the RoPE coordinate: P1 keeps the
 original (monotonic) token `pos` on each cell so llama.cpp's existing
 KQ mask stays causal. Reselect is a `KvMemPlan` diff: resident selected

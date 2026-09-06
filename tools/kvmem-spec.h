@@ -22,8 +22,8 @@ struct kvmem_spec_opts {
     int32_t n_ubatch = 512;
     bool    kvmem_enabled = false;
     std::string draft_model; // optional sidecar GGUF; empty = welded nextn
-    ggml_type type_k = GGML_TYPE_F16;
-    ggml_type type_v = GGML_TYPE_F16;
+    ggml_type type_k = GGML_TYPE_Q8_0;
+    ggml_type type_v = GGML_TYPE_Q8_0;
 };
 
 // llama.cpp cache types that CUDA FA supports without GGML_CUDA_FA_ALL_QUANTS:
