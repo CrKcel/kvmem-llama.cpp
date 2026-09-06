@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace {
 
@@ -25,14 +27,62 @@ struct __align__(2) block_q4_0 {
 static_assert(sizeof(block_q8_0) == 34, "q8_0 block");
 static_assert(sizeof(block_q4_0) == 18, "q4_0 block");
 
+constexpr size_t SLAB = (size_t) 32 * 1024 * 1024;
+constexpr int GATHER_MAX = 8192;
+
+struct CopyOp {
+    const uint8_t * src;
+    uint8_t *       dst;
+    uint32_t        nbytes;
+    uint32_t        pad;
+};
+static_assert(sizeof(CopyOp) == 24, "CopyOp");
+
+enum ItemKind { ITEM_K = 0, ITEM_V = 1 };
+
+struct Item {
+    size_t     off    = 0;
+    size_t     nbytes = 0;
+    uint8_t *  dst    = nullptr;
+    ItemKind   kind   = ITEM_K;
+    ggml_type  ty     = GGML_TYPE_Q8_0;
+    int64_t    nt     = 0;
+    int64_t    n_embd = 0;
+    int        nrot   = 0;
+    int        n_head = 0;
+    int        n_embd_head = 0;
+    int        n_rot_rope = 0;
+    int32_t    pos0   = 0;
+};
+
 struct Stage {
     float *     dev_f32   = nullptr;
     size_t      n_f32     = 0;
     uint8_t *   dev_q     = nullptr;
     size_t      n_q       = 0;
+    uint8_t *   pin[2]    = {nullptr, nullptr};
+    size_t      pin_n     = 0;
+    size_t      used      = 0;
+    int         out_cur   = 0;
+    cudaEvent_t out_ev[2] = {nullptr, nullptr};
+    std::vector<Item> items;
+    struct OutItem {
+        size_t          off      = 0;
+        size_t          nbytes   = 0;
+        const uint8_t * gpu_src  = nullptr;
+    };
+    std::vector<OutItem> outs;
+    CopyOp *    dev_ops   = nullptr;
+    size_t      n_ops     = 0;
+    std::vector<CopyOp> host_ops;
+    std::vector<float> theta;
     float *     dev_theta = nullptr;
     size_t      n_theta   = 0;
     cudaEvent_t h2d_ev    = nullptr;
+    int64_t *   copy_us     = nullptr;
+    int64_t *   rope_us     = nullptr;
+    int64_t *   hadamard_us = nullptr;
+    int64_t *   set_us      = nullptr;
 };
 
 Stage g_st;
@@ -180,6 +230,33 @@ __global__ void quant_q4_0(const float * x, block_q4_0 * y, int64_t n_blocks) {
     }
 }
 
+__global__ void copy_bytes(const CopyOp * ops, int n) {
+    const int i = (int) blockIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const CopyOp op = ops[i];
+    const uint8_t * s = op.src;
+    uint8_t * d = op.dst;
+    const uint32_t nbytes = op.nbytes;
+    if (!s || !d || nbytes == 0) {
+        return;
+    }
+    const uintptr_t a = (uintptr_t) s | (uintptr_t) d;
+    if ((a & 15u) == 0 && (nbytes & 15u) == 0) {
+        const uint32_t n4 = nbytes >> 4;
+        const uint4 * s4 = (const uint4 *) s;
+        uint4 * d4 = (uint4 *) d;
+        for (uint32_t j = threadIdx.x; j < n4; j += blockDim.x) {
+            d4[j] = s4[j];
+        }
+        return;
+    }
+    for (uint32_t j = threadIdx.x; j < nbytes; j += blockDim.x) {
+        d[j] = s[j];
+    }
+}
+
 }  // namespace
 
 bool kvmem_stagein_gpu_ready(size_t n_f32, size_t n_packed) {
@@ -204,17 +281,56 @@ bool kvmem_stagein_gpu_ready(size_t n_f32, size_t n_packed) {
         }
         g_st.n_f32 = n_f32;
     }
-    if (n_packed > 0 && (!g_st.dev_q || g_st.n_q < n_packed)) {
+    const size_t want_q = n_packed > SLAB ? n_packed : (n_packed > 0 ? SLAB : 0);
+    if (want_q > 0 && (!g_st.dev_q || g_st.n_q < want_q)) {
         if (g_st.dev_q) {
             cudaFree(g_st.dev_q);
             g_st.dev_q = nullptr;
             g_st.n_q = 0;
         }
-        if (!cuda_ok(cudaMalloc(reinterpret_cast<void **>(&g_st.dev_q), n_packed), "q scratch")) {
+        if (!cuda_ok(cudaMalloc(reinterpret_cast<void **>(&g_st.dev_q), want_q), "q scratch")) {
             g_st.dev_q = nullptr;
             return false;
         }
-        g_st.n_q = n_packed;
+        g_st.n_q = want_q;
+    }
+    if (want_q >= SLAB && (!g_st.pin[0] || !g_st.pin[1] || g_st.pin_n < SLAB)) {
+        bool ok = true;
+        for (int i = 0; i < 2; ++i) {
+            if (g_st.pin[i]) {
+                continue;
+            }
+            if (!cuda_ok(cudaMallocHost(reinterpret_cast<void **>(&g_st.pin[i]), SLAB),
+                         "slab pin")) {
+                g_st.pin[i] = nullptr;
+                ok = false;
+                break;
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (g_st.out_ev[i]) {
+                continue;
+            }
+            if (!cuda_ok(cudaEventCreateWithFlags(&g_st.out_ev[i], cudaEventDisableTiming),
+                         "stageout event")) {
+                ok = false;
+                break;
+            }
+        }
+        g_st.pin_n = (ok && g_st.pin[0] && g_st.pin[1]) ? SLAB : 0;
+        g_st.used = 0;
+        g_st.out_cur = 0;
+        g_st.items.clear();
+        g_st.outs.clear();
+    }
+    if (want_q >= SLAB && !g_st.dev_ops) {
+        if (!cuda_ok(cudaMalloc(reinterpret_cast<void **>(&g_st.dev_ops),
+                                (size_t) GATHER_MAX * sizeof(CopyOp)),
+                     "gather ops")) {
+            g_st.dev_ops = nullptr;
+        } else {
+            g_st.n_ops = (size_t) GATHER_MAX;
+        }
     }
     return g_st.dev_f32 != nullptr;
 }
@@ -230,6 +346,28 @@ void kvmem_stagein_gpu_free() {
         g_st.dev_q = nullptr;
     }
     g_st.n_q = 0;
+    for (int i = 0; i < 2; ++i) {
+        if (g_st.pin[i]) {
+            cudaFreeHost(g_st.pin[i]);
+            g_st.pin[i] = nullptr;
+        }
+        if (g_st.out_ev[i]) {
+            cudaEventDestroy(g_st.out_ev[i]);
+            g_st.out_ev[i] = nullptr;
+        }
+    }
+    g_st.pin_n = 0;
+    g_st.used = 0;
+    g_st.out_cur = 0;
+    g_st.items.clear();
+    g_st.outs.clear();
+    if (g_st.dev_ops) {
+        cudaFree(g_st.dev_ops);
+        g_st.dev_ops = nullptr;
+    }
+    g_st.n_ops = 0;
+    g_st.host_ops.clear();
+    g_st.theta.clear();
     if (g_st.dev_theta) {
         cudaFree(g_st.dev_theta);
         g_st.dev_theta = nullptr;
@@ -263,8 +401,8 @@ bool kvmem_stagein_h2d_packed(const void * host, size_t n) {
     return cuda_ok(cudaEventSynchronize(g_st.h2d_ev), "H2D packed wait");
 }
 
-bool kvmem_stagein_dequant(ggml_type ty, int64_t n_rows, int64_t n_embd) {
-    if (!g_st.dev_q || !g_st.dev_f32 || n_rows <= 0 || n_embd <= 0) {
+static bool dequant_from(ggml_type ty, const void * src, int64_t n_rows, int64_t n_embd) {
+    if (!src || !g_st.dev_f32 || n_rows <= 0 || n_embd <= 0) {
         return false;
     }
     if ((size_t) n_rows * (size_t) n_embd > g_st.n_f32) {
@@ -278,7 +416,7 @@ bool kvmem_stagein_dequant(ggml_type ty, int64_t n_rows, int64_t n_embd) {
         const int64_t n_blocks = n_rows * (n_embd / QK8_0);
         const int blocks = (int) ((n_blocks + threads - 1) / threads);
         dequant_q8_0<<<blocks, threads, 0, stream()>>>(
-                reinterpret_cast<const block_q8_0 *>(g_st.dev_q), g_st.dev_f32, n_blocks);
+                static_cast<const block_q8_0 *>(src), g_st.dev_f32, n_blocks);
         return cuda_ok(cudaGetLastError(), "dequant q8_0");
     }
     if (ty == GGML_TYPE_Q4_0) {
@@ -288,10 +426,14 @@ bool kvmem_stagein_dequant(ggml_type ty, int64_t n_rows, int64_t n_embd) {
         const int64_t n_blocks = n_rows * (n_embd / QK4_0);
         const int blocks = (int) ((n_blocks + threads - 1) / threads);
         dequant_q4_0<<<blocks, threads, 0, stream()>>>(
-                reinterpret_cast<const block_q4_0 *>(g_st.dev_q), g_st.dev_f32, n_blocks);
+                static_cast<const block_q4_0 *>(src), g_st.dev_f32, n_blocks);
         return cuda_ok(cudaGetLastError(), "dequant q4_0");
     }
     return false;
+}
+
+bool kvmem_stagein_dequant(ggml_type ty, int64_t n_rows, int64_t n_embd) {
+    return dequant_from(ty, g_st.dev_q, n_rows, n_embd);
 }
 
 bool kvmem_stagein_rope_neox(int64_t n_tokens, int n_head, int n_embd_head, int n_rot,
@@ -414,4 +556,374 @@ bool kvmem_stagein_h2d_bytes(void * gpu_dst, const void * host, size_t n) {
 
 void kvmem_stagein_sync() {
     cuda_ok(cudaStreamSynchronize(stream()), "sync");
+}
+
+static bool rope_from_dev(int64_t n_tokens, int n_head, int n_embd_head,
+                          int n_rot, int32_t pos0) {
+    if (!g_st.dev_f32 || !g_st.dev_theta || n_tokens <= 0) {
+        return false;
+    }
+    const int threads = 64;
+    const int blocks_t = (int) ((n_tokens + threads - 1) / threads);
+    dim3 grid(blocks_t, n_head, 1);
+    rope_neox_kernel<<<grid, threads, 0, stream()>>>(
+            g_st.dev_f32, n_tokens, n_head, n_embd_head, n_rot, pos0, g_st.dev_theta);
+    return cuda_ok(cudaGetLastError(), "rope launch");
+}
+
+bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
+                         int64_t * hadamard_us, int64_t * set_us) {
+    if (g_st.used == 0 || g_st.items.empty()) {
+        return true;
+    }
+    if (!g_st.pin[0] || !g_st.dev_q || g_st.used > g_st.n_q) {
+        g_st.used = 0;
+        g_st.items.clear();
+        return false;
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!cuda_ok(cudaMemcpyAsync(g_st.dev_q, g_st.pin[0], g_st.used,
+                                     cudaMemcpyHostToDevice, stream()),
+                     "slab H2D")) {
+            g_st.used = 0;
+            g_st.items.clear();
+            return false;
+        }
+        if (!cuda_ok(cudaEventRecord(g_st.h2d_ev, stream()), "slab H2D record") ||
+            !cuda_ok(cudaEventSynchronize(g_st.h2d_ev), "slab H2D wait")) {
+            g_st.used = 0;
+            g_st.items.clear();
+            return false;
+        }
+        if (set_us) {
+            *set_us += ggml_time_us() - t0;
+        }
+    }
+    bool have_k = false;
+    for (const Item & it : g_st.items) {
+        if (it.kind == ITEM_K) {
+            have_k = true;
+            break;
+        }
+    }
+    if (have_k && !g_st.theta.empty()) {
+        if (!g_st.dev_theta || g_st.n_theta < g_st.theta.size()) {
+            if (g_st.dev_theta) {
+                cudaFree(g_st.dev_theta);
+                g_st.dev_theta = nullptr;
+                g_st.n_theta = 0;
+            }
+            if (!cuda_ok(cudaMalloc(reinterpret_cast<void **>(&g_st.dev_theta),
+                                    g_st.theta.size() * sizeof(float)),
+                         "theta")) {
+                g_st.used = 0;
+                g_st.items.clear();
+                return false;
+            }
+            g_st.n_theta = g_st.theta.size();
+        }
+        if (!cuda_ok(cudaMemcpyAsync(g_st.dev_theta, g_st.theta.data(),
+                                     g_st.theta.size() * sizeof(float),
+                                     cudaMemcpyHostToDevice, stream()),
+                     "H2D theta")) {
+            g_st.used = 0;
+            g_st.items.clear();
+            return false;
+        }
+    }
+    bool ok = true;
+    for (const Item & it : g_st.items) {
+        uint8_t * src = g_st.dev_q + it.off;
+        if (it.kind == ITEM_V) {
+            const int64_t t0 = ggml_time_us();
+            ok = cuda_ok(cudaMemcpyAsync(it.dst, src, it.nbytes,
+                                         cudaMemcpyDeviceToDevice, stream()),
+                         "slab V D2D");
+            if (set_us) {
+                *set_us += ggml_time_us() - t0;
+            }
+            if (!ok) {
+                break;
+            }
+            continue;
+        }
+        {
+            const int64_t t0 = ggml_time_us();
+            ok = dequant_from(it.ty, src, it.nt, it.n_embd);
+            if (copy_us) {
+                *copy_us += ggml_time_us() - t0;
+            }
+            if (!ok) {
+                break;
+            }
+        }
+        {
+            const int64_t t0 = ggml_time_us();
+            ok = rope_from_dev(it.nt, it.n_head, it.n_embd_head, it.n_rot_rope, it.pos0);
+            if (rope_us) {
+                *rope_us += ggml_time_us() - t0;
+            }
+            if (!ok) {
+                break;
+            }
+        }
+        if (it.nrot > 0) {
+            const int64_t t0 = ggml_time_us();
+            ok = kvmem_stagein_fwht(it.nt, it.n_embd, it.nrot);
+            if (hadamard_us) {
+                *hadamard_us += ggml_time_us() - t0;
+            }
+            if (!ok) {
+                break;
+            }
+        }
+        {
+            const int64_t t0 = ggml_time_us();
+            ok = kvmem_stagein_quantize(it.ty, it.dst, it.nt, it.n_embd);
+            if (set_us) {
+                *set_us += ggml_time_us() - t0;
+            }
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    g_st.used = 0;
+    g_st.items.clear();
+    return ok;
+}
+
+static bool slab_ready(size_t nbytes) {
+    return g_st.pin[0] && g_st.pin_n >= SLAB && g_st.dev_q && g_st.n_q >= SLAB &&
+           nbytes > 0 && nbytes <= SLAB;
+}
+
+static bool slab_reserve(size_t nbytes, int64_t * set_us) {
+    if (!g_st.outs.empty()) {
+        return false;
+    }
+    if (!slab_ready(nbytes)) {
+        return false;
+    }
+    if (g_st.used + nbytes > g_st.pin_n) {
+        if (!kvmem_stagein_flush(g_st.copy_us, g_st.rope_us, g_st.hadamard_us,
+                                 set_us ? set_us : g_st.set_us)) {
+            return false;
+        }
+    }
+    return g_st.used + nbytes <= g_st.pin_n;
+}
+
+bool kvmem_stagein_enqueue_k(
+        ggml_type ty, const void * packed, size_t nbytes, uint8_t * dst,
+        int64_t nt, int64_t n_embd, int nrot,
+        int n_head, int n_embd_head, int n_rot_rope, int32_t pos0,
+        const float * theta, int n_theta,
+        int64_t * copy_us, int64_t * rope_us, int64_t * hadamard_us, int64_t * set_us) {
+    if (!packed || !dst || !kvmem_stagein_quant_ok(ty)) {
+        return false;
+    }
+    if (nrot > 0 && !kvmem_stagein_fwht_ok(nrot)) {
+        return false;
+    }
+    if ((int64_t) n_head * n_embd_head != n_embd) {
+        return false;
+    }
+    g_st.copy_us = copy_us;
+    g_st.rope_us = rope_us;
+    g_st.hadamard_us = hadamard_us;
+    g_st.set_us = set_us;
+    if (theta && n_theta > 0 && g_st.theta.size() != (size_t) n_theta) {
+        g_st.theta.assign(theta, theta + n_theta);
+    }
+    if (!slab_reserve(nbytes, set_us)) {
+        return false;
+    }
+    std::memcpy(g_st.pin[0] + g_st.used, packed, nbytes);
+    Item it;
+    it.off = g_st.used;
+    it.nbytes = nbytes;
+    it.dst = dst;
+    it.kind = ITEM_K;
+    it.ty = ty;
+    it.nt = nt;
+    it.n_embd = n_embd;
+    it.nrot = nrot;
+    it.n_head = n_head;
+    it.n_embd_head = n_embd_head;
+    it.n_rot_rope = n_rot_rope;
+    it.pos0 = pos0;
+    g_st.items.push_back(it);
+    g_st.used += nbytes;
+    return true;
+}
+
+bool kvmem_stagein_enqueue_v(const void * packed, size_t nbytes, uint8_t * dst,
+                             int64_t * set_us) {
+    if (!packed || !dst || nbytes == 0) {
+        return false;
+    }
+    if (set_us) {
+        g_st.set_us = set_us;
+    }
+    if (!slab_reserve(nbytes, set_us)) {
+        return false;
+    }
+    std::memcpy(g_st.pin[0] + g_st.used, packed, nbytes);
+    Item it;
+    it.off = g_st.used;
+    it.nbytes = nbytes;
+    it.dst = dst;
+    it.kind = ITEM_V;
+    g_st.items.push_back(it);
+    g_st.used += nbytes;
+    return true;
+}
+
+bool kvmem_stageout_enqueue(const void * gpu_src, size_t nbytes) {
+    if (!gpu_src || nbytes == 0 || !g_st.items.empty()) {
+        return false;
+    }
+    if (!g_st.pin[0] || !g_st.pin[1] || g_st.pin_n < SLAB || !g_st.dev_q ||
+        g_st.n_q < SLAB || nbytes > SLAB) {
+        return false;
+    }
+    if (g_st.used + nbytes > g_st.pin_n) {
+        return false;
+    }
+    Stage::OutItem o;
+    o.off = g_st.used;
+    o.nbytes = nbytes;
+    o.gpu_src = static_cast<const uint8_t *>(gpu_src);
+    g_st.outs.push_back(o);
+    g_st.used += nbytes;
+    return true;
+}
+
+size_t kvmem_stageout_used() {
+    return g_st.used;
+}
+
+int kvmem_stageout_submit(int64_t * copy_us) {
+    if (g_st.outs.empty()) {
+        return -1;
+    }
+    const int slot = g_st.out_cur;
+    uint8_t * dst = (slot == 0 || slot == 1) ? g_st.pin[slot] : nullptr;
+    if (!dst || !g_st.dev_q || g_st.used == 0 || g_st.used > g_st.n_q ||
+        g_st.used > g_st.pin_n || !g_st.out_ev[slot]) {
+        return -1;
+    }
+    const int64_t t0 = ggml_time_us();
+    bool packed = false;
+    const int nitem = (int) g_st.outs.size();
+    if (nitem > 0 && nitem <= GATHER_MAX && g_st.dev_ops &&
+        g_st.n_ops >= (size_t) nitem) {
+        g_st.host_ops.resize((size_t) nitem);
+        bool ops_ok = true;
+        for (int i = 0; i < nitem; ++i) {
+            if (g_st.outs[i].nbytes > 0xffffffffu || g_st.outs[i].off > 0xffffffffu) {
+                ops_ok = false;
+                break;
+            }
+            g_st.host_ops[i].src = g_st.outs[i].gpu_src;
+            g_st.host_ops[i].dst = g_st.dev_q + g_st.outs[i].off;
+            g_st.host_ops[i].nbytes = (uint32_t) g_st.outs[i].nbytes;
+            g_st.host_ops[i].pad = 0;
+        }
+        if (ops_ok &&
+            cuda_ok(cudaMemcpyAsync(g_st.dev_ops, g_st.host_ops.data(),
+                                    (size_t) nitem * sizeof(CopyOp),
+                                    cudaMemcpyHostToDevice, stream()),
+                    "gather ops H2D")) {
+            copy_bytes<<<nitem, 256, 0, stream()>>>(g_st.dev_ops, nitem);
+            packed = cuda_ok(cudaGetLastError(), "gather kernel");
+        }
+    }
+    if (packed) {
+        packed = cuda_ok(cudaMemcpyAsync(dst, g_st.dev_q, g_st.used,
+                                         cudaMemcpyDeviceToHost, stream()),
+                         "stageout D2H");
+    }
+    if (!packed) {
+        cudaStreamSynchronize(stream());
+        for (const Stage::OutItem & o : g_st.outs) {
+            if (!cuda_ok(cudaMemcpyAsync(dst + o.off, o.gpu_src, o.nbytes,
+                                         cudaMemcpyDeviceToHost, stream()),
+                         "stageout D2H item")) {
+                return -1;
+            }
+        }
+    }
+    if (!cuda_ok(cudaEventRecord(g_st.out_ev[slot], stream()), "stageout record")) {
+        return -1;
+    }
+    if (copy_us) {
+        *copy_us += ggml_time_us() - t0;
+    }
+    g_st.outs.clear();
+    g_st.used = 0;
+    g_st.out_cur = 1 - slot;
+    return slot;
+}
+
+bool kvmem_stageout_wait(int slot, int64_t * copy_us) {
+    if (slot < 0) {
+        return true;
+    }
+    if (slot > 1 || !g_st.out_ev[slot]) {
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+    if (!cuda_ok(cudaEventSynchronize(g_st.out_ev[slot]), "stageout wait")) {
+        return false;
+    }
+    if (copy_us) {
+        *copy_us += ggml_time_us() - t0;
+    }
+    return true;
+}
+
+const uint8_t * kvmem_stageout_slot_base(int slot) {
+    if (slot < 0 || slot > 1) {
+        return nullptr;
+    }
+    return g_st.pin[slot];
+}
+
+void kvmem_stageout_clear() {
+    g_st.outs.clear();
+    if (g_st.items.empty()) {
+        g_st.used = 0;
+    }
+}
+
+bool kvmem_d2d_batched(const void * const * src, void * const * dst,
+                       const size_t * nbytes, int n) {
+    if (n <= 0) {
+        return true;
+    }
+    if (!src || !dst || !nbytes || n > GATHER_MAX || !g_st.dev_ops ||
+        g_st.n_ops < (size_t) n) {
+        return false;
+    }
+    g_st.host_ops.resize((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        if (!src[i] || !dst[i] || nbytes[i] == 0 || nbytes[i] > 0xffffffffu) {
+            return false;
+        }
+        g_st.host_ops[i].src = static_cast<const uint8_t *>(src[i]);
+        g_st.host_ops[i].dst = static_cast<uint8_t *>(dst[i]);
+        g_st.host_ops[i].nbytes = (uint32_t) nbytes[i];
+        g_st.host_ops[i].pad = 0;
+    }
+    if (!cuda_ok(cudaMemcpyAsync(g_st.dev_ops, g_st.host_ops.data(),
+                                 (size_t) n * sizeof(CopyOp),
+                                 cudaMemcpyHostToDevice, stream()),
+                 "layout ops H2D")) {
+        return false;
+    }
+    copy_bytes<<<n, 256, 0, stream()>>>(g_st.dev_ops, n);
+    return cuda_ok(cudaGetLastError(), "layout copy kernel");
 }

@@ -568,15 +568,22 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     bool k_gpu = false;
     if (k_quant && kbase && !theta.empty()) {
         const size_t nbytes = krow * (size_t) nt;
-        k_gpu = kvmem_stagein_quant_ok(type_k_) &&
-                (nrot_k == 0 || kvmem_stagein_fwht_ok(nrot_k)) &&
-                kvmem_stagein_h2d_packed(kpack.data(), nbytes) &&
-                kvmem_stagein_dequant(type_k_, (int64_t) nt, (int64_t) n_embd_k_) &&
-                kvmem_stagein_rope_neox((int64_t) nt, n_head, n_eh, n_rot_rope,
-                                        (int32_t) blk.orig_pos_start, theta.data(), n_theta) &&
-                (nrot_k == 0 || kvmem_stagein_fwht((int64_t) nt, (int64_t) n_embd_k_, nrot_k)) &&
-                kvmem_stagein_quantize(type_k_, kbase + cell0 * krow, (int64_t) nt,
-                                       (int64_t) n_embd_k_);
+        k_gpu = kvmem_stagein_enqueue_k(
+                type_k_, kpack.data(), nbytes, kbase + cell0 * krow,
+                (int64_t) nt, (int64_t) n_embd_k_, nrot_k, n_head, n_eh, n_rot_rope,
+                (int32_t) blk.orig_pos_start, theta.data(), n_theta,
+                nullptr, nullptr, nullptr, nullptr);
+        if (!k_gpu) {
+            k_gpu = kvmem_stagein_quant_ok(type_k_) &&
+                    (nrot_k == 0 || kvmem_stagein_fwht_ok(nrot_k)) &&
+                    kvmem_stagein_h2d_packed(kpack.data(), nbytes) &&
+                    kvmem_stagein_dequant(type_k_, (int64_t) nt, (int64_t) n_embd_k_) &&
+                    kvmem_stagein_rope_neox((int64_t) nt, n_head, n_eh, n_rot_rope,
+                                            (int32_t) blk.orig_pos_start, theta.data(), n_theta) &&
+                    (nrot_k == 0 || kvmem_stagein_fwht((int64_t) nt, (int64_t) n_embd_k_, nrot_k)) &&
+                    kvmem_stagein_quantize(type_k_, kbase + cell0 * krow, (int64_t) nt,
+                                           (int64_t) n_embd_k_);
+        }
     }
     if (!k_gpu) {
         std::vector<float> roped((size_t) nt * n_embd_k_);
@@ -614,9 +621,13 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     }
     if (have_v && vt && !v_trans_) {
         if (have_gpu_v) {
-            if (!(vbase && kvmem_stagein_h2d_bytes(vbase + cell0 * vrow, vpack.data(),
-                                                   (size_t) nt * vrow))) {
-                ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+            const size_t nbytes = vrow * (size_t) nt;
+            if (!(vbase && kvmem_stagein_enqueue_v(vpack.data(), nbytes,
+                                                   vbase + cell0 * vrow, nullptr))) {
+                if (!(vbase && kvmem_stagein_h2d_bytes(vbase + cell0 * vrow, vpack.data(),
+                                                       nbytes))) {
+                    ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+                }
             }
         } else {
             bool v_gpu = false;
@@ -638,7 +649,6 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
             }
         }
     }
-    kvmem_stagein_sync();
 }
 
 void llama_memory_kvmem_mtp::on_stage_out(uint32_t block_id) {
@@ -705,6 +715,8 @@ void llama_memory_kvmem_mtp::follow_retrieval() {
             n_miss++;
         }
     }
+    kvmem_stagein_flush(nullptr, nullptr, nullptr, nullptr);
+    kvmem_stagein_sync();
     if (trace_) {
         fprintf(stderr, "\n");
     }

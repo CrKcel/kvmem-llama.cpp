@@ -25,3 +25,29 @@ bool kvmem_stagein_fwht(int64_t n_rows, int64_t n_embd, int nrot);
 bool kvmem_stagein_quantize(ggml_type ty, void * gpu_dst, int64_t n_rows, int64_t n_embd);
 bool kvmem_stagein_h2d_bytes(void * gpu_dst, const void * host, size_t n);
 void kvmem_stagein_sync();
+
+// 32 MiB packed host+GPU slab. Enqueue (block,layer) rows; flush does one H2D
+// then dequant/RoPE/Hadamard/quant (K) or D2D (packed V). Extra VRAM = 32 MiB.
+bool kvmem_stagein_enqueue_k(
+        ggml_type ty, const void * packed, size_t nbytes, uint8_t * dst,
+        int64_t nt, int64_t n_embd, int nrot,
+        int n_head, int n_embd_head, int n_rot_rope, int32_t pos0,
+        const float * theta, int n_theta,
+        int64_t * copy_us, int64_t * rope_us, int64_t * hadamard_us, int64_t * set_us);
+bool kvmem_stagein_enqueue_v(const void * packed, size_t nbytes, uint8_t * dst,
+                             int64_t * set_us);
+bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
+                         int64_t * hadamard_us, int64_t * set_us);
+
+// Reverse slab: packed GPU V → pin. Gather kernel packs scattered rows into
+// the 32 MiB GPU slab, then one D2H. Two host pins; no extra VRAM slab.
+bool kvmem_stageout_enqueue(const void * gpu_src, size_t nbytes);
+size_t kvmem_stageout_used();
+int kvmem_stageout_submit(int64_t * copy_us);
+bool kvmem_stageout_wait(int slot, int64_t * copy_us);
+const uint8_t * kvmem_stageout_slot_base(int slot);
+void kvmem_stageout_clear();
+
+// Batched device copies (layout gather/scatter). One kernel; false → caller D2D.
+bool kvmem_d2d_batched(const void * const * src, void * const * dst,
+                       const size_t * nbytes, int n);

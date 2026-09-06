@@ -615,23 +615,29 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
         LayerBlk & lb = blocks_[bid].layers[il];
         lb.v.clear();
-        lb.v.shrink_to_fit();
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
-        if (lb.v_gpu.size() < need) {
-            if (lb.v_on_nvme && lb.v_gpu_fmt) {
-                lb.v_gpu.assign(need, 0);
-                load_v_gpu_nvme(bid, il, lb.v_gpu.data());
+        const size_t nbytes = static_cast<size_t>(take) * static_cast<size_t>(row);
+        const uint8_t * src = v + static_cast<size_t>(done) * static_cast<size_t>(row);
+        if (off == 0 && take == bt && !(lb.v_on_nvme && lb.v_gpu_fmt)) {
+            if (lb.v_on_nvme) {
                 lb.v_on_nvme = false;
-            } else {
-                if (lb.v_on_nvme) {
-                    lb.v_on_nvme = false;
-                }
-                lb.v_gpu.assign(need, 0);
             }
+            lb.v_gpu.assign(src, src + need);
+        } else {
+            if (lb.v_gpu.size() < need) {
+                if (lb.v_on_nvme && lb.v_gpu_fmt) {
+                    lb.v_gpu.assign(need, 0);
+                    load_v_gpu_nvme(bid, il, lb.v_gpu.data());
+                    lb.v_on_nvme = false;
+                } else {
+                    if (lb.v_on_nvme) {
+                        lb.v_on_nvme = false;
+                    }
+                    lb.v_gpu.resize(need);
+                }
+            }
+            std::memcpy(lb.v_gpu.data() + static_cast<size_t>(off) * row, src, nbytes);
         }
-        std::memcpy(lb.v_gpu.data() + static_cast<size_t>(off) * row,
-                    v + static_cast<size_t>(done) * row,
-                    static_cast<size_t>(take) * row);
         lb.v_gpu_fmt = true;
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         maybe_flush_v(bid, il);

@@ -153,6 +153,25 @@ private:
     void trace_plan(const char * tag, const kvmem::KvMemPlan & plan) const;
     void write_block_to_gpu(uint32_t block_id);
     void harvest_gpu_v(uint32_t block_id);
+    void harvest_gpu_v_commit();
+    void harvest_gpu_v_flush_slab();
+    void harvest_write_batch();
+    struct HarvestVJob {
+        uint32_t pos0 = 0;
+        uint32_t n = 0;
+        uint32_t il = 0;
+        const uint8_t * gpu_src = nullptr;
+        size_t nbytes = 0;
+        size_t pin_off = 0;
+        ggml_tensor * vt = nullptr;
+        size_t tensor_off = 0;
+    };
+    struct HarvestVBatch {
+        int slot = -1;
+        std::vector<HarvestVJob> jobs;
+    };
+    std::vector<HarvestVJob> harvest_v_jobs_;
+    HarvestVBatch harvest_v_pending_;
     void copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_slot,
                                 void * host, uint64_t bytes);
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
@@ -221,6 +240,8 @@ private:
         int64_t score_us = 0;
         int64_t plan_us = 0;
         int64_t stage_out_us = 0;
+        int64_t stage_out_gpu_us = 0;
+        int64_t stage_out_host_us = 0;
         int64_t admit_us = 0;
         int64_t seq_rm_us = 0;
         int64_t occupy_us = 0;

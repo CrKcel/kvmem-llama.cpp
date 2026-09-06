@@ -1,0 +1,22 @@
+# v0.8.0 speed excerpts
+# decode = KVMEM_GEN_WALL. Speed is not a go/no-go.
+# 32 MiB slab + GPU gather/scatter vs v0.7.0. IQ3 128k / 5090.
+
+========== IQ3_S 128k / 60k active / q8 / 5090 / -b 512 / bt=128 no-mtp ==========
+# v0.6.0 host Hadamard  logs/ista_iq3_128k_q8kv_bt128_speed.log
+prefill=780 tok/s  retrieval_ms=44498  decode=33.0  VRAM peak=14896
+
+# v0.7.0 GPU dequant+RoPE+FWHT+quant  logs/ista_iq3_128k_q8kv_bt128_gpu_dequant.log
+prefill=787 tok/s  retrieval_ms=3392  decode=34.2  VRAM peak=14896
+KVMEM_RETR_SUM total=3392 stage_out=1839 layout=72+62 copy=277 rope=50 hadamard=32 set=899
+
+# v0.8.0 layout gather/scatter control  logs/ista_iq3_128k_q8kv_bt128_layout_ctrl.log
+prefill=825 tok/s  retrieval_ms=1367  decode=33.8  VRAM peak=14928
+KVMEM_RETR_SUM total=1366.860 flush=7.107 score=39.835 plan=0.052
+stage_out=429.782 stage_out_gpu=10.811 stage_out_host=417.991
+seq_rm=22.715 occupy=6.459 layout_d2h=4.674 layout_h2d=3.835
+copy=206.941 rope=23.179 hadamard=24.195 set=505.708
+n_move=220 n_raw=248 n_skip=68 n_stage_in=248 laid_out=1
+
+# tried, not in tag (no wall-clock win on stage_out host ~400 ms):
+# bump arena / prefault / write_v_gpu_slab

@@ -1,0 +1,18 @@
+# v0.8.0 quality excerpts
+# 0.8B: RTX 5050 (UUID GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29)
+# 2026-09-06  CUDA_DEVICE_ORDER=PCI_BUS_ID  --kv-dtype q8_0 (default)
+# After revert of bump-arena / prefault / write_v_gpu_slab (not in this tag)
+
+========== identity_canary.py Qwen3.5-0.8B-Q8_0 ==========
+off [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303]
+on  [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303]
+PASS: identity (KVMem-on greedy tokens == KVMem-off)
+
+========== needle_recall.py retrieval budget=256 bt=32 --no-think ==========
+KVMEM_KV L23 K rebuild_vs_gpu n=16384 cos=0.999987 rmse=0.007353
+KVMEM_KV L23 V packed_vs_gpu n=16384 cos=1.000000 rmse=0.000000
+output: Based on the notes provided, the secret code is **BLUEBIRD-42**.
+PASS: retrieval budget=256 bt=32 revived the middle needle
+
+========== raw_kv_store_test ==========
+unit rc=0

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_env  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+# Unsloth Q4_K_M only. Do not point this at ISTA IQ3_S (MTP is off / not tested).
 DEFAULT_MODEL = ROOT / "models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf"
 
 KV_RE = re.compile(

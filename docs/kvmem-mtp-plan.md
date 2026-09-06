@@ -267,6 +267,8 @@ tools/llama-kvmem-server.cpp           同上
 
 `--no-think`：27B 默认会进 `<think>`，needle 的 `-n` 不够会假 miss（已在 27B 复测中证实）。
 
+**ISTA IQ3_S 不在此矩阵里。** 2026-09-05 测过：`n_max=3` 接受率 ~28–41%，16k decode 无加速（off+mtp 40.6 vs off 47.3 tok/s，`logs/ista_iq3_16k_speed.log`）。产品默认 `--spec-type none`。以后不要对 IQ3_S 开 `--spec-type draft-mtp`，也不要把它加进 canary。27B MTP 车仍是 Unsloth `UD-Q4_K_M`。政策正文：[architecture.md](architecture.md#ista-iq3_s-mtp-off-do-not-test)。
+
 ---
 
 ## 7. 风险

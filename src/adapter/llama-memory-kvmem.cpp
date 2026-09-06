@@ -198,6 +198,16 @@ static bool kvmem_stagein_gpu_from_packed(
     return true;
 }
 
+static void kvmem_stagein_flush_sync(int64_t * copy_us, int64_t * rope_us,
+                                     int64_t * hadamard_us, int64_t * set_us) {
+    kvmem_stagein_flush(copy_us, rope_us, hadamard_us, set_us);
+    const int64_t t0 = ggml_time_us();
+    kvmem_stagein_sync();
+    if (set_us) {
+        *set_us += ggml_time_us() - t0;
+    }
+}
+
 static bool kvmem_harvest_sync_old() {
     const char * e = getenv("KVMEM_HARVEST_SYNC");
     return e && e[0] != '\0' && e[0] != '0';
@@ -712,6 +722,7 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
                 mtp_->on_stage_out(id);
             }
         }
+        harvest_gpu_v_commit();
         runtime_->spill_outgoing();
         if (retr_.enabled) {
             retr_.stage_out_us += ggml_time_us() - t0;
@@ -877,6 +888,8 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             d2d_ok = false;
             LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
         }
+        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+                                std::max(krow, vrow) * (size_t) block_tokens_);
     }
 
     if (d2d_ok) {
@@ -898,22 +911,52 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
                 copy_ok = false;
                 break;
             }
-            const int64_t t_g = ggml_time_us();
-            for (size_t i = 0; i < items.size() && copy_ok; ++i) {
+            std::vector<const void *> gsrc;
+            std::vector<void *> gdst;
+            std::vector<size_t> gbytes;
+            std::vector<const void *> ssrc;
+            std::vector<void *> sdst;
+            std::vector<size_t> sbytes;
+            gsrc.reserve(n_res * 2);
+            gdst.reserve(n_res * 2);
+            gbytes.reserve(n_res * 2);
+            ssrc.reserve(n_res * 2);
+            sdst.reserve(n_res * 2);
+            sbytes.reserve(n_res * 2);
+            for (size_t i = 0; i < items.size(); ++i) {
                 if (res_ix[i] == static_cast<size_t>(-1)) {
                     continue;
                 }
                 const uint32_t nt = items[i].n;
                 const uint32_t src0 = static_cast<uint32_t>(items[i].slot) * block_tokens_;
+                const uint32_t dst0 = static_cast<uint32_t>(i) * block_tokens_;
                 uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
-                if (kbase && krow) {
-                    copy_ok = kvmem_d2d(slot_sc, kbase + static_cast<size_t>(src0) * krow,
-                                        static_cast<size_t>(nt) * krow, st);
+                if (kbase && krow && nt) {
+                    const size_t nb = static_cast<size_t>(nt) * krow;
+                    gsrc.push_back(kbase + static_cast<size_t>(src0) * krow);
+                    gdst.push_back(slot_sc);
+                    gbytes.push_back(nb);
+                    ssrc.push_back(slot_sc);
+                    sdst.push_back(kbase + static_cast<size_t>(dst0) * krow);
+                    sbytes.push_back(nb);
                 }
-                if (copy_ok && vbase && vrow) {
-                    copy_ok = kvmem_d2d(slot_sc + kspan,
-                                        vbase + static_cast<size_t>(src0) * vrow,
-                                        static_cast<size_t>(nt) * vrow, st);
+                if (vbase && vrow && nt) {
+                    const size_t nb = static_cast<size_t>(nt) * vrow;
+                    gsrc.push_back(vbase + static_cast<size_t>(src0) * vrow);
+                    gdst.push_back(slot_sc + kspan);
+                    gbytes.push_back(nb);
+                    ssrc.push_back(slot_sc + kspan);
+                    sdst.push_back(vbase + static_cast<size_t>(dst0) * vrow);
+                    sbytes.push_back(nb);
+                }
+            }
+            const int64_t t_g = ggml_time_us();
+            const int ng = static_cast<int>(gsrc.size());
+            if (!kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
+                for (int j = 0; j < ng && copy_ok; ++j) {
+                    copy_ok = kvmem_d2d(static_cast<uint8_t *>(gdst[j]),
+                                        static_cast<const uint8_t *>(gsrc[j]),
+                                        gbytes[j], st);
                 }
             }
             if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
@@ -924,21 +967,12 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
                 retr_.layout_d2h_us += ggml_time_us() - t_g;
             }
             const int64_t t_s = ggml_time_us();
-            for (size_t i = 0; i < items.size() && copy_ok; ++i) {
-                if (res_ix[i] == static_cast<size_t>(-1)) {
-                    continue;
-                }
-                const uint32_t nt = items[i].n;
-                const uint32_t dst0 = static_cast<uint32_t>(i) * block_tokens_;
-                uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
-                if (kbase && krow) {
-                    copy_ok = kvmem_d2d(kbase + static_cast<size_t>(dst0) * krow, slot_sc,
-                                        static_cast<size_t>(nt) * krow, st);
-                }
-                if (copy_ok && vbase && vrow) {
-                    copy_ok = kvmem_d2d(vbase + static_cast<size_t>(dst0) * vrow,
-                                        slot_sc + kspan,
-                                        static_cast<size_t>(nt) * vrow, st);
+            const int ns = static_cast<int>(ssrc.size());
+            if (!kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
+                for (int j = 0; j < ns && copy_ok; ++j) {
+                    copy_ok = kvmem_d2d(static_cast<uint8_t *>(sdst[j]),
+                                        static_cast<const uint8_t *>(ssrc[j]),
+                                        sbytes[j], st);
                 }
             }
             if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
@@ -1021,6 +1055,10 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             retr_.n_raw += n_raw;
             retr_.laid_out = 1;
         }
+        kvmem_stagein_flush_sync(retr_.enabled ? &retr_.copy_us : nullptr,
+                                 retr_.enabled ? &retr_.rope_us : nullptr,
+                                 retr_.enabled ? &retr_.hadamard_us : nullptr,
+                                 retr_.enabled ? &retr_.set_us : nullptr);
         if (trace_) {
             fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u\n", n_move, n_raw);
         }
@@ -1071,6 +1109,10 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         retr_.n_raw += n_raw;
         retr_.laid_out = 1;
     }
+    kvmem_stagein_flush_sync(retr_.enabled ? &retr_.copy_us : nullptr,
+                             retr_.enabled ? &retr_.rope_us : nullptr,
+                             retr_.enabled ? &retr_.hadamard_us : nullptr,
+                             retr_.enabled ? &retr_.set_us : nullptr);
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE layout_writeback move=%u raw=%u d2d=%d\n",
                 n_move, n_raw, (int) d2d_ok);
@@ -2042,6 +2084,89 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
     }
 }
 
+void llama_memory_kvmem::harvest_write_batch() {
+    HarvestVBatch & b = harvest_v_pending_;
+    if (b.jobs.empty()) {
+        b.slot = -1;
+        return;
+    }
+    auto fallback = [&](const HarvestVJob & j) {
+        if (j.nbytes == 0) {
+            return;
+        }
+        std::vector<uint8_t> packed(j.nbytes);
+        if (j.gpu_src &&
+            cudaMemcpy(packed.data(), j.gpu_src, j.nbytes,
+                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+            raw_->write_layer_v_gpu(j.pos0, j.n, j.il, packed.data());
+            return;
+        }
+        if (j.vt) {
+            ggml_backend_tensor_get(j.vt, packed.data(), j.tensor_off, j.nbytes);
+            raw_->write_layer_v_gpu(j.pos0, j.n, j.il, packed.data());
+        }
+    };
+    const uint8_t * base = (b.slot >= 0) ? kvmem_stageout_slot_base(b.slot) : nullptr;
+    const int64_t t0 = ggml_time_us();
+    for (const HarvestVJob & j : b.jobs) {
+        const uint8_t * p = (base && j.nbytes) ? base + j.pin_off : nullptr;
+        if (p) {
+            raw_->write_layer_v_gpu(j.pos0, j.n, j.il, p);
+        } else {
+            fallback(j);
+        }
+    }
+    if (retr_.enabled) {
+        retr_.stage_out_host_us += ggml_time_us() - t0;
+    }
+    b.jobs.clear();
+    b.slot = -1;
+}
+
+void llama_memory_kvmem::harvest_gpu_v_flush_slab() {
+    if (harvest_v_jobs_.empty()) {
+        return;
+    }
+    int64_t * gpu_us = retr_.enabled ? &retr_.stage_out_gpu_us : nullptr;
+    if (harvest_v_pending_.slot >= 0) {
+        if (!kvmem_stageout_wait(harvest_v_pending_.slot, gpu_us)) {
+            harvest_v_pending_.slot = -1;
+        }
+        const int slot = kvmem_stageout_submit(gpu_us);
+        HarvestVBatch next;
+        next.slot = slot;
+        next.jobs = std::move(harvest_v_jobs_);
+        harvest_v_jobs_.clear();
+        harvest_write_batch();
+        harvest_v_pending_ = std::move(next);
+        if (harvest_v_pending_.slot < 0) {
+            harvest_write_batch();
+        }
+        return;
+    }
+    const int slot = kvmem_stageout_submit(gpu_us);
+    harvest_v_pending_.slot = slot;
+    harvest_v_pending_.jobs = std::move(harvest_v_jobs_);
+    harvest_v_jobs_.clear();
+    if (harvest_v_pending_.slot < 0) {
+        harvest_write_batch();
+    }
+}
+
+void llama_memory_kvmem::harvest_gpu_v_commit() {
+    harvest_gpu_v_flush_slab();
+    int64_t * gpu_us = retr_.enabled ? &retr_.stage_out_gpu_us : nullptr;
+    if (harvest_v_pending_.slot >= 0) {
+        if (!kvmem_stageout_wait(harvest_v_pending_.slot, gpu_us)) {
+            harvest_v_pending_.slot = -1;
+        }
+        harvest_write_batch();
+    } else if (!harvest_v_pending_.jobs.empty()) {
+        harvest_write_batch();
+    }
+    kvmem_stageout_clear();
+}
+
 void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     if (v_trans_ || !raw_ || !kv_) {
         return;
@@ -2062,7 +2187,39 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
     const uint32_t nt = blk.n_tokens;
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
-    std::vector<uint8_t> packed(static_cast<size_t>(nt) * vrow);
+    kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+                            std::max(ggml_row_size(type_k_, n_embd_k_), vrow) *
+                                    (size_t) block_tokens_);
+    auto enqueue_or_get = [&](ggml_tensor * vt, uint32_t il, uint32_t nget) {
+        const size_t nbytes = static_cast<size_t>(nget) * vrow;
+        const size_t toff = static_cast<size_t>(cell0) * vrow;
+        uint8_t * vbase = kvmem_cuda_tensor_ptr(vt);
+        const uint8_t * gpu_src = (vbase && nbytes > 0) ? vbase + toff : nullptr;
+        HarvestVJob job;
+        job.pos0 = blk.orig_pos_start;
+        job.n = nget;
+        job.il = il;
+        job.gpu_src = gpu_src;
+        job.nbytes = nbytes;
+        job.pin_off = kvmem_stageout_used();
+        job.vt = vt;
+        job.tensor_off = toff;
+        if (gpu_src && kvmem_stageout_enqueue(gpu_src, nbytes)) {
+            harvest_v_jobs_.push_back(job);
+            return;
+        }
+        if (gpu_src && (!harvest_v_jobs_.empty() || harvest_v_pending_.slot >= 0)) {
+            harvest_gpu_v_flush_slab();
+            job.pin_off = kvmem_stageout_used();
+            if (kvmem_stageout_enqueue(gpu_src, nbytes)) {
+                harvest_v_jobs_.push_back(job);
+                return;
+            }
+        }
+        std::vector<uint8_t> packed(nbytes);
+        ggml_backend_tensor_get(vt, packed.data(), toff, nbytes);
+        raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
+    };
     uint32_t n_ok = 0;
     uint32_t n_skip = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
@@ -2078,10 +2235,7 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
             continue;
         }
         const uint32_t nget = std::min(nt, kv_size_ - cell0);
-        ggml_backend_tensor_get(vt, packed.data(),
-                                static_cast<size_t>(cell0) * vrow,
-                                static_cast<size_t>(nget) * vrow);
-        raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
+        enqueue_or_get(vt, il, nget);
         n_ok++;
     }
     if (trace_) {
@@ -2162,14 +2316,25 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         uint8_t * vbase = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
         bool k_gpu = false;
         if (k_quant && kbase && cell0 < kv_size_ && !theta.empty()) {
-            k_gpu = kvmem_stagein_gpu_from_packed(
-                    type_k_, kpack.data(),
+            const size_t nbytes = krow * (size_t) nt;
+            k_gpu = kvmem_stagein_enqueue_k(
+                    type_k_, kpack.data(), nbytes,
                     kbase + static_cast<size_t>(cell0) * krow,
                     static_cast<int64_t>(nt), static_cast<int64_t>(n_embd_k_),
                     nrot_k, static_cast<int>(n_head_kv_),
                     static_cast<int>(n_embd_head_), n_rot_rope,
                     static_cast<int32_t>(blk.orig_pos_start),
                     theta.data(), n_theta, cacc, racc, hacc, sacc);
+            if (!k_gpu) {
+                k_gpu = kvmem_stagein_gpu_from_packed(
+                        type_k_, kpack.data(),
+                        kbase + static_cast<size_t>(cell0) * krow,
+                        static_cast<int64_t>(nt), static_cast<int64_t>(n_embd_k_),
+                        nrot_k, static_cast<int>(n_head_kv_),
+                        static_cast<int>(n_embd_head_), n_rot_rope,
+                        static_cast<int32_t>(blk.orig_pos_start),
+                        theta.data(), n_theta, cacc, racc, hacc, sacc);
+            }
         }
         if (!k_gpu) {
             if (k_quant) {
@@ -2222,14 +2387,20 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         }
         if (have_v && vt && !v_trans_ && cell0 < kv_size_) {
             if (have_gpu_v) {
-                const int64_t t_set = ggml_time_us();
-                if (!(vbase && kvmem_stagein_h2d_bytes(
-                        vbase + static_cast<size_t>(cell0) * vrow,
-                        vpack.data(), static_cast<size_t>(nt) * vrow))) {
-                    ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
-                }
-                if (retr_.enabled) {
-                    retr_.set_us += ggml_time_us() - t_set;
+                const size_t nbytes = vrow * (size_t) nt;
+                bool v_ok = vbase && kvmem_stagein_enqueue_v(
+                        vpack.data(), nbytes,
+                        vbase + static_cast<size_t>(cell0) * vrow, sacc);
+                if (!v_ok) {
+                    const int64_t t_set = ggml_time_us();
+                    if (!(vbase && kvmem_stagein_h2d_bytes(
+                            vbase + static_cast<size_t>(cell0) * vrow,
+                            vpack.data(), nbytes))) {
+                        ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+                    }
+                    if (retr_.enabled) {
+                        retr_.set_us += ggml_time_us() - t_set;
+                    }
                 }
             } else {
                 bool v_gpu = false;
@@ -2262,7 +2433,6 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
             }
         }
     }
-    kvmem_stagein_sync();
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE stage_in_raw block=%u slot=%d n=%u orig=%u\n",
                 block_id, blk.gpu_slot, nt, blk.orig_pos_start);
@@ -2400,12 +2570,14 @@ void llama_memory_kvmem::retr_perf_print() {
     }
     fprintf(stderr,
             "KVMEM_RETR_SUM total_ms=%.3f flush_ms=%.3f score_ms=%.3f plan_ms=%.3f "
-            "stage_out_ms=%.3f admit_ms=%.3f seq_rm_ms=%.3f occupy_ms=%.3f "
+            "stage_out_ms=%.3f stage_out_gpu_ms=%.3f stage_out_host_ms=%.3f "
+            "admit_ms=%.3f seq_rm_ms=%.3f occupy_ms=%.3f "
             "layout_d2h_ms=%.3f layout_h2d_ms=%.3f "
             "copy_ms=%.3f rope_ms=%.3f hadamard_ms=%.3f set_ms=%.3f mtp_ms=%.3f dump_ms=%.3f "
             "n_move=%u n_raw=%u n_skip=%u n_stage_in=%u laid_out=%d\n",
             retr_.total_us / 1000.0, retr_.flush_us / 1000.0, retr_.score_us / 1000.0,
             retr_.plan_us / 1000.0, retr_.stage_out_us / 1000.0,
+            retr_.stage_out_gpu_us / 1000.0, retr_.stage_out_host_us / 1000.0,
             retr_.admit_us / 1000.0, retr_.seq_rm_us / 1000.0, retr_.occupy_us / 1000.0,
             retr_.layout_d2h_us / 1000.0, retr_.layout_h2d_us / 1000.0,
             retr_.copy_us / 1000.0, retr_.rope_us / 1000.0, retr_.hadamard_us / 1000.0,
@@ -2541,6 +2713,10 @@ void llama_memory_kvmem::apply_retrieval() {
             write_block_to_gpu(id);
             n_raw++;
         }
+        kvmem_stagein_flush_sync(retr_.enabled ? &retr_.copy_us : nullptr,
+                                 retr_.enabled ? &retr_.rope_us : nullptr,
+                                 retr_.enabled ? &retr_.hadamard_us : nullptr,
+                                 retr_.enabled ? &retr_.set_us : nullptr);
         if (retr_.enabled) {
             retr_.n_raw += n_raw;
             retr_.n_skip += n_skip;
@@ -2772,6 +2948,7 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
         kvmem::rope_neox_apply(rope_, rk0.data(), nt,
                                static_cast<int32_t>(blk.orig_pos_start), rec_k.data());
         write_block_to_gpu(bid);
+        kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
         std::vector<float> after;
         if (read_gpu_block(bid, 0, true, after)) {
             kv_stats("L0 K gpu_after_writeback_vs_gpu_before", before.data(), after.data(), before.size());

@@ -31,7 +31,10 @@ KvMemRuntime::KvMemRuntime(KvMemRuntimeConfig cfg, KvMemBackend *backend)
         ncfg.slot_bytes = slot_bytes_;
         nvme_tier_ = std::make_unique<NvmeKvTier>(ncfg);
     }
-    if (slot_bytes_ > 0) {
+    const bool gpu_fmt_spill =
+            (cpu_tier_ && cpu_tier_->enabled()) ||
+            (nvme_tier_ && nvme_tier_->enabled());
+    if (slot_bytes_ > 0 && gpu_fmt_spill) {
         scratch_.assign(static_cast<size_t>(slot_bytes_), 0);
     }
     if (cpu_tier_ || nvme_tier_) {
@@ -226,6 +229,8 @@ void KvMemRuntime::stage_out(uint32_t block_id) {
     const int32_t prev_nvme = store_.blocks()[block_id].nvme_slot;
 
     const bool persist = cfg_.store.select_method == KvMemMethod::Retrieval;
+    // Packed K/V already live in RawKvStore. GPU-format D2H is only for the
+    // CPU/NVMe block arena; skip it when those tiers are off.
     if (persist && gpu_slot >= 0 && slot_bytes_ > 0 && !scratch_.empty()) {
         backend_->copy_block_to_host(block_id, gpu_slot, scratch_.data(), slot_bytes_);
     }
