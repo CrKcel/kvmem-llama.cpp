@@ -7,6 +7,7 @@
 #include "llama-kvmem-factory.h"
 #include "llama-kvmem-hooks.h"
 #include "llama-kvmem-quant.h"
+#include "llama-kvmem-stagein.h"
 
 #include "llama-arch.h"
 #include "llama-cparams.h"
@@ -91,6 +92,110 @@ static bool kvmem_d2d(uint8_t * dst, const uint8_t * src, size_t n, cudaStream_t
         return true;
     }
     return kvmem_cuda_ok(cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToDevice, st), "layout D2D");
+}
+
+static bool kvmem_stagein_gpu_quant(ggml_type ty, const float * host, uint8_t * dst,
+                                    int64_t nt, int64_t n_embd, int nrot,
+                                    int64_t * hadamard_us, int64_t * set_us) {
+    if (!host || !dst || nt <= 0 || n_embd <= 0 || !kvmem_stagein_quant_ok(ty)) {
+        return false;
+    }
+    if (nrot > 0 && !kvmem_stagein_fwht_ok(nrot)) {
+        return false;
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_h2d_f32(host, nt * n_embd)) {
+            return false;
+        }
+        if (set_us) {
+            *set_us += ggml_time_us() - t0;
+        }
+    }
+    if (nrot > 0) {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_fwht(nt, n_embd, nrot)) {
+            return false;
+        }
+        if (hadamard_us) {
+            *hadamard_us += ggml_time_us() - t0;
+        }
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_quantize(ty, dst, nt, n_embd)) {
+            return false;
+        }
+        if (set_us) {
+            *set_us += ggml_time_us() - t0;
+        }
+    }
+    return true;
+}
+
+static bool kvmem_stagein_gpu_from_packed(
+        ggml_type ty, const void * packed, uint8_t * dst,
+        int64_t nt, int64_t n_embd, int nrot,
+        int n_head, int n_embd_head, int n_rot_rope, int32_t pos0,
+        const float * theta, int n_theta,
+        int64_t * copy_us, int64_t * rope_us, int64_t * hadamard_us, int64_t * set_us) {
+    if (!packed || !dst || nt <= 0 || n_embd <= 0 || !kvmem_stagein_quant_ok(ty)) {
+        return false;
+    }
+    if (nrot > 0 && !kvmem_stagein_fwht_ok(nrot)) {
+        return false;
+    }
+    if ((int64_t) n_head * n_embd_head != n_embd) {
+        return false;
+    }
+    const size_t nbytes = ggml_row_size(ty, n_embd) * (size_t) nt;
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_h2d_packed(packed, nbytes)) {
+            return false;
+        }
+        if (set_us) {
+            *set_us += ggml_time_us() - t0;
+        }
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_dequant(ty, nt, n_embd)) {
+            return false;
+        }
+        if (copy_us) {
+            *copy_us += ggml_time_us() - t0;
+        }
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_rope_neox(nt, n_head, n_embd_head, n_rot_rope, pos0,
+                                     theta, n_theta)) {
+            return false;
+        }
+        if (rope_us) {
+            *rope_us += ggml_time_us() - t0;
+        }
+    }
+    if (nrot > 0) {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_fwht(nt, n_embd, nrot)) {
+            return false;
+        }
+        if (hadamard_us) {
+            *hadamard_us += ggml_time_us() - t0;
+        }
+    }
+    {
+        const int64_t t0 = ggml_time_us();
+        if (!kvmem_stagein_quantize(ty, dst, nt, n_embd)) {
+            return false;
+        }
+        if (set_us) {
+            *set_us += ggml_time_us() - t0;
+        }
+    }
+    return true;
 }
 
 static bool kvmem_harvest_sync_old() {
@@ -480,6 +585,7 @@ llama_memory_kvmem::~llama_memory_kvmem() {
     harvest_worker_stop();
     harvest_perf_print_sum();
     d2h_free();
+    kvmem_stagein_gpu_free();
     if (mtp_) {
         mtp_->detach_target();
         mtp_ = nullptr;
@@ -598,24 +704,42 @@ void llama_memory_kvmem::trace_plan(const char * tag, const kvmem::KvMemPlan & p
 
 void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
     auto & store = runtime_->store();
-    for (uint32_t id : plan.stage_out) {
-        harvest_gpu_v(id);
-        if (mtp_) {
-            mtp_->on_stage_out(id);
+    {
+        const int64_t t0 = ggml_time_us();
+        for (uint32_t id : plan.stage_out) {
+            harvest_gpu_v(id);
+            if (mtp_) {
+                mtp_->on_stage_out(id);
+            }
+        }
+        runtime_->spill_outgoing();
+        if (retr_.enabled) {
+            retr_.stage_out_us += ggml_time_us() - t0;
         }
     }
-    runtime_->spill_outgoing();
-    for (uint32_t id : plan.stage_out) {
-        if (id >= store.block_count()) {
-            continue;
+    {
+        const int64_t t0 = ggml_time_us();
+        for (uint32_t id : plan.stage_out) {
+            if (id >= store.block_count()) {
+                continue;
+            }
+            const kvmem::KvMemBlock & b = store.blocks()[id];
+            if (b.n_tokens > 0) {
+                kv_->seq_rm(0, static_cast<llama_pos>(b.orig_pos_start),
+                            static_cast<llama_pos>(b.orig_pos_end()));
+            }
         }
-        const kvmem::KvMemBlock & b = store.blocks()[id];
-        if (b.n_tokens > 0) {
-            kv_->seq_rm(0, static_cast<llama_pos>(b.orig_pos_start),
-                        static_cast<llama_pos>(b.orig_pos_end()));
+        if (retr_.enabled) {
+            retr_.seq_rm_us += ggml_time_us() - t0;
         }
     }
-    runtime_->admit_incoming();
+    {
+        const int64_t t0 = ggml_time_us();
+        runtime_->admit_incoming();
+        if (retr_.enabled) {
+            retr_.admit_us += ggml_time_us() - t0;
+        }
+    }
 }
 
 bool llama_memory_kvmem::gpu_kv_already_resident(uint32_t block_id) const {
@@ -675,6 +799,7 @@ void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
     ub.output = output.data();
     ub.token = tok.data();
     {
+        const int64_t t0 = ggml_time_us();
         const llama_kv_cells & cells = kv_->get_cells(0);
         for (uint32_t t = 0; t < nt; ++t) {
             const uint32_t idx = sinfo.idxs[0][t];
@@ -683,8 +808,17 @@ void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
                 kv_->seq_rm(0, p, p + 1);
             }
         }
+        if (retr_.enabled) {
+            retr_.seq_rm_us += ggml_time_us() - t0;
+        }
     }
-    kv_->apply_ubatch(sinfo, ub);
+    {
+        const int64_t t0 = ggml_time_us();
+        kv_->apply_ubatch(sinfo, ub);
+        if (retr_.enabled) {
+            retr_.occupy_us += ggml_time_us() - t0;
+        }
+    }
 }
 
 bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
@@ -837,10 +971,16 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         if (retr_.enabled) {
             retr_.layout_d2h_us += ggml_time_us() - t_d2h;
         }
-        for (const auto & it : items) {
-            kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
-                        static_cast<llama_pos>(it.orig + it.n));
-            store.set_block_gpu_slot(it.id, -1);
+        {
+            const int64_t t0 = ggml_time_us();
+            for (const auto & it : items) {
+                kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
+                            static_cast<llama_pos>(it.orig + it.n));
+                store.set_block_gpu_slot(it.id, -1);
+            }
+            if (retr_.enabled) {
+                retr_.seq_rm_us += ggml_time_us() - t0;
+            }
         }
         reset_slots();
         if (trace_) {
@@ -887,10 +1027,16 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         return true;
     }
 
-    for (const auto & it : items) {
-        kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
-                    static_cast<llama_pos>(it.orig + it.n));
-        store.set_block_gpu_slot(it.id, -1);
+    {
+        const int64_t t0 = ggml_time_us();
+        for (const auto & it : items) {
+            kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
+                        static_cast<llama_pos>(it.orig + it.n));
+            store.set_block_gpu_slot(it.id, -1);
+        }
+        if (retr_.enabled) {
+            retr_.seq_rm_us += ggml_time_us() - t0;
+        }
     }
     reset_slots();
     if (trace_) {
@@ -1964,17 +2110,37 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     std::vector<uint8_t> kpack(static_cast<size_t>(nt) * krow);
     std::vector<uint8_t> vpack(static_cast<size_t>(nt) * vrow);
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
+    kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+                            std::max(krow, vrow) * (size_t) block_tokens_);
+    int64_t * cacc = retr_.enabled ? &retr_.copy_us : nullptr;
+    int64_t * racc = retr_.enabled ? &retr_.rope_us : nullptr;
+    int64_t * hacc = retr_.enabled ? &retr_.hadamard_us : nullptr;
+    int64_t * sacc = retr_.enabled ? &retr_.set_us : nullptr;
+    const int nrot_k = kvmem_attn_rot_on(type_k_, static_cast<int>(n_embd_head_))
+            ? kvmem_hadamard_nrot_k(static_cast<int>(n_embd_head_)) : 0;
+    const int nrot_v = kvmem_attn_rot_on(type_v_, static_cast<int>(n_embd_head_))
+            ? kvmem_hadamard_nrot_v(static_cast<int>(n_embd_head_)) : 0;
+    const int n_rot_rope = static_cast<int>(rope_.n_rot);
+    const int n_theta = n_rot_rope / 2;
+    std::vector<float> theta;
+    if (n_theta > 0) {
+        theta.resize(static_cast<size_t>(n_theta));
+        for (int i = 0; i < n_theta; ++i) {
+            theta[static_cast<size_t>(i)] =
+                    std::pow(rope_.freq_base, -2.0f * static_cast<float>(i) /
+                             static_cast<float>(n_rot_rope)) *
+                    rope_.freq_scale;
+        }
+    }
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
         }
         const int64_t t_copy = ggml_time_us();
         bool have_k = false;
-        if (ggml_is_quantized(type_k_)) {
-            have_k = raw_->copy_k_rows(block_id, il, kpack.data(), nt) &&
-                    kvmem_cache_unpack_rows(type_k_, kpack.data(), rk.data(),
-                                            static_cast<int64_t>(nt),
-                                            static_cast<int64_t>(n_embd_k_));
+        const bool k_quant = ggml_is_quantized(type_k_);
+        if (k_quant) {
+            have_k = raw_->copy_k_rows(block_id, il, kpack.data(), nt);
         } else {
             have_k = raw_->copy_k(block_id, il, rk.data());
         }
@@ -1990,45 +2156,113 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         if (retr_.enabled) {
             retr_.copy_us += ggml_time_us() - t_copy;
         }
-        const int64_t t_rope = ggml_time_us();
-        kvmem::rope_neox_apply(rope_, rk.data(), nt, static_cast<int32_t>(blk.orig_pos_start), roped.data());
-        if (retr_.enabled) {
-            retr_.rope_us += ggml_time_us() - t_rope;
-        }
-        if (kvmem_attn_rot_on(type_k_, static_cast<int>(n_embd_head_))) {
-            kvmem_hadamard_rows(roped.data(), static_cast<int64_t>(nt),
-                                static_cast<int>(n_head_kv_), static_cast<int>(n_embd_head_),
-                                kvmem_hadamard_nrot_k(static_cast<int>(n_embd_head_)));
-        }
-        if (have_v && !have_gpu_v &&
-            kvmem_attn_rot_on(type_v_, static_cast<int>(n_embd_head_))) {
-            kvmem_hadamard_rows(rv.data(), static_cast<int64_t>(nt),
-                                static_cast<int>(n_head_kv_), static_cast<int>(n_embd_head_),
-                                kvmem_hadamard_nrot_v(static_cast<int>(n_embd_head_)));
-        }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
-        const int64_t t_set = ggml_time_us();
-        if (kt && cell0 < kv_size_) {
-            if (kvmem_cache_pack_rows(type_k_, roped.data(), kpack.data(),
-                                      static_cast<int64_t>(nt),
-                                      static_cast<int64_t>(n_embd_k_))) {
-                ggml_backend_tensor_set(kt, kpack.data(), cell0 * krow, nt * krow);
+        uint8_t * kbase = kvmem_cuda_tensor_ptr(kt);
+        uint8_t * vbase = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
+        bool k_gpu = false;
+        if (k_quant && kbase && cell0 < kv_size_ && !theta.empty()) {
+            k_gpu = kvmem_stagein_gpu_from_packed(
+                    type_k_, kpack.data(),
+                    kbase + static_cast<size_t>(cell0) * krow,
+                    static_cast<int64_t>(nt), static_cast<int64_t>(n_embd_k_),
+                    nrot_k, static_cast<int>(n_head_kv_),
+                    static_cast<int>(n_embd_head_), n_rot_rope,
+                    static_cast<int32_t>(blk.orig_pos_start),
+                    theta.data(), n_theta, cacc, racc, hacc, sacc);
+        }
+        if (!k_gpu) {
+            if (k_quant) {
+                const int64_t t_un = ggml_time_us();
+                if (!kvmem_cache_unpack_rows(type_k_, kpack.data(), rk.data(),
+                                             static_cast<int64_t>(nt),
+                                             static_cast<int64_t>(n_embd_k_))) {
+                    continue;
+                }
+                if (retr_.enabled) {
+                    retr_.copy_us += ggml_time_us() - t_un;
+                }
+            }
+            const int64_t t_rope = ggml_time_us();
+            kvmem::rope_neox_apply(rope_, rk.data(), nt,
+                                   static_cast<int32_t>(blk.orig_pos_start), roped.data());
+            if (retr_.enabled) {
+                retr_.rope_us += ggml_time_us() - t_rope;
+            }
+            bool k_gpu_f32 = false;
+            if (kbase && cell0 < kv_size_) {
+                k_gpu_f32 = kvmem_stagein_gpu_quant(
+                        type_k_, roped.data(),
+                        kbase + static_cast<size_t>(cell0) * krow,
+                        static_cast<int64_t>(nt), static_cast<int64_t>(n_embd_k_),
+                        nrot_k, hacc, sacc);
+            }
+            if (!k_gpu_f32) {
+                const int64_t t_h = ggml_time_us();
+                if (nrot_k > 0) {
+                    kvmem_hadamard_rows(roped.data(), static_cast<int64_t>(nt),
+                                        static_cast<int>(n_head_kv_),
+                                        static_cast<int>(n_embd_head_), nrot_k);
+                }
+                if (retr_.enabled) {
+                    retr_.hadamard_us += ggml_time_us() - t_h;
+                }
+                const int64_t t_set = ggml_time_us();
+                if (kt && cell0 < kv_size_) {
+                    if (kvmem_cache_pack_rows(type_k_, roped.data(), kpack.data(),
+                                              static_cast<int64_t>(nt),
+                                              static_cast<int64_t>(n_embd_k_))) {
+                        ggml_backend_tensor_set(kt, kpack.data(), cell0 * krow, nt * krow);
+                    }
+                }
+                if (retr_.enabled) {
+                    retr_.set_us += ggml_time_us() - t_set;
+                }
             }
         }
         if (have_v && vt && !v_trans_ && cell0 < kv_size_) {
             if (have_gpu_v) {
-                ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
-            } else if (kvmem_cache_pack_rows(type_v_, rv.data(), vpack.data(),
+                const int64_t t_set = ggml_time_us();
+                if (!(vbase && kvmem_stagein_h2d_bytes(
+                        vbase + static_cast<size_t>(cell0) * vrow,
+                        vpack.data(), static_cast<size_t>(nt) * vrow))) {
+                    ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+                }
+                if (retr_.enabled) {
+                    retr_.set_us += ggml_time_us() - t_set;
+                }
+            } else {
+                bool v_gpu = false;
+                if (vbase) {
+                    v_gpu = kvmem_stagein_gpu_quant(type_v_, rv.data(),
+                            vbase + static_cast<size_t>(cell0) * vrow,
+                            static_cast<int64_t>(nt), static_cast<int64_t>(n_embd_v_),
+                            nrot_v, hacc, sacc);
+                }
+                if (!v_gpu) {
+                    const int64_t t_h = ggml_time_us();
+                    if (nrot_v > 0) {
+                        kvmem_hadamard_rows(rv.data(), static_cast<int64_t>(nt),
+                                            static_cast<int>(n_head_kv_),
+                                            static_cast<int>(n_embd_head_), nrot_v);
+                    }
+                    if (retr_.enabled) {
+                        retr_.hadamard_us += ggml_time_us() - t_h;
+                    }
+                    const int64_t t_set = ggml_time_us();
+                    if (kvmem_cache_pack_rows(type_v_, rv.data(), vpack.data(),
                                              static_cast<int64_t>(nt),
                                              static_cast<int64_t>(n_embd_v_))) {
-                ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+                        ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+                    }
+                    if (retr_.enabled) {
+                        retr_.set_us += ggml_time_us() - t_set;
+                    }
+                }
             }
         }
-        if (retr_.enabled) {
-            retr_.set_us += ggml_time_us() - t_set;
-        }
     }
+    kvmem_stagein_sync();
     if (trace_) {
         fprintf(stderr, "KVMEM_TRACE stage_in_raw block=%u slot=%d n=%u orig=%u\n",
                 block_id, blk.gpu_slot, nt, blk.orig_pos_start);
@@ -2166,14 +2400,16 @@ void llama_memory_kvmem::retr_perf_print() {
     }
     fprintf(stderr,
             "KVMEM_RETR_SUM total_ms=%.3f flush_ms=%.3f score_ms=%.3f plan_ms=%.3f "
-            "stage_out_ms=%.3f layout_d2h_ms=%.3f layout_h2d_ms=%.3f "
-            "copy_ms=%.3f rope_ms=%.3f set_ms=%.3f mtp_ms=%.3f dump_ms=%.3f "
+            "stage_out_ms=%.3f admit_ms=%.3f seq_rm_ms=%.3f occupy_ms=%.3f "
+            "layout_d2h_ms=%.3f layout_h2d_ms=%.3f "
+            "copy_ms=%.3f rope_ms=%.3f hadamard_ms=%.3f set_ms=%.3f mtp_ms=%.3f dump_ms=%.3f "
             "n_move=%u n_raw=%u n_skip=%u n_stage_in=%u laid_out=%d\n",
             retr_.total_us / 1000.0, retr_.flush_us / 1000.0, retr_.score_us / 1000.0,
             retr_.plan_us / 1000.0, retr_.stage_out_us / 1000.0,
+            retr_.admit_us / 1000.0, retr_.seq_rm_us / 1000.0, retr_.occupy_us / 1000.0,
             retr_.layout_d2h_us / 1000.0, retr_.layout_h2d_us / 1000.0,
-            retr_.copy_us / 1000.0, retr_.rope_us / 1000.0, retr_.set_us / 1000.0,
-            retr_.mtp_us / 1000.0, retr_.dump_us / 1000.0,
+            retr_.copy_us / 1000.0, retr_.rope_us / 1000.0, retr_.hadamard_us / 1000.0,
+            retr_.set_us / 1000.0, retr_.mtp_us / 1000.0, retr_.dump_us / 1000.0,
             retr_.n_move, retr_.n_raw, retr_.n_skip, retr_.n_stage_in, retr_.laid_out);
 }
 
@@ -2251,13 +2487,7 @@ void llama_memory_kvmem::apply_retrieval() {
         }
         fprintf(stderr, "\n");
     }
-    {
-        const int64_t t0 = ggml_time_us();
-        apply_plan_to_kv(plan);
-        if (retr_.enabled) {
-            retr_.stage_out_us += ggml_time_us() - t0;
-        }
-    }
+    apply_plan_to_kv(plan);
     auto & store = runtime_->store();
     retrieval_pinned_ = true;
     if (mtp_) {

@@ -1,0 +1,18 @@
+# v0.7.0 speed excerpts
+# decode = KVMEM_GEN_WALL. Speed is not a go/no-go.
+# GPU stage-in vs v0.6.0 host Hadamard. IQ3 128k / 5090.
+
+========== IQ3_S 128k / 60k active / q8 / 5090 / -b 512 / bt=128 no-mtp ==========
+# v0.6.0 host Hadamard  logs/ista_iq3_128k_q8kv_bt128_speed.log
+prefill=780 tok/s  retrieval_ms=44498  decode=33.0  VRAM peak=14896
+KVMEM_RETR_SUM total=44497 stage_out=1793 set=4253 copy=335 rope=329 n_raw=248
+# ~37 s unbucketed (host Hadamard)
+
+# v0.7.0 GPU dequant+RoPE+FWHT+quant  logs/ista_iq3_128k_q8kv_bt128_gpu_dequant.log
+prefill=787 tok/s  retrieval_ms=3392  decode=34.2  VRAM peak=14896
+KVMEM_RETR_SUM total=3392 flush=7.6 score=46 plan=0.05 stage_out=1839 admit=0
+seq_rm=24 occupy=6.5 layout_d2h=72 layout_h2d=62 copy=277 rope=50
+hadamard=32 set=899 n_raw=248 n_move=220 laid_out=1
+
+# pinned double-buffer (not in tag; wall clock no win)
+# logs/ista_iq3_128k_q8kv_bt128_pin_dbl.log  retr=3445 set=684 copy=476

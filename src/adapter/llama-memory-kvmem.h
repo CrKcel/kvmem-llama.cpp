@@ -221,10 +221,14 @@ private:
         int64_t score_us = 0;
         int64_t plan_us = 0;
         int64_t stage_out_us = 0;
+        int64_t admit_us = 0;
+        int64_t seq_rm_us = 0;
+        int64_t occupy_us = 0;
         int64_t layout_d2h_us = 0;
         int64_t layout_h2d_us = 0;
         int64_t copy_us = 0;
         int64_t rope_us = 0;
+        int64_t hadamard_us = 0;
         int64_t set_us = 0;
         int64_t mtp_us = 0;
         int64_t dump_us = 0;
