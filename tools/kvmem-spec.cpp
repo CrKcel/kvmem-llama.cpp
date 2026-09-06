@@ -3,6 +3,42 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+
+ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
+    if (ok) {
+        *ok = true;
+    }
+    if (!s) {
+        if (ok) {
+            *ok = false;
+        }
+        return GGML_TYPE_F16;
+    }
+    if (std::strcmp(s, "f16") == 0 || std::strcmp(s, "fp16") == 0) {
+        return GGML_TYPE_F16;
+    }
+    if (std::strcmp(s, "f32") == 0 || std::strcmp(s, "fp32") == 0) {
+        return GGML_TYPE_F32;
+    }
+    if (std::strcmp(s, "q8_0") == 0 || std::strcmp(s, "q8") == 0) {
+        return GGML_TYPE_Q8_0;
+    }
+    if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "q4") == 0) {
+        return GGML_TYPE_Q4_0;
+    }
+    if (ok) {
+        *ok = false;
+    }
+    return GGML_TYPE_F16;
+}
+
+bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v) {
+    if (ggml_is_quantized(type_k) || ggml_is_quantized(type_v)) {
+        return type_k == type_v;
+    }
+    return true;
+}
 
 bool kvmem_spec_start(kvmem_spec_session & sess,
                       llama_model * model_tgt,
@@ -32,6 +68,8 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     p.n_parallel = 1;
     p.n_outputs_max = 1 + std::max(0, opts.n_max);
     p.n_outputs_max_per_seq = p.n_outputs_max;
+    p.cache_type_k = opts.type_k;
+    p.cache_type_v = opts.type_v;
 
     common_params p_dft = common_base_params_to_speculative(p);
     sess.init = common_speculative_init_from_params(p_dft, model_tgt, ctx_tgt);
