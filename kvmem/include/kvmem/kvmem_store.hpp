@@ -380,9 +380,10 @@ public:
     uint32_t gpu_high_watermark_tokens(uint32_t pool_tokens) const;
     uint32_t gpu_low_watermark_tokens(uint32_t pool_tokens) const;
 
-    // True when the next prefill chunk must run sink+tail pressure offload:
-    // over the semantic prefill budget, over the hard pool, or over the high
-    // watermark. Incoming tokens that already fit stay on the fast path.
+    // True when the next prefill chunk would overflow the physical GPU pool
+    // (budget + gen_reserve) or its high watermark. History longer than the
+    // semantic prefill budget is not enough: unused gen_reserve slots are
+    // slack, then pressure contracts back to prefill_budget in one reselect.
     bool prefill_needs_offload(uint32_t resident_tokens,
                                uint32_t incoming_tokens,
                                uint32_t pool_tokens) const;

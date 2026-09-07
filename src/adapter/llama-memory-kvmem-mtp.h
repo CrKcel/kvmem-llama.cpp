@@ -72,12 +72,22 @@ public:
     void follow_retrieval();
     void detach_target() { target_ = nullptr; }
 
+    // Retrieval layout: keep native MTP GPU KV for blocks that still sit
+    // at src_slot, D2D them to dst_slot (same permutation as the trunk).
+    struct LayoutMove {
+        int32_t src_slot = -1;
+        int32_t dst_slot = -1;
+        uint32_t n_tokens = 0;
+    };
+    bool slot_holds(int32_t slot, uint32_t orig_pos) const;
+    bool layout_d2d(const LayoutMove * moves, size_t n_moves);
+    void occupy_block(uint32_t block_id);
+
 private:
     bool fill_from_target(const llama_ubatch & ubatch, llama_kv_cache::slot_info & out);
-    void occupy_block(uint32_t block_id);
     void write_block_to_gpu(uint32_t block_id);
+    void harvest_k(uint32_t block_id);
     void harvest_v(uint32_t block_id);
-    void harvest_capture(struct ggml_tensor * t, char which);
 
     const llama_model & model_;
     llama_memory_kvmem * target_ = nullptr;

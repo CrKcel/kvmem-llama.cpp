@@ -1,0 +1,39 @@
+# v0.9.0 quality excerpts
+# 0.8B: RTX 5050 (UUID GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29)
+# 27B:  RTX 5090 (UUID GPU-58a7c28b-e698-307f-c149-24d4ecd88bf4)
+# 2026-09-07  CUDA_DEVICE_ORDER=PCI_BUS_ID  --kv-dtype q8_0 (default)
+
+========== identity_canary.py Qwen3.5-0.8B-Q8_0 ==========
+off [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303]
+on  [3629, 13, 353, 1044, 264, 220, 17, 15, 4514, 6086, 8330, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303, 279, 3516, 4042, 13, 353, 1044, 264, 5286, 506, 264, 11759, 303]
+PASS: identity (KVMem-on greedy tokens == KVMem-off)
+
+========== needle_recall.py retrieval budget=256 bt=32 --no-think ==========
+KVMEM_KV L23 K packed_bytes mismatch=0 / 17408
+KVMEM_KV L23 K packed_vs_gpu n=16384 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=1.435393
+KVMEM_KV L23 V packed_vs_gpu n=16384 cos=1.000000 rmse=0.000000 maxabs=0.000000 rms_gpu=2.341545
+output: Based on the notes provided, the secret code is **BLUEBIRD-42**.
+PASS: retrieval budget=256 bt=32 revived the middle needle
+
+========== mtp_canary.py 0.8B n_max=2 ==========
+PASS: retrieval+MTP ranker/follow TRACE
+PASS: retrieval+MTP generated BLUEBIRD-42
+mtp_follow n_no_raw=0
+spec_stats accept_pct=45.7
+
+========== raw_kv_store_test / kvmem_store_test ==========
+unit rc=0
+
+========== 27B 60k programming MTP n_max=2 (5090) ==========
+# UD-Q4_K_M logs/mtp_prog_60k_eager.log
+spec_stats n_gen=256 n_drafted=184 n_accept=166 accept_pct=90.2
+mtp_follow n_no_raw=0
+# IQ3_S logs/ista_iq3_prog_60k_mtp.log
+spec_stats n_gen=256 n_drafted=186 n_accept=163 accept_pct=87.6
+mtp_follow n_no_raw=0
+
+========== 27B 60k English-prose MTP n_max=2 (5090) ==========
+# IQ3_S logs/prose_60k_iq3.log
+spec_stats n_gen=228 n_drafted=200 n_accept=129 accept_pct=64.5
+# UD-Q4_K_M logs/prose_60k_q4.log
+spec_stats n_gen=256 n_drafted=224 n_accept=146 accept_pct=65.2

@@ -3,13 +3,13 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.8.0`](docs/milestones/v0.8.0.md)** (2026-09-06).
-GPU KV default **q8_0**; cold stage-in is adapter CUDA (packed q8 H2D →
-dequant → orig-pos RoPE → FWHT → quant) via a **32 MiB** slab. Layout and
-packed-V stage-out use GPU gather/scatter. V spill is packed working-cache
-rows; raw-K is unrotated q8_0. `--kvmem` is retrieval + query-last 64.
-MTP remains optional (`v0.5.0`). 0.8B identity + BLUEBIRD-42 GO. Speed
-recorded. P6 is not started.
+**Current local milestone: [`v0.9.0`](docs/milestones/v0.9.0.md)** (2026-09-07).
+GPU KV default **q8_0**. Orig-pos cells; restore is packed GPU K/V memcpy
+(no unrotated raw-K on the product path). Retrieval uses pre-RoPE mean-K.
+Full blocks copy packed K/V to host asynchronously during prefill.
+`--kvmem` is retrieval + query-last 64. MTP remains optional (default
+**none**). 0.8B identity + BLUEBIRD-42 GO. Speed recorded. P6 is not
+started. Prefix cache (plan B/C/D) is not in this tag.
 
 ## Layout
 
@@ -31,11 +31,11 @@ recorded. P6 is not started.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.8.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.9.0` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.8.0
+git checkout v0.9.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh

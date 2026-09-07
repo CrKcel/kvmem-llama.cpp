@@ -132,6 +132,28 @@ int main() {
     }
     rawg.write_layer_v_gpu(0, 2, 0, packed.data());
     CHECK(rawg.has_v(0, 0));
+    CHECK(rawg.has_v_gpu(0, 0));
+    CHECK(!rawg.has_block(0));
+    kvmem::RawKvStoreConfig kgcfg = cfg;
+    kgcfg.k_gpu_row_bytes = 6;
+    kvmem::RawKvStore rawkg(kgcfg);
+    rawkg.write_layer_k_gpu(0, 2, 0, packed.data());
+    CHECK(rawkg.has_k_gpu(0, 0));
+    CHECK(rawkg.has_block(0));
+    CHECK(!rawkg.has_k(0, 0));
+    std::vector<uint8_t> kgout(12, 0);
+    CHECK(rawkg.copy_k_gpu(0, 0, kgout.data(), 2));
+    CHECK(kgout[0] == 1);
+    CHECK(kgout[11] == 12);
+
+    kvmem::RawKvStore rawm(cfg);
+    rawm.write_layer_mean_k(0, 2, 0, k.data());
+    CHECK(rawm.has_block(0));
+    CHECK(!rawm.has_k(0, 0));
+    CHECK(!rawm.has_k_gpu(0, 0));
+    std::vector<float> mm(4, 0.0f);
+    rawm.mean_k(0, 0, mm.data());
+    CHECK(std::fabs(mm[0] - 2.0f) < 1e-3f);
     std::vector<uint8_t> gout(12, 0);
     CHECK(rawg.copy_v_gpu(0, 0, gout.data(), 2));
     CHECK(gout[0] == 1);

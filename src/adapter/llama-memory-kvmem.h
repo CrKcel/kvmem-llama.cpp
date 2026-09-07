@@ -145,7 +145,7 @@ private:
     bool prepare_working_set(uint32_t n_new_tokens);
     void apply_plan_to_kv(const kvmem::KvMemPlan & plan);
     // Place GPU-resident blocks into slots 0..N-1 in orig_pos order.
-    // Resident KV is copied slot-to-slot; only cold blocks are rebuilt from raw.
+    // Resident KV is copied slot-to-slot; cold blocks memcpy packed GPU K/V.
     bool layout_gpu_slots_by_orig_pos();
     bool gpu_kv_already_resident(uint32_t block_id) const;
     void occupy_block_cells(uint32_t block_id);
@@ -156,10 +156,14 @@ private:
     void harvest_gpu_v_commit();
     void harvest_gpu_v_flush_slab();
     void harvest_write_batch();
+    // After a prefill graph, enqueue packed K/V D2H for GPU-resident
+    // full blocks. Does not wait; apply_plan / retrieval commit.
+    void harvest_full_blocks_async();
     struct HarvestVJob {
         uint32_t pos0 = 0;
         uint32_t n = 0;
         uint32_t il = 0;
+        bool is_k = false;
         const uint8_t * gpu_src = nullptr;
         size_t nbytes = 0;
         size_t pin_off = 0;
@@ -172,6 +176,8 @@ private:
     };
     std::vector<HarvestVJob> harvest_v_jobs_;
     HarvestVBatch harvest_v_pending_;
+    // 1 while a block's packed D2H is queued or in flight (until commit).
+    std::vector<uint8_t> harvest_gpu_queued_;
     void copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_slot,
                                 void * host, uint64_t bytes);
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
@@ -231,6 +237,8 @@ private:
         int64_t last_nvme_us = 0;
         uint64_t last_nvme_bytes = 0;
         uint64_t last_nvme_syscalls = 0;
+        uint32_t n_pressure = 0;
+        uint32_t n_pressure_out = 0;
     };
 
     struct RetrPerf {

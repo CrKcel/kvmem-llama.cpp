@@ -621,7 +621,9 @@ static void test_prefill_watermark_offload_predicate() {
 
     CHECK(s.gpu_high_watermark_tokens(pool) == 230);  // 256 * 0.90
     CHECK(s.gpu_low_watermark_tokens(pool) == 204);   // 256 * 0.80
-    CHECK(s.prefill_needs_offload(0, 32, pool));      // over semantic budget
+    // History > semantic budget is not enough: GPU still has gen_reserve slack.
+    CHECK(!s.prefill_needs_offload(0, 32, pool));
+    CHECK(!s.prefill_needs_offload(32 * 4, 32, pool));  // 160 < 230
     CHECK(s.prefill_needs_offload(200, 40, pool));    // over high watermark
     CHECK(s.prefill_needs_offload(240, 32, pool));    // over hard pool
     CHECK(!s.prefill_needs_offload(0, 0, pool));

@@ -68,6 +68,7 @@ def run_text(cli: Path, model: Path, extra: list[str], prompt: str, n: int,
     keys = (
         "KVMEM_TRACE retrieval",
         "stage_in_raw",
+        "stage_in_packed",
         "query_replay",
         "force_pos",
         "selected",

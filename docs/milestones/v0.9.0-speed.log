@@ -1,0 +1,27 @@
+# v0.9.0 speed excerpts
+# decode = KVMEM_GEN_WALL. Speed is not a go/no-go.
+# 60k prompt / budget 20k / q8 / 5090 / bt=128 / -b 512
+
+========== UD-Q4_K_M 60k programming ==========
+# off  logs/mtp_prog_60k_off.summary
+GEN_WALL=39.38 tok/s  retrieval_ms=1291
+# mtp n_max=2 after packed memcpy, before eager D2H  logs/mtp_prog_60k_kgpu.log
+GEN_WALL=59.92 tok/s  accept=90.2  retrieval_ms=789
+# mtp + eager block-full D2H  logs/mtp_prog_60k_eager.log
+GEN_WALL=60.77 tok/s  accept=90.2  retrieval_ms=440
+KVMEM_RETR_SUM total=439.052 stage_out=63.928 stage_out_host=2.547
+copy=47.268 set=168.143 mtp=53.071 n_raw=105 n_move=51
+
+========== IQ3_S 60k programming ==========
+# off  logs/ista_iq3_prog_60k_off.log
+GEN_WALL=40.59 tok/s  retrieval_ms=324
+# mtp n_max=2  logs/ista_iq3_prog_60k_mtp.log
+GEN_WALL=60.53 tok/s  accept=87.6  retrieval_ms=582
+
+========== 60k English prose MTP n_max=2 ==========
+# IQ3_S  logs/prose_60k_iq3.log
+GEN_WALL=49.20 tok/s  accept=64.5
+# UD-Q4_K_M  logs/prose_60k_q4.log
+GEN_WALL=46.58 tok/s  accept=65.2
+
+# not in tag: decode mean-K / prefix cache / state_write

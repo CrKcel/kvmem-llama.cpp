@@ -339,17 +339,14 @@ uint32_t KvMemStore::gpu_low_watermark_tokens(uint32_t pool_tokens) const {
 bool KvMemStore::prefill_needs_offload(uint32_t resident_tokens,
                                        uint32_t incoming_tokens,
                                        uint32_t pool_tokens) const {
-    if (incoming_tokens == 0) {
+    if (incoming_tokens == 0 || pool_tokens == 0) {
         return false;
     }
-    if (block_count() > prefill_budget_blocks()) {
-        return true;
-    }
     const uint32_t next = resident_tokens + incoming_tokens;
-    if (pool_tokens > 0 && next > pool_tokens) {
+    if (next > pool_tokens) {
         return true;
     }
-    return pool_tokens > 0 && next > gpu_high_watermark_tokens(pool_tokens);
+    return next > gpu_high_watermark_tokens(pool_tokens);
 }
 
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {

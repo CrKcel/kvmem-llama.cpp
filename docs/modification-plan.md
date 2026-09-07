@@ -1,6 +1,6 @@
 # KVMem × llama.cpp 修改计划
 
-**状态（2026-09-06）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7 **`v0.5.0`**。量化 KV spill / unrotated q8 raw-K **`v0.6.0`**。GPU stage-in **`v0.7.0`**。32 MiB slab + GPU gather/scatter **`v0.8.0`**（tag `v0.8.0`）。产品默认 `--kvmem` = retrieval + query-last 64，GPU KV **q8_0**；MTP 可选 `--spec-type draft-mtp`（默认 **none**）。ISTA IQ3_S 不开 MTP。阶段测试：[milestones/v0.8.0.md](milestones/v0.8.0.md)。P6 未开始。
+**状态（2026-09-07）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7 **`v0.5.0`**。量化 KV spill **`v0.6.0`**。GPU stage-in **`v0.7.0`**。32 MiB slab **`v0.8.0`**。packed GPU K/V memcpy + mean-K + 块写满异步 D2H **`v0.9.0`**（tag `v0.9.0`）。产品默认 `--kvmem` = retrieval + query-last 64，GPU KV **q8_0**；MTP 可选 `--spec-type draft-mtp`（默认 **none**）。ISTA IQ3_S 默认仍 **none**（60k 编程抽检接受率可用，不改默认）。阶段测试：[milestones/v0.9.0.md](milestones/v0.9.0.md)。P6 未开始。prefix cache（计划 B/C/D）未进此 tag。
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**
 

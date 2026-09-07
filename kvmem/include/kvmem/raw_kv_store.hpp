@@ -1,11 +1,10 @@
 #pragma once
 
-// CPU/NVMe immutable raw-K (pre-RoPE). Indexed by logical block, then layer.
+// Host spill for attention KV, indexed by logical block then layer.
 //
-// Default K rows are unrotated FP16. When `k_row_bytes` is set (adapter: ggml
-// row size of GPU type_k), K rows are opaque unrotated quant (q8_0/q4_0) with
-// no Hadamard. Mean-K is captured from F16/F32 at write, never from quant rows.
-// GPU-format V (qw3-style): stage-out copies packed working-V rows as-is.
+// Product path: mean-K (F32) at first write; packed GPU-format K/V (q8_0 etc)
+// copied at stage-out. Restore is memcpy; orig pos does not need unrotated K.
+// `write_layer_k_rows` (unrotated token-major K) remains for tests only.
 
 #include <atomic>
 #include <condition_variable>
@@ -27,6 +26,7 @@ struct RawKvStoreConfig {
     uint32_t n_embd_v = 0;
     uint32_t block_tokens = 128;
     uint64_t k_row_bytes = 0;      // 0 = FP16 (n_embd_k * 2); else opaque K row
+    uint64_t k_gpu_row_bytes = 0;  // 0 = no packed GPU K; else bytes per token row
     uint64_t v_gpu_row_bytes = 0;  // 0 = no packed GPU V; else bytes per token row
     uint64_t nvme_bytes = 0;
     std::string nvme_dir;
@@ -54,15 +54,22 @@ public:
     void write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
                             const uint8_t * k, const float * k_f32);
     void write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il, const uint8_t * v);
+    // Packed GPU-format K (RoPE+Hadamard+quant already applied). RAM only.
+    void write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il, const uint8_t * k);
+    // Prefill mean-K only (no raw-K rows). k is token-major F32, n_embd_k per token.
+    void write_layer_mean_k(uint32_t pos0, uint32_t n, uint32_t il, const float * k);
 
     bool has_block(uint32_t block_id) const;
     bool has_k(uint32_t block_id, uint32_t il) const;
+    bool has_k_gpu(uint32_t block_id, uint32_t il) const;
     bool has_v(uint32_t block_id, uint32_t il) const;
+    bool has_v_gpu(uint32_t block_id, uint32_t il) const;
     uint32_t n_tokens(uint32_t block_id) const;
 
     bool copy_k(uint32_t block_id, uint32_t il, float * out) const;
     bool copy_v(uint32_t block_id, uint32_t il, float * out) const;
     bool copy_k_rows(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
+    bool copy_k_gpu(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
     bool copy_v_gpu(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
 
     void mean_k(uint32_t block_id, uint32_t il, float * out) const;
@@ -82,11 +89,13 @@ private:
         uint32_t n_tokens = 0;
         std::vector<uint8_t> k;
         std::vector<uint16_t> v;
+        std::vector<uint8_t> k_gpu;
         std::vector<uint8_t> v_gpu;
         std::vector<float> mean;
         std::vector<float> k_sum;
         bool k_on_nvme = false;
         bool v_on_nvme = false;
+        bool k_gpu_fmt = false;
         bool v_gpu_fmt = false;
         bool k_flushing = false;
         bool v_flushing = false;

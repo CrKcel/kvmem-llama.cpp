@@ -11,21 +11,20 @@ llama.cpp/      submodule + thin patches (P1+)
 
 GPU attention cache is a **bounded block-slot pool** of size
 `budget + gen_reserve`. Product default GPU KV type is llama.cpp **q8_0**
-for K and V (`--kv-dtype q8_0`; `f16` or `q4_0` to override). Unrotated
-raw-K matches that type (q8_0/q4_0 rows, no RoPE/Hadamard; F16 when GPU
-is F16). Mean-K is F32 captured before quantize. Packed GPU V is the
-stage-out spill. Cold stage-in of quantized K is adapter CUDA: H2D packed
-rows, dequant, orig-pos NeoX RoPE, Walsh-Hadamard, quant into the working
-cache (`src/adapter/llama-kvmem-stagein.cu`). Packed transfers use a
-**32 MiB** GPU slab (stage-in H2D; stage-out gather + one D2H; layout
-gather/scatter). GPU-format CPU/NVMe scratch is allocated only when those
-tiers are on. Host Hadamard remains fallback. Each logical block occupies
-one slot of `block_tokens` cells. Slot index is not the RoPE coordinate: P1 keeps the
-original (monotonic) token `pos` on each cell so llama.cpp's existing
-KQ mask stays causal. Reselect is a `KvMemPlan` diff: resident selected
-blocks stay in their slot; only `stage_out` cells are `seq_rm`'d.
-Flash Attention is not modified. P1 recency does not re-RoPE and does
-not resurrect dropped blocks.
+for K and V (`--kv-dtype q8_0`; `f16` or `q4_0` to override). Cell `pos` is
+the original monotonic token position (slot index is not a RoPE coordinate).
+Restore is packed GPU-format memcpy at that orig pos — no unrotated raw-K
+and no re-RoPE on the product path. Retrieval scores **mean-K** (F32,
+pre-RoPE, captured at first write). Packed K/V for a full block are
+copied to host asynchronously when the block fills, overlapping later
+prefill; eviction then skips if the copy exists. Cold stage-in is
+`copy_k_gpu` / `copy_v_gpu` + slab H2D. Packed transfers use a **32 MiB**
+GPU slab. GPU-format CPU/NVMe scratch is allocated only when those tiers
+are on. Each logical block occupies one slot of `block_tokens` cells.
+Reselect is a `KvMemPlan` diff: resident selected blocks stay in their
+slot; only `stage_out` cells are `seq_rm`'d. Flash Attention is not
+modified. P1 recency does not re-RoPE and does not resurrect dropped
+blocks.
 
 Hardware split on this machine: RTX 5050 (GPU 0) for models < 27B;
 RTX 5090 (GPU 1) for 27B. Details in `scripts/gpu.sh` and
