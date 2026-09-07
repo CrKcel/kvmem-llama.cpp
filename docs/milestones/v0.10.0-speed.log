@@ -1,0 +1,32 @@
+# v0.10.0 speed excerpts
+# decode = KVMEM_GEN_WALL. Speed is not a go/no-go.
+# 60k notes + tools / budget 20k / q8 / 5090 / bt=128 / -b 512
+
+========== UD-Q4_K_M 60k tools (llama-kvmem-server) ==========
+# off  logs/tools_60k_27b.summary
+PEAK gpu_mib=16810 rss_mib=16094
+turn1 http=53.10s prefill_ms=49221 gen_n=26 GEN_WALL=32.82 tok/s
+turn2 reused=1 http=1.12s prefill_ms=682 gen_n=6 GEN_WALL=34.23 tok/s
+turn3 reused=1 http=1.15s prefill_ms=702 gen_n=6 GEN_WALL=34.60 tok/s
+# mtp n_max=2  logs/tools_60k_27b_mtp.summary
+PEAK gpu_mib=17388 rss_mib=16094
+turn1 http=56.24s prefill_ms=52895 gen_n=26 GEN_WALL=55.51 tok/s accept=100.0
+turn2 reused=1 http=1.32s prefill_ms=850 gen_n=6 GEN_WALL=32.91 tok/s accept=100.0
+turn3 reused=1 http=1.25s prefill_ms=755 gen_n=6 GEN_WALL=40.64 tok/s accept=100.0
+CUDA0 model buffer 14674 MiB (off) / 15009 MiB (mtp)
+
+========== IQ3_S 60k tools (llama-kvmem-server) ==========
+# off  logs/tools_60k_27b_iq3.summary
+PEAK gpu_mib=13238 rss_mib=11937
+turn1 http=53.90s prefill_ms=50343 gen_n=26 GEN_WALL=37.92 tok/s
+turn2 reused=1 http=1.16s prefill_ms=725 gen_n=6 GEN_WALL=37.75 tok/s
+turn3 reused=1 http=1.14s prefill_ms=691 gen_n=6 GEN_WALL=35.19 tok/s
+# mtp n_max=2  logs/tools_60k_27b_iq3_mtp.summary
+PEAK gpu_mib=13816 rss_mib=11950
+turn1 http=58.53s prefill_ms=55011 gen_n=26 GEN_WALL=59.55 tok/s accept=100.0
+turn2 reused=1 http=1.25s prefill_ms=781 gen_n=6 GEN_WALL=38.08 tok/s accept=100.0
+turn3 reused=1 http=1.25s prefill_ms=770 gen_n=6 GEN_WALL=35.39 tok/s accept=100.0
+CUDA0 model buffer 10827 MiB (off) / 11160 MiB (mtp)
+
+# v0.9.0 60k programming GEN_WALL still applies (same packed path):
+# Q4 off ~40 / mtp 60.8 accept 90.2; IQ3 off 40.6 / mtp 60.5 accept 87.6

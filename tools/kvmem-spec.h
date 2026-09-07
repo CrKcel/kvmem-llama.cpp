@@ -78,3 +78,13 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         int n_predict,
         float temp,
         kvmem_spec_on_token on_token);
+
+// Same as above, but uses a fully-specified sampler (grammar / lazy triggers).
+kvmem_spec_gen_stats kvmem_spec_generate(
+        llama_context * ctx_tgt,
+        llama_model * model_tgt,
+        kvmem_spec_session & sess,
+        const std::vector<llama_token> & prompt,
+        int n_predict,
+        common_params_sampling sparams,
+        kvmem_spec_on_token on_token);

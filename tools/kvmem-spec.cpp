@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <utility>
 
 ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
     if (ok) {
@@ -179,6 +181,29 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         int n_predict,
         float temp,
         kvmem_spec_on_token on_token) {
+    common_params_sampling sparams;
+    if (temp <= 0.0f) {
+        sparams.temp = 0.0f;
+        sparams.min_p = 0.0f;
+        sparams.top_p = 1.0f;
+        sparams.top_k = 0;
+        sparams.penalty_repeat = 1.0f;
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    } else {
+        sparams.temp = temp;
+    }
+    return kvmem_spec_generate(ctx_tgt, model_tgt, sess, prompt, n_predict,
+                               std::move(sparams), std::move(on_token));
+}
+
+kvmem_spec_gen_stats kvmem_spec_generate(
+        llama_context * ctx_tgt,
+        llama_model * model_tgt,
+        kvmem_spec_session & sess,
+        const std::vector<llama_token> & prompt,
+        int n_predict,
+        common_params_sampling sparams,
+        kvmem_spec_on_token on_token) {
     kvmem_spec_gen_stats st;
     if (!sess.ok || !sess.spec || prompt.empty() || n_predict <= 0) {
         st.failed = true;
@@ -192,18 +217,18 @@ kvmem_spec_gen_stats kvmem_spec_generate(
     common_speculative * spec = sess.spec;
     const llama_seq_id seq_id = 0;
 
-    common_params_sampling sparams;
-    if (temp <= 0.0f) {
-        sparams.temp = 0.0f;
-        sparams.min_p = 0.0f;
-        sparams.top_p = 1.0f;
-        sparams.top_k = 0;
-        sparams.penalty_repeat = 1.0f;
-        sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
-    } else {
-        sparams.temp = temp;
+    common_sampler_ptr smpl;
+    try {
+        smpl.reset(common_sampler_init(model_tgt, sparams));
+    } catch (const std::exception & e) {
+        fprintf(stderr, "kvmem_spec_generate sampler init failed: %s\n", e.what());
+        st.failed = true;
+        return st;
     }
-    common_sampler_ptr smpl(common_sampler_init(model_tgt, sparams));
+    if (!smpl) {
+        st.failed = true;
+        return st;
+    }
 
     llama_tokens prompt_tgt(prompt.begin(), prompt.end() - 1);
     prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
@@ -295,6 +320,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
 
         if (restore) {
             ++st.n_restore;
+            llama_kvmem_decode_mean_discard();
             draft = std::move(ids);
             ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
@@ -314,6 +340,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             continue;
         }
 
+        llama_kvmem_decode_mean_commit((uint32_t) ids.size());
         common_speculative_accept(spec, seq_id, (uint16_t) (ids.size() - 1));
         n_past += (int) ids.size() - 1;
         st.n_drafted += (int) n_draft;
@@ -355,6 +382,8 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             "KVMEM_TRACE spec_stats n_gen=%d n_drafted=%d n_accept=%d n_restore=%d accept_pct=%.1f\n",
             st.n_gen, st.n_drafted, st.n_accept, st.n_restore,
             st.n_drafted > 0 ? 100.0 * st.n_accept / st.n_drafted : 0.0);
+    llama_kvmem_decode_mean_flush();
+    llama_kvmem_decode_mean_discard();
     common_speculative_print_stats(spec);
 
     llama_batch_free(batch_tgt);

@@ -58,6 +58,8 @@ public:
     void write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il, const uint8_t * k);
     // Prefill mean-K only (no raw-K rows). k is token-major F32, n_embd_k per token.
     void write_layer_mean_k(uint32_t pos0, uint32_t n, uint32_t il, const float * k);
+    // Decode running-sum: `sum` is already reduced over `n` tokens in one block.
+    void write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il, const float * sum);
 
     bool has_block(uint32_t block_id) const;
     bool has_k(uint32_t block_id, uint32_t il) const;
@@ -83,6 +85,8 @@ public:
 
     void wait_writes();
     void clear();
+    // Drop blocks whose orig start is >= token_pos. Partial last block kept.
+    void truncate_to(uint32_t token_pos);
 
 private:
     struct LayerBlk {

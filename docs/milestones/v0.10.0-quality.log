@@ -1,0 +1,40 @@
+# v0.10.0 quality excerpts
+# 0.8B: RTX 5050 (UUID GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29)
+# 27B:  RTX 5090 (UUID GPU-58a7c28b-e698-307f-c149-24d4ecd88bf4)
+# 2026-09-07  CUDA_DEVICE_ORDER=PCI_BUS_ID  --kv-dtype q8_0 (default)
+
+========== server_smoke.py Qwen3.5-0.8B-Q8_0 (T1–T5) ==========
+PASS: greedy /v1/chat/completions
+PASS: streaming /v1/chat/completions
+PASS: query-conditioned request printed retrieval TRACE
+PASS: prefix reuse + old needle still recalled
+  KVMEM_TRACE prefix_reuse reused=1 n_past=846 n_prompt=891 n_new=45 query=[869,882)
+PASS: T1 tools parse + template sees tool history
+  chat_parse n_msg=3 n_tools=1 tool_choice=auto tool_hist=2 prompt_has_tool=1
+PASS: T3 non-stream OpenAI tool_calls
+  finish_reason=tool_calls name=lookup_code arguments={"q":"secret code"} id=call_1
+PASS: T4 stream delta.tool_calls
+  chat_stream n_tc_delta=6 finish=tool_calls
+PASS: T5 tool round-2 prefix reuse + last-user query
+  reused=1 n_past=312 n_prompt=336 query=[260,277) recapture=1
+  retrieval_protect suffix=[277,312) finish=stop content=BLUEBIRD-42
+
+========== 27B 60k multi-turn tools UD-Q4_K_M (5090) ==========
+# logs/tools_60k_27b.summary
+turn1 finish=tool_calls lookup_code reused=0 n_prompt=61362
+turn2 reused=1 n_past=61362 n_new=54 content=BLUEBIRD-42
+turn3 reused=1 n_past=61416 n_new=41 content=BLUEBIRD-42
+# MTP n_max=2  logs/tools_60k_27b_mtp.summary
+turn1 mtp=1 accept_pct=100.0 n_drafted=18 n_accept=18
+turn2 reused=1 mtp=1 accept_pct=100.0 content=BLUEBIRD-42
+turn3 reused=1 mtp=1 accept_pct=100.0 content=BLUEBIRD-42
+
+========== 27B 60k multi-turn tools IQ3_S (5090) ==========
+# logs/tools_60k_27b_iq3.summary
+turn1 finish=tool_calls lookup_code reused=0 n_prompt=61362
+turn2 reused=1 content=BLUEBIRD-42
+turn3 reused=1 content=BLUEBIRD-42
+# MTP n_max=2  logs/tools_60k_27b_iq3_mtp.summary
+turn1 mtp=1 accept_pct=100.0 n_drafted=18 n_accept=18
+turn2 reused=1 mtp=1 accept_pct=100.0 content=BLUEBIRD-42
+turn3 reused=1 mtp=1 accept_pct=100.0 content=BLUEBIRD-42

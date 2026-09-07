@@ -17,8 +17,13 @@ Restore is packed GPU-format memcpy at that orig pos — no unrotated raw-K
 and no re-RoPE on the product path. Retrieval scores **mean-K** (F32,
 pre-RoPE, captured at first write). Packed K/V for a full block are
 copied to host asynchronously when the block fills, overlapping later
-prefill; eviction then skips if the copy exists. Cold stage-in is
-`copy_k_gpu` / `copy_v_gpu` + slab H2D. Packed transfers use a **32 MiB**
+prefill; eviction then skips if the copy exists. After retrieval pin,
+decode keeps a GPU running sum of pre-RoPE K and writes mean-K when a
+block fills (accepted tokens only; MTP drafts are not counted). Cold
+stage-in is `copy_k_gpu` / `copy_v_gpu` + slab H2D. `llama-kvmem-server`
+reuses the GPU prefix across requests (token LCP); the retrieval query
+is the last `role=user` span. Chat tools reuse llama.cpp `common/chat`
++ `common_sampler`; the server does not execute tools. Packed transfers use a **32 MiB**
 GPU slab. GPU-format CPU/NVMe scratch is allocated only when those tiers
 are on. Each logical block occupies one slot of `block_tokens` cells.
 Reselect is a `KvMemPlan` diff: resident selected blocks stay in their

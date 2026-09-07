@@ -1,6 +1,6 @@
 # Packed GPU KV + prefix cache
 
-**状态：** 阶段 A（含块写满异步 packed D2H）已进 **v0.9.0**。下一步 B → C → D。不改 FA，不窗口化 pos。  
+**状态：** 阶段 A 已进 **v0.9.0**。阶段 B、C 已进 **v0.10.0**。下一步 D（可选落盘）。不改 FA，不窗口化 pos。  
 **前提：** cell 上始终是**原始 pos**。因此冷块回来不必再 RoPE。
 
 ---
@@ -54,28 +54,48 @@
 | retrieval 256 `--no-think` | **BLUEBIRD-42**；`selected` 含 block 13；`L23 K/V packed_vs_gpu cos=1.000`；packed bytes mismatch=0 |
 | MTP canary n_max=2 | PASS；`n_no_raw=0`；retrieval+MTP 打出 BLUEBIRD-42；accept 45.7% |
 
-## 阶段 B — decode mean-K
+## 阶段 B — decode mean-K（已完成）
 
-- 现在 `n_tokens<=1` 不 capture，生成段没有 mean-K。
-- 对当前 gen 块在 GPU 上 running sum；**块写满或本轮结束**时 D2H 一份 mean。
-- 只计已接受 token；MTP 草稿不算。
+- retrieval pin 之后：pre-RoPE K 在 GPU 上 running sum；**块写满或本轮结束** D2H 一份 mean。
+- 只计已接受 token；MTP 草稿不算（verify stash → accept 后 `commit(ids.size())`）。
 - 块未满就被挤出：stage-out 前落 running mean。
+- GPU add 失败则 `ggml_backend_tensor_get` host fallback。
+- 短 prompt（`query_begin==0` 不 pin）不会走这条路径。
 
-## 阶段 C — 进程内 prefix reuse
+**0.8B / 5050 门（2026-09-07）：**
 
-`llama-kvmem-server` 今天每请求 `llama_memory_clear`。改为 llama-server 同款：
+| 项 | 结果 |
+|---|---|
+| identity Q8_0 | PASS |
+| recency 256 不召回 | PASS |
+| retrieval 256 `--no-think` | **BLUEBIRD-42**；`decode_mean_flush` 出现 |
+| 生成满 1 块 | `flush block=14 n=32` gpu=6 host=0 `rms≈1.20`；`n_tok=64 n_miss=0` |
+| MTP n_max=2 | PASS；`n_no_raw=0`；retrieval+MTP BLUEBIRD-42；verify `n_pos=3` 后 flush；accept 68.8% |
+
+## 阶段 C — 进程内 prefix reuse（已完成）
+
+`llama-kvmem-server` 不再每请求 `llama_memory_clear`。客户端带完整 messages；单 slot。
 
 ```text
-n_past = 公共前缀
-seq_rm(n_past, -1)     // 主干 + MTP 成对
-truncate 块表
-unpin retrieval
-只 prefill 后缀（写 mean-K）
+n_past = token LCP(cached, new_prompt)
+seq_rm(n_past, -1)     // 主干 + MTP
+truncate 块表 + raw 冷块
+unpin retrieval，重新 harvest 后缀 mean-K
+GDN：能对齐则不动；否则 restore 上一轮 query ckpt 再 catch-up
+只 prefill 后缀
 apply_retrieval + query replay + MTP follow
 decode
 ```
 
-客户端需带完整 messages。单 slot。
+助手文本 roundtrip 往往对不齐整段 cached，LCP 落在 generation prompt 附近。此时用 retrieval 的 GDN ckpt catch-up，不整段重算。对不上 ckpt 则 fallback clear。
+
+**0.8B / 5050 门（2026-09-07）：**
+
+| 项 | 结果 |
+|---|---|
+| greedy + streaming chat | PASS |
+| turn-1 retrieval | **BLUEBIRD-42** |
+| turn-2 完整 messages | `reused=1 n_past=846 n_prompt=891 n_new=45`；GDN catch-up 834→845；输出 **BLUEBIRD-42** |
 
 ## 阶段 D — 落盘（可选）
 

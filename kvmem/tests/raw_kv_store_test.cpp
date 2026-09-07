@@ -154,6 +154,32 @@ int main() {
     std::vector<float> mm(4, 0.0f);
     rawm.mean_k(0, 0, mm.data());
     CHECK(std::fabs(mm[0] - 2.0f) < 1e-3f);
+    rawm.clear();
+    CHECK(!rawm.has_block(0));
+    rawm.write_layer_mean_k(0, 1, 0, k.data());
+    std::vector<float> mm0(4, 0.0f);
+    rawm.mean_k(0, 0, mm0.data());
+    CHECK(std::fabs(mm0[0] - k[0]) < 1e-3f);
+    rawm.write_layer_mean_k(4, 1, 0, k.data() + 4);
+    CHECK(rawm.has_block(1));
+    rawm.truncate_to(4);
+    CHECK(rawm.has_block(0));
+    CHECK(!rawm.has_block(1));
+    kvmem::RawKvStore raws(cfg);
+    raws.write_layer_mean_k(0, 1, 0, k.data());
+    raws.write_layer_mean_k(1, 1, 0, k.data() + 4);
+    std::vector<float> ms(4, 0.0f);
+    raws.mean_k(0, 0, ms.data());
+    CHECK(std::fabs(ms[0] - 2.0f) < 1e-3f);
+    kvmem::RawKvStore rawsum(cfg);
+    std::vector<float> ksum(4, 0.0f);
+    for (int d = 0; d < 4; ++d) {
+        ksum[static_cast<size_t>(d)] = k[static_cast<size_t>(d)] + k[static_cast<size_t>(d + 4)];
+    }
+    rawsum.write_layer_mean_sum(0, 2, 0, ksum.data());
+    std::vector<float> msum(4, 0.0f);
+    rawsum.mean_k(0, 0, msum.data());
+    CHECK(std::fabs(msum[0] - 2.0f) < 1e-3f);
     std::vector<uint8_t> gout(12, 0);
     CHECK(rawg.copy_v_gpu(0, 0, gout.data(), 2));
     CHECK(gout[0] == 1);

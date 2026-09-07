@@ -104,9 +104,27 @@ public:
     void set_replay(bool replay) { replay_ = replay; }
     bool replay() const { return replay_; }
     bool want_prefill_capture() const {
-        return prefill_capture_ && !retrieval_pinned_;
+        return prefill_capture_ && !retrieval_pinned_ && !replay_;
+    }
+    // Recapture Q for retrieval even while replaying a cached query span.
+    bool want_q_capture() const {
+        return method_ == 1 && !retrieval_pinned_ && query_begin_ >= 0;
+    }
+    bool want_decode_mean() const {
+        return retrieval_pinned_ && method_ == 1 && !replay_;
     }
     void end_prefill_capture() { prefill_capture_ = false; }
+    // Next request continues this sequence: flush decode mean, unpin
+    // retrieval, harvest mean-K for the suffix. Does not wipe prefix KV.
+    void begin_cached_turn();
+    void truncate_cached(uint32_t n_past);
+    uint32_t store_n_tokens() const {
+        return runtime_ ? runtime_->store().total_tokens() : 0;
+    }
+    llama_pos recr_pos_max() const;
+    void decode_mean_commit(uint32_t n_keep);
+    void decode_mean_discard();
+    void decode_mean_flush();
     void set_recurrent(llama_memory_recurrent * recr) { recr_ = recr; }
     bool has_recurrent() const { return recr_ != nullptr; }
     void set_query_span(int32_t begin, int32_t end) {
@@ -159,6 +177,12 @@ private:
     // After a prefill graph, enqueue packed K/V D2H for GPU-resident
     // full blocks. Does not wait; apply_plan / retrieval commit.
     void harvest_full_blocks_async();
+    void decode_mean_ingest(struct ggml_backend_sched * sched);
+    void decode_mean_reset();
+    void decode_mean_add_range(uint32_t tok0, uint32_t n_add);
+    void decode_mean_zero_acc();
+    bool decode_mean_add_host_layer(struct ggml_tensor * t, int il, uint32_t tok0, uint32_t n_add);
+    void decode_mean_print_sum();
     struct HarvestVJob {
         uint32_t pos0 = 0;
         uint32_t n = 0;
@@ -309,7 +333,28 @@ private:
         char which = 0;
     };
     std::vector<CaptureNode> pending_capture_;
+    std::vector<CaptureNode> decode_mean_pending_k_;
+    std::vector<llama_pos> decode_mean_pending_pos_;
+    uint32_t decode_mean_n_ = 0;
+    uint32_t decode_mean_block_ = ~0u;
+    uint32_t decode_mean_pos0_ = 0;
+    std::vector<std::vector<float>> decode_mean_host_;
+    std::vector<uint8_t> decode_mean_src_; // 0 none, 1 gpu, 2 host
+    struct DecodeMeanStats {
+        uint32_t n_tok = 0;
+        uint32_t n_flush = 0;
+        uint32_t n_gpu = 0;
+        uint32_t n_host = 0;
+        uint32_t n_miss = 0;
+        uint32_t last_block = ~0u;
+        uint32_t last_n = 0;
+        uint32_t last_layers = 0;
+        float last_rms = 0.0f;
+        bool printed = false;
+    };
+    DecodeMeanStats decode_mean_stats_;
     bool graph_has_q_ = false;
+    bool graph_has_k_ = false;
     struct CaptureD2hPipe;
     std::unique_ptr<CaptureD2hPipe> d2h_;
     struct HarvestWorker {

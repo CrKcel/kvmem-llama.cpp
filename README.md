@@ -3,13 +3,16 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.9.0`](docs/milestones/v0.9.0.md)** (2026-09-07).
+**Current local milestone: [`v0.10.0`](docs/milestones/v0.10.0.md)** (2026-09-07).
 GPU KV default **q8_0**. Orig-pos cells; restore is packed GPU K/V memcpy
-(no unrotated raw-K on the product path). Retrieval uses pre-RoPE mean-K.
-Full blocks copy packed K/V to host asynchronously during prefill.
-`--kvmem` is retrieval + query-last 64. MTP remains optional (default
-**none**). 0.8B identity + BLUEBIRD-42 GO. Speed recorded. P6 is not
-started. Prefix cache (plan B/C/D) is not in this tag.
+(no unrotated raw-K on the product path). Retrieval uses pre-RoPE mean-K
+(prefill write + decode running sum after pin). Full blocks copy packed
+K/V to host asynchronously during prefill. `llama-kvmem-server` reuses
+the GPU prefix across requests; `/v1/chat/completions` supports OpenAI
+tools (server does not execute them). `--kvmem` is retrieval + query-last
+64. MTP remains optional (default **none**). 0.8B identity + BLUEBIRD-42
+GO; 27B 60k tool rounds reuse the prefix. Speed recorded. P6 is not
+started. Phase D `state_write` is not in this tag.
 
 ## Layout
 
@@ -31,11 +34,11 @@ started. Prefix cache (plan B/C/D) is not in this tag.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.9.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.10.0` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.9.0
+git checkout v0.10.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh
@@ -44,7 +47,7 @@ scripts/build-cuda.sh                # nvcc from ~/.cu13-env, sm_120
 python3 scripts/identity_canary.py \
   -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
 python3 scripts/mtp_canary.py --gpu small   # needs 0.8B-MTP-GGUF (has nextn)
-python3 scripts/server_smoke.py      # independent llama-kvmem-server
+python3 scripts/server_smoke.py      # greedy/stream/retrieval/tools T1–T5
 ```
 
 `llama-kvmem-cli` and `llama-kvmem-server` land in `build/bin/`. This
@@ -59,7 +62,7 @@ Independent OpenAI-compatible server (P5, single slot, does not patch
 source scripts/gpu.sh small
 build/bin/llama-kvmem-server -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
   --port 8080 -c 2048 --kvmem --kvmem-budget 256 -ngl 99
-# POST /v1/chat/completions  (greedy + stream)
+# POST /v1/chat/completions  (greedy + stream + tools)
 # last user message becomes the retrieval query span; optional body.kvmem.pin / force_substr
 python3 scripts/server_smoke.py
 ```

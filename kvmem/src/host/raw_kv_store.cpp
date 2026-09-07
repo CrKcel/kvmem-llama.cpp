@@ -701,6 +701,36 @@ void RawKvStore::write_layer_mean_k(uint32_t pos0, uint32_t n, uint32_t il,
     }
 }
 
+void RawKvStore::write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il,
+                                      const float * sum) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (!sum || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
+        cfg_.n_embd_k == 0) {
+        return;
+    }
+    const uint32_t bt = cfg_.block_tokens;
+    const uint32_t bid = pos0 / bt;
+    const uint32_t off = pos0 % bt;
+    const uint32_t take = std::min(n, bt - off);
+    ensure_blocks(bid + 1);
+    LayerBlk & lb = blocks_[bid].layers[il];
+    if (lb.k_sum.size() != cfg_.n_embd_k) {
+        lb.k_sum.assign(cfg_.n_embd_k, 0.0f);
+    }
+    if (off == 0 && lb.n_tokens == 0) {
+        std::fill(lb.k_sum.begin(), lb.k_sum.end(), 0.0f);
+    }
+    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
+        lb.k_sum[d] += sum[d];
+    }
+    lb.n_tokens = std::max(lb.n_tokens, off + take);
+    lb.mean.assign(cfg_.n_embd_k, 0.0f);
+    const float inv = 1.0f / static_cast<float>(lb.n_tokens);
+    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
+        lb.mean[d] = lb.k_sum[d] * inv;
+    }
+}
+
 bool RawKvStore::has_block(uint32_t block_id) const {
     std::lock_guard<std::mutex> lk(mu_);
     if (block_id >= blocks_.size()) {
@@ -1048,6 +1078,19 @@ size_t RawKvStore::bytes_v() const {
         }
     }
     return n;
+}
+
+void RawKvStore::truncate_to(uint32_t token_pos) {
+    wait_writes();
+    std::lock_guard<std::mutex> lk(mu_);
+    if (token_pos == 0 || cfg_.block_tokens == 0) {
+        blocks_.clear();
+        return;
+    }
+    const uint32_t keep = (token_pos + cfg_.block_tokens - 1) / cfg_.block_tokens;
+    if (blocks_.size() > keep) {
+        blocks_.resize(keep);
+    }
 }
 
 void RawKvStore::clear() {

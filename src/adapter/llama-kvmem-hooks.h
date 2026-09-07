@@ -63,8 +63,26 @@ LLAMA_API bool llama_kvmem_capture_can_reuse(uint32_t n_tokens, uint32_t n_pos,
 // True while prefill/query-span harvest is still allowed (retrieval, not pinned).
 // MTP verify is n>1 after pin; callers must not harvest those ubatches into raw-K.
 LLAMA_API bool llama_kvmem_want_prefill_capture(void);
+// Q capture for retrieval scoring. True for query-span ubatches before pin,
+// including replay of a cached query (T5).
+LLAMA_API bool llama_kvmem_want_q_capture(uint32_t n_tokens, uint32_t n_pos,
+                                          const llama_pos * pos);
+LLAMA_API void llama_kvmem_reset_query(void);
+// True after retrieval pin: capture pre-RoPE K for decode mean-K (n=1 and MTP verify).
+LLAMA_API bool llama_kvmem_want_decode_mean(void);
 // Close prefill harvest before decode / speculative verify.
 LLAMA_API void llama_kvmem_end_prefill_capture(void);
+// Start a follow-up turn that keeps the GPU prefix. Call seq_rm(n_past,-1)
+// on trunk + MTP after this; then prefill only the suffix.
+LLAMA_API void llama_kvmem_begin_cached_turn(void);
+LLAMA_API void llama_kvmem_truncate_cached(uint32_t n_past);
+LLAMA_API uint32_t llama_kvmem_store_n_tokens(void);
+LLAMA_API llama_pos llama_kvmem_recr_pos_max(void);
+// After MTP verify: keep the first n_keep batch tokens in the running mean (0 = discard).
+LLAMA_API void llama_kvmem_decode_mean_commit(uint32_t n_keep);
+LLAMA_API void llama_kvmem_decode_mean_discard(void);
+// Write any partial-block running mean to the host store (end of turn / evict).
+LLAMA_API void llama_kvmem_decode_mean_flush(void);
 
 // Score + reselect + stage-in raw-K/V for retrieval. No-op if method is recency.
 LLAMA_API void llama_kvmem_apply_retrieval(struct llama_context * ctx);

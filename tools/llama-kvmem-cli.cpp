@@ -573,6 +573,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        llama_kvmem_decode_mean_flush();
     }
     if (!tokens_only) {
         printf("\n");

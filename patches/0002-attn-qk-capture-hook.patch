@@ -5,12 +5,12 @@ Subject: [PATCH 2/3] kvmem: capture pre-RoPE K/Q/V and expose V storage
 
 ---
  src/llama-context.cpp | 18 +++++++++++++-
- src/llama-graph.cpp   | 70 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-graph.cpp   | 68 +++++++++++++++++++++++++++++++++++++++++++
  src/llama-graph.h     |  8 ++++++
  src/llama-kv-cache.h  |  1 +
  src/models/qwen3.cpp  |  3 +++
  src/models/qwen35.cpp |  6 +++++
- 6 files changed, 96 insertions(+), 1 deletion(-)
+ 6 files changed, 94 insertions(+), 1 deletion(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index f286bd1..177e47a 100644
@@ -75,7 +75,7 @@ index 72db486..de59b4f 100644
  
  #include <cassert>
  #include <cmath>
-@@ -1500,6 +1503,87 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+@@ -1500,6 +1503,85 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
      }
  }
  
@@ -109,18 +109,22 @@ index 72db486..de59b4f 100644
 +}
 +
 +void llm_graph_context::kvmem_capture_k(ggml_tensor * k_prerope, int il) const {
-+    // Decode is one token; raw-K/Q for retrieval were harvested in prefill.
-+    // Skip the extra cpy nodes so generation is not paying D2H every step.
-+    if (ubatch.n_tokens <= 1) {
-+        return;
-+    }
 +#if defined(LLAMA_KVMEM)
-+    // MTP verify is n>1 after pin; do not harvest those ubatches into raw-K.
-+    if (!llama_kvmem_want_prefill_capture()) {
++    // Prefill: full ubatch mean-K. Decode / MTP verify after pin: running mean-K.
++    if (ubatch.n_tokens <= 1) {
++        if (!llama_kvmem_want_decode_mean()) {
++            return;
++        }
++        kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
 +        return;
 +    }
++    if (llama_kvmem_want_prefill_capture() || llama_kvmem_want_decode_mean()) {
++        kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
++    }
++#else
++    GGML_UNUSED(k_prerope);
++    GGML_UNUSED(il);
 +#endif
-+    kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
 +}
 +
 +void llm_graph_context::kvmem_capture_q(ggml_tensor * q, int il) const {
@@ -128,10 +132,7 @@ index 72db486..de59b4f 100644
 +        return;
 +    }
 +#if defined(LLAMA_KVMEM)
-+    if (!llama_kvmem_want_prefill_capture()) {
-+        return;
-+    }
-+    if (!llama_kvmem_ubatch_needs_q_capture(ubatch.n_tokens, ubatch.n_pos, ubatch.pos)) {
++    if (!llama_kvmem_want_q_capture(ubatch.n_tokens, ubatch.n_pos, ubatch.pos)) {
 +        return;
 +    }
 +#endif

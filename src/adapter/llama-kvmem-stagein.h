@@ -51,3 +51,12 @@ void kvmem_stageout_clear();
 // Batched device copies (layout gather/scatter). One kernel; false → caller D2D.
 bool kvmem_d2d_batched(const void * const * src, void * const * dst,
                        const size_t * nbytes, int n);
+
+// Decode mean-K running sum on GPU. Extra VRAM = n_layer * n_embd * 4.
+bool kvmem_meank_ready(uint32_t n_layer, uint32_t n_embd);
+void kvmem_meank_free();
+void kvmem_meank_zero(uint32_t il);
+bool kvmem_meank_add(uint32_t il, ggml_type ty, const void * gpu_k,
+                     uint32_t tok0, uint32_t n_keep, uint32_t n_embd,
+                     int64_t ne0, size_t nb0, size_t nb1, size_t nb2);
+bool kvmem_meank_d2h(uint32_t il, float * host, uint32_t n_embd);

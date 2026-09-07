@@ -1,6 +1,7 @@
 #include "llama-kvmem-stagein.h"
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -257,6 +258,61 @@ __global__ void copy_bytes(const CopyOp * ops, int n) {
     }
 }
 
+struct MeanKAcc {
+    float * acc = nullptr;
+    uint32_t n_layer = 0;
+    uint32_t n_embd = 0;
+};
+MeanKAcc g_mk;
+
+__global__ void meank_add_f32(const uint8_t * k, float * acc, int tok0, int n_keep,
+                              int n_embd, int ne0, size_t nb0, size_t nb1, size_t nb2) {
+    const int d = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (d >= n_embd || ne0 <= 0) {
+        return;
+    }
+    const int head = d / ne0;
+    const int dim = d % ne0;
+    float s = acc[d];
+    for (int t = 0; t < n_keep; ++t) {
+        const size_t off = (size_t) (tok0 + t) * nb2 + (size_t) head * nb1 + (size_t) dim * nb0;
+        s += *reinterpret_cast<const float *>(k + off);
+    }
+    acc[d] = s;
+}
+
+__global__ void meank_add_f16(const uint8_t * k, float * acc, int tok0, int n_keep,
+                              int n_embd, int ne0, size_t nb0, size_t nb1, size_t nb2) {
+    const int d = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (d >= n_embd || ne0 <= 0) {
+        return;
+    }
+    const int head = d / ne0;
+    const int dim = d % ne0;
+    float s = acc[d];
+    for (int t = 0; t < n_keep; ++t) {
+        const size_t off = (size_t) (tok0 + t) * nb2 + (size_t) head * nb1 + (size_t) dim * nb0;
+        s += __half2float(*reinterpret_cast<const half *>(k + off));
+    }
+    acc[d] = s;
+}
+
+__global__ void meank_add_bf16(const uint8_t * k, float * acc, int tok0, int n_keep,
+                               int n_embd, int ne0, size_t nb0, size_t nb1, size_t nb2) {
+    const int d = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (d >= n_embd || ne0 <= 0) {
+        return;
+    }
+    const int head = d / ne0;
+    const int dim = d % ne0;
+    float s = acc[d];
+    for (int t = 0; t < n_keep; ++t) {
+        const size_t off = (size_t) (tok0 + t) * nb2 + (size_t) head * nb1 + (size_t) dim * nb0;
+        s += __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(k + off));
+    }
+    acc[d] = s;
+}
+
 }  // namespace
 
 bool kvmem_stagein_gpu_ready(size_t n_f32, size_t n_packed) {
@@ -367,6 +423,7 @@ void kvmem_stagein_gpu_free() {
     }
     g_st.n_ops = 0;
     g_st.host_ops.clear();
+    kvmem_meank_free();
     g_st.theta.clear();
     if (g_st.dev_theta) {
         cudaFree(g_st.dev_theta);
@@ -926,4 +983,79 @@ bool kvmem_d2d_batched(const void * const * src, void * const * dst,
     }
     copy_bytes<<<n, 256, 0, stream()>>>(g_st.dev_ops, n);
     return cuda_ok(cudaGetLastError(), "layout copy kernel");
+}
+
+bool kvmem_meank_ready(uint32_t n_layer, uint32_t n_embd) {
+    if (n_layer == 0 || n_embd == 0) {
+        return false;
+    }
+    const size_t need = (size_t) n_layer * n_embd * sizeof(float);
+    if (g_mk.acc && g_mk.n_layer == n_layer && g_mk.n_embd == n_embd) {
+        return true;
+    }
+    kvmem_meank_free();
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void **>(&g_mk.acc), need), "meank acc")) {
+        g_mk.acc = nullptr;
+        return false;
+    }
+    g_mk.n_layer = n_layer;
+    g_mk.n_embd = n_embd;
+    if (!cuda_ok(cudaMemsetAsync(g_mk.acc, 0, need, stream()), "meank zero")) {
+        kvmem_meank_free();
+        return false;
+    }
+    return true;
+}
+
+void kvmem_meank_free() {
+    if (g_mk.acc) {
+        cudaFree(g_mk.acc);
+        g_mk.acc = nullptr;
+    }
+    g_mk.n_layer = 0;
+    g_mk.n_embd = 0;
+}
+
+void kvmem_meank_zero(uint32_t il) {
+    if (!g_mk.acc || il >= g_mk.n_layer) {
+        return;
+    }
+    cudaMemsetAsync(g_mk.acc + (size_t) il * g_mk.n_embd, 0,
+                    (size_t) g_mk.n_embd * sizeof(float), stream());
+}
+
+bool kvmem_meank_add(uint32_t il, ggml_type ty, const void * gpu_k,
+                     uint32_t tok0, uint32_t n_keep, uint32_t n_embd,
+                     int64_t ne0, size_t nb0, size_t nb1, size_t nb2) {
+    if (!g_mk.acc || !gpu_k || n_keep == 0 || n_embd == 0 || ne0 <= 0 ||
+        il >= g_mk.n_layer || n_embd != g_mk.n_embd) {
+        return false;
+    }
+    float * acc = g_mk.acc + (size_t) il * g_mk.n_embd;
+    const uint8_t * k = static_cast<const uint8_t *>(gpu_k);
+    const int threads = 64;
+    const int blocks = ((int) n_embd + threads - 1) / threads;
+    if (ty == GGML_TYPE_F32) {
+        meank_add_f32<<<blocks, threads, 0, stream()>>>(
+                k, acc, (int) tok0, (int) n_keep, (int) n_embd, (int) ne0, nb0, nb1, nb2);
+    } else if (ty == GGML_TYPE_F16) {
+        meank_add_f16<<<blocks, threads, 0, stream()>>>(
+                k, acc, (int) tok0, (int) n_keep, (int) n_embd, (int) ne0, nb0, nb1, nb2);
+    } else if (ty == GGML_TYPE_BF16) {
+        meank_add_bf16<<<blocks, threads, 0, stream()>>>(
+                k, acc, (int) tok0, (int) n_keep, (int) n_embd, (int) ne0, nb0, nb1, nb2);
+    } else {
+        return false;
+    }
+    return cuda_ok(cudaGetLastError(), "meank add");
+}
+
+bool kvmem_meank_d2h(uint32_t il, float * host, uint32_t n_embd) {
+    if (!g_mk.acc || !host || il >= g_mk.n_layer || n_embd != g_mk.n_embd) {
+        return false;
+    }
+    return cuda_ok(cudaMemcpyAsync(host, g_mk.acc + (size_t) il * g_mk.n_embd,
+                                   (size_t) n_embd * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream()),
+                   "meank D2H");
 }

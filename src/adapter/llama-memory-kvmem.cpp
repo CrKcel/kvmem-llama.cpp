@@ -488,6 +488,9 @@ llama_memory_kvmem::llama_memory_kvmem(
 }
 
 llama_memory_kvmem::~llama_memory_kvmem() {
+    decode_mean_flush();
+    decode_mean_discard();
+    decode_mean_print_sum();
     harvest_flush();
     harvest_worker_stop();
     harvest_perf_print_sum();
@@ -509,12 +512,38 @@ void llama_memory_kvmem::reset_slots() {
 }
 
 void llama_memory_kvmem::reset_policy() {
+    decode_mean_reset();
+    reset_query_acc();
+    if (raw_) {
+        raw_->clear();
+    }
     if (runtime_) {
         runtime_->truncate_to(0);
     }
     reset_slots();
     retrieval_pinned_ = false;
     prefill_capture_ = true;
+}
+
+void llama_memory_kvmem::begin_cached_turn() {
+    decode_mean_flush();
+    decode_mean_discard();
+    reset_query_acc();
+    retrieval_pinned_ = false;
+    prefill_capture_ = true;
+}
+
+void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
+    if (raw_) {
+        raw_->truncate_to(n_past);
+    }
+    if (runtime_ && n_past < runtime_->store().total_tokens()) {
+        runtime_->truncate_to(n_past);
+    }
+}
+
+llama_pos llama_memory_kvmem::recr_pos_max() const {
+    return recr_ ? recr_->seq_pos_max(0) : (llama_pos) -1;
 }
 
 int32_t llama_memory_kvmem::alloc_slot() {
@@ -611,6 +640,12 @@ void llama_memory_kvmem::trace_plan(const char * tag, const kvmem::KvMemPlan & p
 
 void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
     auto & store = runtime_->store();
+    for (uint32_t id : plan.stage_out) {
+        if (id == decode_mean_block_) {
+            decode_mean_flush();
+            break;
+        }
+    }
     {
         const int64_t t0 = ggml_time_us();
         for (uint32_t id : plan.stage_out) {
@@ -1283,16 +1318,30 @@ void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
     if (which == 'q') {
         graph_has_q_ = true;
     }
+    if (which == 'k') {
+        graph_has_k_ = true;
+    }
 }
 
 void llama_memory_kvmem::capture_on_new_graph() {
     pending_capture_.clear();
     graph_has_q_ = false;
+    graph_has_k_ = false;
 }
 
 bool llama_memory_kvmem::capture_can_reuse(uint32_t n_tokens, uint32_t n_pos,
                                            const llama_pos * pos) const {
-    return llama_kvmem_ubatch_needs_q_capture(n_tokens, n_pos, pos) == graph_has_q_;
+    // After pin, n=1 decode must not reuse a graph built without K capture
+    // (last prefill ubatch of 1 token, or query replay with capture off).
+    if (want_decode_mean() && !graph_has_k_) {
+        return false;
+    }
+    // Post-pin query replay must not keep rebuilding just because the ubatch
+    // overlaps the query span — Q nodes are off after pin. T5 recapture
+    // (want_q_capture, including replay) still requires a Q graph.
+    const bool need_q = want_q_capture() &&
+            llama_kvmem_ubatch_needs_q_capture(n_tokens, n_pos, pos);
+    return need_q == graph_has_q_;
 }
 
 bool llama_memory_kvmem::d2h_init() {
@@ -1742,6 +1791,10 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
 }
 
 void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
+    if (want_decode_mean()) {
+        decode_mean_ingest(sched);
+        return;
+    }
     const int64_t t_entry = ggml_time_us();
     perf_.last_commit_us = 0;
     perf_.last_d2h_wait_us = 0;
@@ -1836,6 +1889,8 @@ void llama_memory_kvmem::bytes_to_f32_token_major(const uint8_t * data, ggml_typ
                     val = *reinterpret_cast<const float *>(data + off);
                 } else if (type == GGML_TYPE_F16) {
                     val = ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(data + off));
+                } else if (type == GGML_TYPE_BF16) {
+                    val = ggml_bf16_to_fp32(*reinterpret_cast<const ggml_bf16_t *>(data + off));
                 }
                 out[static_cast<size_t>(tok * h * d + head * d + dim)] = val;
             }
@@ -2231,6 +2286,279 @@ void llama_memory_kvmem::harvest_full_blocks_async() {
     }
 }
 
+void llama_memory_kvmem::decode_mean_reset() {
+    decode_mean_flush();
+    decode_mean_discard();
+    decode_mean_n_ = 0;
+    decode_mean_block_ = ~0u;
+    decode_mean_pos0_ = 0;
+}
+
+void llama_memory_kvmem::decode_mean_discard() {
+    decode_mean_pending_k_.clear();
+    decode_mean_pending_pos_.clear();
+}
+
+void llama_memory_kvmem::decode_mean_zero_acc() {
+    if (kvmem_meank_ready(n_layer_, n_embd_k_)) {
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            kvmem_meank_zero(il);
+        }
+    }
+    decode_mean_host_.assign(n_layer_, std::vector<float>(n_embd_k_, 0.0f));
+    decode_mean_src_.assign(n_layer_, 0);
+}
+
+void llama_memory_kvmem::decode_mean_print_sum() {
+    if (decode_mean_stats_.printed) {
+        return;
+    }
+    decode_mean_stats_.printed = true;
+    fprintf(stderr,
+            "KVMEM_DECODE_MEAN n_tok=%u n_flush=%u n_gpu=%u n_host=%u n_miss=%u "
+            "last_block=%d last_n=%u last_layers=%u last_rms=%.6f\n",
+            decode_mean_stats_.n_tok, decode_mean_stats_.n_flush,
+            decode_mean_stats_.n_gpu, decode_mean_stats_.n_host,
+            decode_mean_stats_.n_miss,
+            decode_mean_stats_.last_block == ~0u
+                    ? -1 : static_cast<int>(decode_mean_stats_.last_block),
+            decode_mean_stats_.last_n, decode_mean_stats_.last_layers,
+            decode_mean_stats_.last_rms);
+}
+
+bool llama_memory_kvmem::decode_mean_add_host_layer(ggml_tensor * t, int il,
+                                                   uint32_t tok0, uint32_t n_add) {
+    if (!t || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || n_add == 0) {
+        return false;
+    }
+    if (decode_mean_host_.size() != n_layer_) {
+        decode_mean_host_.assign(n_layer_, std::vector<float>(n_embd_k_, 0.0f));
+        decode_mean_src_.assign(n_layer_, 0);
+    }
+    const uint32_t uil = static_cast<uint32_t>(il);
+    if (decode_mean_src_[uil] == 1) {
+        if (decode_mean_host_[uil].size() != n_embd_k_) {
+            decode_mean_host_[uil].assign(n_embd_k_, 0.0f);
+        }
+        kvmem_stagein_sync();
+        if (!kvmem_meank_d2h(uil, decode_mean_host_[uil].data(), n_embd_k_)) {
+            return false;
+        }
+        kvmem_stagein_sync();
+        kvmem_meank_zero(uil);
+        decode_mean_src_[uil] = 2;
+    }
+    std::vector<float> flat;
+    tensor_to_f32_token_major(t, flat);
+    const size_t need = (static_cast<size_t>(tok0) + n_add) * n_embd_k_;
+    if (flat.size() < need) {
+        return false;
+    }
+    if (decode_mean_host_[uil].size() != n_embd_k_) {
+        decode_mean_host_[uil].assign(n_embd_k_, 0.0f);
+    }
+    const float * src = flat.data() + static_cast<size_t>(tok0) * n_embd_k_;
+    for (uint32_t t_i = 0; t_i < n_add; ++t_i) {
+        for (uint32_t d = 0; d < n_embd_k_; ++d) {
+            decode_mean_host_[uil][d] += src[static_cast<size_t>(t_i) * n_embd_k_ + d];
+        }
+    }
+    decode_mean_src_[uil] = 2;
+    decode_mean_stats_.n_host += n_add;
+    return true;
+}
+
+void llama_memory_kvmem::decode_mean_ingest(ggml_backend_sched_t sched) {
+    if (pending_capture_.empty() || pos_queue_.empty()) {
+        decode_mean_stats_.n_miss++;
+        if (trace_ || decode_mean_stats_.n_miss <= 3) {
+            fprintf(stderr,
+                    "KVMEM_DECODE_MEAN ingest_skip capture=%zu posq=%zu "
+                    "pinned=%d replay=%d graph_k=%d\n",
+                    pending_capture_.size(), pos_queue_.size(),
+                    (int) retrieval_pinned_, (int) replay_, (int) graph_has_k_);
+        }
+        return;
+    }
+    if (sched) {
+        ggml_backend_sched_synchronize(sched);
+    }
+    decode_mean_pending_pos_ = std::move(pos_queue_.front());
+    pos_queue_.erase(pos_queue_.begin());
+    decode_mean_pending_k_.clear();
+    for (const CaptureNode & n : pending_capture_) {
+        if (n.t && n.which == 'k') {
+            decode_mean_pending_k_.push_back(n);
+        }
+    }
+    if (decode_mean_pending_k_.empty()) {
+        decode_mean_stats_.n_miss++;
+        if (trace_ || decode_mean_stats_.n_miss <= 3) {
+            fprintf(stderr, "KVMEM_DECODE_MEAN ingest_skip no_k_nodes capture=%zu\n",
+                    pending_capture_.size());
+        }
+        decode_mean_pending_pos_.clear();
+        return;
+    }
+    if (trace_ && decode_mean_stats_.n_tok == 0 && !decode_mean_pending_k_.empty()) {
+        const CaptureNode & n0 = decode_mean_pending_k_.front();
+        fprintf(stderr,
+                "KVMEM_TRACE decode_mean_ingest n_pos=%zu n_k=%zu type=%s gpu=%d\n",
+                decode_mean_pending_pos_.size(), decode_mean_pending_k_.size(),
+                n0.t ? ggml_type_name(n0.t->type) : "?",
+                n0.t && kvmem_cuda_tensor_ptr(n0.t) ? 1 : 0);
+    }
+    if (decode_mean_pending_pos_.size() == 1) {
+        decode_mean_commit(1);
+    }
+}
+
+void llama_memory_kvmem::decode_mean_add_range(uint32_t tok0, uint32_t n_add) {
+    if (n_add == 0 || decode_mean_pending_pos_.empty() || !raw_ ||
+        tok0 >= decode_mean_pending_pos_.size()) {
+        return;
+    }
+    const llama_pos pos0 = decode_mean_pending_pos_[tok0];
+    const uint32_t bid = static_cast<uint32_t>(pos0) / block_tokens_;
+    if (decode_mean_block_ != bid) {
+        if (decode_mean_n_ > 0) {
+            decode_mean_flush();
+        }
+        decode_mean_zero_acc();
+        decode_mean_block_ = bid;
+        decode_mean_pos0_ = static_cast<uint32_t>(pos0);
+        decode_mean_n_ = 0;
+    }
+    const bool gpu_ready = kvmem_meank_ready(n_layer_, n_embd_k_);
+    bool any = false;
+    for (const CaptureNode & n : decode_mean_pending_k_) {
+        if (!n.t || static_cast<uint32_t>(n.il) >= n_layer_) {
+            continue;
+        }
+        bool ok = false;
+        if (gpu_ready) {
+            const uint8_t * gpu = kvmem_cuda_tensor_ptr(n.t);
+            if (gpu &&
+                kvmem_meank_add(static_cast<uint32_t>(n.il), n.t->type, gpu,
+                                tok0, n_add, n_embd_k_, n.t->ne[0],
+                                n.t->nb[0], n.t->nb[1], n.t->nb[2])) {
+                if (decode_mean_src_.size() != n_layer_) {
+                    decode_mean_src_.assign(n_layer_, 0);
+                }
+                decode_mean_src_[static_cast<uint32_t>(n.il)] = 1;
+                decode_mean_stats_.n_gpu += n_add;
+                ok = true;
+            }
+        }
+        if (!ok) {
+            ok = decode_mean_add_host_layer(n.t, n.il, tok0, n_add);
+        }
+        any = any || ok;
+    }
+    if (!any) {
+        decode_mean_stats_.n_miss++;
+        if (trace_ || decode_mean_stats_.n_miss <= 3) {
+            fprintf(stderr, "KVMEM_DECODE_MEAN add_fail n_add=%u n_k=%zu gpu_ready=%d\n",
+                    n_add, decode_mean_pending_k_.size(), (int) gpu_ready);
+        }
+        return;
+    }
+    decode_mean_n_ += n_add;
+    decode_mean_stats_.n_tok += n_add;
+}
+
+void llama_memory_kvmem::decode_mean_commit(uint32_t n_keep) {
+    if (n_keep == 0 || decode_mean_pending_pos_.empty()) {
+        decode_mean_discard();
+        return;
+    }
+    n_keep = std::min(n_keep, static_cast<uint32_t>(decode_mean_pending_pos_.size()));
+    uint32_t i = 0;
+    while (i < n_keep) {
+        const uint32_t pos = static_cast<uint32_t>(decode_mean_pending_pos_[i]);
+        const uint32_t bid = pos / block_tokens_;
+        uint32_t take = 1;
+        while (i + take < n_keep) {
+            const uint32_t p = static_cast<uint32_t>(decode_mean_pending_pos_[i + take]);
+            if (p / block_tokens_ != bid) {
+                break;
+            }
+            take++;
+        }
+        decode_mean_add_range(i, take);
+        // Accepted tokens only. Store n_tokens can include MTP drafts that
+        // seq_rm will drop; do not flush on that watermark.
+        if (decode_mean_block_ == bid && decode_mean_n_ > 0 &&
+            (decode_mean_pos0_ % block_tokens_) + decode_mean_n_ >= block_tokens_) {
+            decode_mean_flush();
+        }
+        i += take;
+    }
+    decode_mean_discard();
+}
+
+void llama_memory_kvmem::decode_mean_flush() {
+    if (decode_mean_n_ == 0 || !raw_ || decode_mean_block_ == ~0u) {
+        return;
+    }
+    kvmem_stagein_sync();
+    std::vector<float> sum(n_embd_k_, 0.0f);
+    uint32_t n_ok = 0;
+    uint32_t n_gpu = 0;
+    uint32_t n_host = 0;
+    float rms = 0.0f;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+            continue;
+        }
+        const uint8_t src = (il < decode_mean_src_.size()) ? decode_mean_src_[il] : 0;
+        bool got = false;
+        if (src == 2 && il < decode_mean_host_.size() &&
+            decode_mean_host_[il].size() == n_embd_k_) {
+            std::memcpy(sum.data(), decode_mean_host_[il].data(),
+                        n_embd_k_ * sizeof(float));
+            got = true;
+            n_host++;
+        } else if (src == 1 && kvmem_meank_d2h(il, sum.data(), n_embd_k_)) {
+            kvmem_stagein_sync();
+            got = true;
+            n_gpu++;
+        }
+        if (!got) {
+            continue;
+        }
+        raw_->write_layer_mean_sum(decode_mean_pos0_, decode_mean_n_, il, sum.data());
+        kvmem_meank_zero(il);
+        if (n_ok == 0 && n_embd_k_ > 0) {
+            double acc = 0;
+            for (uint32_t d = 0; d < n_embd_k_; ++d) {
+                acc += static_cast<double>(sum[d]) * sum[d];
+            }
+            rms = std::sqrt(acc / static_cast<double>(n_embd_k_)) /
+                    static_cast<float>(std::max(1u, decode_mean_n_));
+        }
+        n_ok++;
+    }
+    fprintf(stderr,
+            "KVMEM_DECODE_MEAN flush block=%u n=%u pos0=%u layers=%u gpu=%u host=%u rms=%.6f\n",
+            decode_mean_block_, decode_mean_n_, decode_mean_pos0_, n_ok, n_gpu, n_host, rms);
+    if (trace_) {
+        fprintf(stderr, "KVMEM_TRACE decode_mean_flush block=%u n=%u pos0=%u layers=%u\n",
+                decode_mean_block_, decode_mean_n_, decode_mean_pos0_, n_ok);
+    }
+    decode_mean_stats_.n_flush++;
+    decode_mean_stats_.last_block = decode_mean_block_;
+    decode_mean_stats_.last_n = decode_mean_n_;
+    decode_mean_stats_.last_layers = n_ok;
+    decode_mean_stats_.last_rms = rms;
+    decode_mean_n_ = 0;
+    decode_mean_block_ = ~0u;
+    decode_mean_src_.assign(n_layer_, 0);
+    for (auto & h : decode_mean_host_) {
+        std::fill(h.begin(), h.end(), 0.0f);
+    }
+}
+
 void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     auto & store = runtime_->store();
     if (block_id >= store.block_count()) {
@@ -2482,6 +2810,20 @@ void llama_memory_kvmem::apply_retrieval() {
         for (const auto & b : runtime_->store().blocks()) {
             if (b.orig_pos_end() > static_cast<uint32_t>(query_begin_) && b.orig_pos_start < qe) {
                 mandatory.push_back(b.block_id);
+            }
+        }
+        // T5: last-user query is in the middle. Tokens after query_end (assistant
+        // tool XML + role=tool) are already in the reused prefix and must stay
+        // resident; recent_tokens=0 would otherwise let retrieval evict them.
+        const uint32_t pe = runtime_->store().total_tokens();
+        if (query_end_ > 0 && qe < pe) {
+            for (const auto & b : runtime_->store().blocks()) {
+                if (b.orig_pos_end() > qe && b.orig_pos_start < pe) {
+                    mandatory.push_back(b.block_id);
+                }
+            }
+            if (trace_) {
+                fprintf(stderr, "KVMEM_TRACE retrieval_protect suffix=[%u,%u)\n", qe, pe);
             }
         }
     }
@@ -2870,6 +3212,29 @@ bool llama_kvmem_has_recurrent(void) {
     return mem && mem->has_recurrent();
 }
 
+bool llama_kvmem_want_decode_mean(void) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    return mem && mem->want_decode_mean();
+}
+
+void llama_kvmem_decode_mean_commit(uint32_t n_keep) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->decode_mean_commit(n_keep);
+    }
+}
+
+void llama_kvmem_decode_mean_discard(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->decode_mean_discard();
+    }
+}
+
+void llama_kvmem_decode_mean_flush(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->decode_mean_flush();
+    }
+}
+
 bool llama_kvmem_want_prefill_capture(void) {
     const llama_kvmem_params * kp = llama_kvmem_get_params();
     if (!kp || !kp->enabled) {
@@ -2885,10 +3250,50 @@ bool llama_kvmem_want_prefill_capture(void) {
     return mem->want_prefill_capture();
 }
 
+bool llama_kvmem_want_q_capture(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || !mem->want_q_capture()) {
+        return false;
+    }
+    return llama_kvmem_ubatch_needs_q_capture(n_tokens, n_pos, pos);
+}
+
+void llama_kvmem_reset_query(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->reset_query_acc();
+    }
+}
+
 void llama_kvmem_end_prefill_capture(void) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->end_prefill_capture();
     }
+}
+
+void llama_kvmem_begin_cached_turn(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->begin_cached_turn();
+    }
+}
+
+uint32_t llama_kvmem_store_n_tokens(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->store_n_tokens();
+    }
+    return 0;
+}
+
+void llama_kvmem_truncate_cached(uint32_t n_past) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->truncate_cached(n_past);
+    }
+}
+
+llama_pos llama_kvmem_recr_pos_max(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->recr_pos_max();
+    }
+    return -1;
 }
 
 void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos) {
