@@ -809,7 +809,11 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
             }
         }
     }
-    out.max_tokens = body.value("max_tokens", 128);
+    if (body.contains("max_tokens") && body["max_tokens"].is_number()) {
+        out.max_tokens = body["max_tokens"].get<int>();
+    } else if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()) {
+        out.max_tokens = body["max_completion_tokens"].get<int>();
+    }
     out.temperature = body.value("temperature", 0.0f);
     out.stream = body.value("stream", false);
     if (body.contains("kvmem") && body["kvmem"].is_object()) {
