@@ -3195,6 +3195,37 @@ void llama_kvmem_apply_retrieval(struct llama_context * /*ctx*/) {
     }
 }
 
+bool llama_memory_kvmem::query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const {
+    if (!runtime_ || query_begin >= prompt_end) {
+        return true;
+    }
+    const kvmem::KvMemStore & store = runtime_->store();
+    const uint32_t bt = std::max(1u, store.config().block_tokens);
+    const uint32_t budget = store.budget_blocks();
+    if (budget == 0) {
+        return true;
+    }
+    const uint64_t total_blocks =
+            (static_cast<uint64_t>(prompt_end) + bt - 1) / bt;
+    const uint64_t boundary_block = query_begin / bt;
+    if (boundary_block >= total_blocks) {
+        return true;
+    }
+    const uint64_t sink =
+            std::min<uint64_t>(store.config().sink_blocks, total_blocks);
+    const uint64_t suffix = total_blocks - boundary_block;
+    const uint64_t required =
+            boundary_block < sink ? total_blocks : sink + suffix;
+    return required <= static_cast<uint64_t>(budget);
+}
+
+bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->query_replay_fits(query_begin, prompt_end);
+    }
+    return true;
+}
+
 void llama_kvmem_set_replay(bool replay) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->set_replay(replay);

@@ -99,6 +99,7 @@ public:
     void harvest_perf_print_sum();
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
+    bool query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const;
     void dump_kv_compare(int32_t block_id, bool writeback_test = false);
     void trace_working_set(const char * tag) const;
     void set_replay(bool replay) { replay_ = replay; }

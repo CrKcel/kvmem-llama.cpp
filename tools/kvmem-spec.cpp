@@ -139,7 +139,8 @@ int kvmem_spec_decode_span(llama_context * ctx,
                            common_speculative * spec,
                            const llama_token * toks,
                            int pos0, int pos1, int n_batch,
-                           const char * what) {
+                           const char * what,
+                           const std::function<bool()> & abort) {
     if (pos0 >= pos1) {
         return 0;
     }
@@ -149,6 +150,12 @@ int kvmem_spec_decode_span(llama_context * ctx,
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     int n_pos = pos0;
     while (n_pos < pos1) {
+        if (abort && abort()) {
+            fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
+                    n_pos, what ? what : "");
+            llama_batch_free(batch);
+            return KVMEM_DECODE_ABORT;
+        }
         const int n = std::min(n_batch, pos1 - n_pos);
         common_batch_clear(batch);
         for (int i = 0; i < n; ++i) {
@@ -203,7 +210,8 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         const std::vector<llama_token> & prompt,
         int n_predict,
         common_params_sampling sparams,
-        kvmem_spec_on_token on_token) {
+        kvmem_spec_on_token on_token,
+        const std::function<bool()> & abort) {
     kvmem_spec_gen_stats st;
     if (!sess.ok || !sess.spec || prompt.empty() || n_predict <= 0) {
         st.failed = true;
@@ -242,6 +250,10 @@ kvmem_spec_gen_stats kvmem_spec_generate(
     bool has_eos = false;
 
     while (st.n_gen < n_predict && !has_eos) {
+        if (abort && abort()) {
+            fprintf(stderr, "KVMEM_TRACE stream_abort phase=spec_gen n_gen=%d\n", st.n_gen);
+            break;
+        }
         if (draft.empty()) {
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             ckpt.update_pos(

@@ -50,12 +50,17 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
 
 void kvmem_spec_stop(kvmem_spec_session & sess);
 
+// decode_span / spec_decode_span: client disconnected mid-prefill.
+constexpr int KVMEM_DECODE_ABORT = -100;
+
 // Decode [pos0, pos1) with explicit pos/seq_id so process() can catch up draft KV.
+// `abort` if set: return KVMEM_DECODE_ABORT when it returns true (checked between batches).
 int kvmem_spec_decode_span(llama_context * ctx,
                            common_speculative * spec,
                            const llama_token * toks,
                            int pos0, int pos1, int n_batch,
-                           const char * what);
+                           const char * what,
+                           const std::function<bool()> & abort = {});
 
 using kvmem_spec_on_token =
         std::function<void(llama_token id, const std::string & piece, bool from_draft)>;
@@ -80,6 +85,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         kvmem_spec_on_token on_token);
 
 // Same as above, but uses a fully-specified sampler (grammar / lazy triggers).
+// `abort` if set: stop the generate loop when it returns true (not a failure).
 kvmem_spec_gen_stats kvmem_spec_generate(
         llama_context * ctx_tgt,
         llama_model * model_tgt,
@@ -87,4 +93,5 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         const std::vector<llama_token> & prompt,
         int n_predict,
         common_params_sampling sparams,
-        kvmem_spec_on_token on_token);
+        kvmem_spec_on_token on_token,
+        const std::function<bool()> & abort = {});

@@ -476,7 +476,7 @@ static void test_mandatory_overlap_deduplicates_and_recent_is_best_effort() {
     CHECK(std::find(sel.begin(), sel.end(), 8) == sel.end());
 }
 
-static void test_mandatory_hard_union_overflow_throws() {
+static void test_mandatory_hard_union_overflow_trims_newest() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
     cfg.select_budget = 32 * 4;
@@ -485,22 +485,22 @@ static void test_mandatory_hard_union_overflow_throws() {
     KvMemStore s(cfg);
     s.register_append(32 * 10);
 
-    bool topk_threw = false;
-    try {
-        (void)s.pick_topk_blocks({1, 2, 3, 4});
-    } catch (const std::runtime_error &) {
-        topk_threw = true;
+    // sink {0} + mandatory {1,2,3,4} is 5 > budget 4. Keep the newest
+    // mandatory ids: {0, 2, 3, 4}.
+    const auto sel = s.pick_topk_blocks({1, 2, 3, 4});
+    CHECK(sel.size() == 4);
+    for (uint32_t id : {0u, 2u, 3u, 4u}) {
+        CHECK(std::find(sel.begin(), sel.end(), id) != sel.end());
     }
-    CHECK(topk_threw);
+    CHECK(std::find(sel.begin(), sel.end(), 1) == sel.end());
 
-    bool semantic_threw = false;
-    try {
-        (void)s.pick_semantic_groups(
-            {{32 * 5, 32 * 7}}, {1.0}, {1, 2, 3, 4});
-    } catch (const std::runtime_error &) {
-        semantic_threw = true;
+    const auto sem = s.pick_semantic_groups(
+        {{32 * 5, 32 * 7}}, {1.0}, {1, 2, 3, 4});
+    CHECK(sem.size() == 4);
+    for (uint32_t id : {0u, 2u, 3u, 4u}) {
+        CHECK(std::find(sem.begin(), sem.end(), id) != sem.end());
     }
-    CHECK(semantic_threw);
+    CHECK(std::find(sem.begin(), sem.end(), 1) == sem.end());
 }
 
 static void test_prefill_pressure_mandatory_blocks_stay_inside_budget() {
@@ -521,13 +521,13 @@ static void test_prefill_pressure_mandatory_blocks_stay_inside_budget() {
     CHECK(std::find(sel.begin(), sel.end(), 9) != sel.end());
     CHECK(std::find(sel.begin(), sel.end(), 7) == sel.end());
 
-    bool budget_threw = false;
-    try {
-        (void)s.pick_prefill_pressure_blocks({1, 2, 3, 4, 5});
-    } catch (const std::runtime_error &) {
-        budget_threw = true;
+    // sink {0} + mandatory {1..5} exceeds prefill budget 5; keep newest.
+    const auto trimmed = s.pick_prefill_pressure_blocks({1, 2, 3, 4, 5});
+    CHECK(trimmed.size() == 5);
+    for (uint32_t id : {0u, 2u, 3u, 4u, 5u}) {
+        CHECK(std::find(trimmed.begin(), trimmed.end(), id) != trimmed.end());
     }
-    CHECK(budget_threw);
+    CHECK(std::find(trimmed.begin(), trimmed.end(), 1) == trimmed.end());
 }
 
 static void test_prefill_pressure_sink_full_recent_tail() {
@@ -1089,7 +1089,7 @@ int main() {
     test_budget_scaled_keep_allocation();
     test_topk_mandatory_blocks_stay_inside_budget();
     test_mandatory_overlap_deduplicates_and_recent_is_best_effort();
-    test_mandatory_hard_union_overflow_throws();
+    test_mandatory_hard_union_overflow_trims_newest();
     test_prefill_pressure_mandatory_blocks_stay_inside_budget();
     test_prefill_pressure_sink_full_recent_tail();
     test_prefill_pressure_edges();

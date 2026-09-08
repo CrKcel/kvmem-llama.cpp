@@ -375,12 +375,31 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(
             ++kept_count;
         }
     };
-    for (uint32_t id = 0; id < sink; ++id) keep(id);
-    for (uint32_t id : mandatory_blocks) keep(id);
-    if (kept_count > budget) {
-        throw std::runtime_error(
-            "KVMem mandatory prefill selection plus sink blocks exceeds "
-            "the configured prefill budget");
+    for (uint32_t id = 0; id < sink && kept_count < budget; ++id) keep(id);
+    // Newest mandatory first so a huge query suffix cannot evict the tail
+    // or throw. Drop older mandatory blocks that do not fit.
+    uint32_t mand_kept = 0;
+    uint32_t mand_unique = 0;
+    {
+        std::vector<uint8_t> seen(n, 0);
+        for (uint32_t id : mandatory_blocks) {
+            if (id < n && !seen[id]) {
+                seen[id] = 1;
+                ++mand_unique;
+            }
+        }
+    }
+    for (size_t i = mandatory_blocks.size(); i > 0 && kept_count < budget; --i) {
+        const uint32_t before = kept_count;
+        keep(mandatory_blocks[i - 1]);
+        if (kept_count > before) {
+            ++mand_kept;
+        }
+    }
+    if (mand_kept < mand_unique) {
+        std::fprintf(stderr,
+                     "KVMEM_TRACE mandatory_trim policy=prefill kept=%u dropped=%u budget=%u\n",
+                     mand_kept, mand_unique - mand_kept, budget);
     }
     for (uint32_t id = n; id > 0 && kept_count < budget; --id) {
         keep(id - 1);
@@ -423,11 +442,28 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
         if (id < n && !kept[id]) { kept[id] = true; ++kept_count; }
     };
     for (uint32_t i = 0; i < sink && kept_count < budget; ++i) keep(i);
-    for (uint32_t id : mandatory_blocks) keep(id);
-    if (kept_count > budget) {
-        throw std::runtime_error(
-            "KVMem mandatory selection plus sink blocks exceeds the "
-            "configured selection budget");
+    uint32_t mand_kept = 0;
+    uint32_t mand_unique = 0;
+    {
+        std::vector<uint8_t> seen(n, 0);
+        for (uint32_t id : mandatory_blocks) {
+            if (id < n && !seen[id]) {
+                seen[id] = 1;
+                ++mand_unique;
+            }
+        }
+    }
+    for (size_t i = mandatory_blocks.size(); i > 0 && kept_count < budget; --i) {
+        const uint32_t before = kept_count;
+        keep(mandatory_blocks[i - 1]);
+        if (kept_count > before) {
+            ++mand_kept;
+        }
+    }
+    if (mand_kept < mand_unique) {
+        std::fprintf(stderr,
+                     "KVMEM_TRACE mandatory_trim policy=topk kept=%u dropped=%u budget=%u\n",
+                     mand_kept, mand_unique - mand_kept, budget);
     }
     for (uint32_t i = 0; i < recent && kept_count < budget; ++i) {
         keep(n - 1 - i);
@@ -553,11 +589,28 @@ std::vector<uint32_t> KvMemStore::pick_semantic_groups(
     const uint32_t sink = std::min(cfg_.sink_blocks, n);
     const uint32_t recent = std::min(cfg_.recent_blocks, n);
     for (uint32_t id = 0; id < sink && kept_count < budget; ++id) keep(id);
-    for (uint32_t id : mandatory_blocks) keep(id);
-    if (kept_count > budget) {
-        throw std::runtime_error(
-            "KVMem mandatory semantic selection plus sink blocks exceeds the "
-            "configured selection budget");
+    uint32_t mand_kept = 0;
+    uint32_t mand_unique = 0;
+    {
+        std::vector<uint8_t> seen(n, 0);
+        for (uint32_t id : mandatory_blocks) {
+            if (id < n && !seen[id]) {
+                seen[id] = 1;
+                ++mand_unique;
+            }
+        }
+    }
+    for (size_t i = mandatory_blocks.size(); i > 0 && kept_count < budget; --i) {
+        const uint32_t before = kept_count;
+        keep(mandatory_blocks[i - 1]);
+        if (kept_count > before) {
+            ++mand_kept;
+        }
+    }
+    if (mand_kept < mand_unique) {
+        std::fprintf(stderr,
+                     "KVMEM_TRACE mandatory_trim policy=semantic kept=%u dropped=%u budget=%u\n",
+                     mand_kept, mand_unique - mand_kept, budget);
     }
     for (uint32_t i = 0; i < recent && kept_count < budget; ++i) {
         keep(n - 1 - i);

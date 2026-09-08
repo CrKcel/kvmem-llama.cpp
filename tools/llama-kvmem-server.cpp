@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -45,6 +46,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
             "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
+            "  --kvmem-query-max-tokens N cap last-user retrieval query to this many tokens\n"
+            "                            from the end of the span (default 512; qw3-style)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -56,7 +59,12 @@ static void print_usage(const char * argv0) {
             "  -ctv, --cache-type-v TYPE  GPU V cache type (must match K when quantized)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
-            "  --spec-draft-p-min P       min draft probability (default 0)\n",
+            "  --spec-draft-p-min P       min draft probability (default 0)\n"
+            "  --enable-thinking          Qwen thinking on (default off; request can override)\n"
+            "  --no-think                 force thinking off\n"
+            "  --reasoning-budget N       thinking token budget: -1 unlimited, 0 end immediately,\n"
+            "                            N>0 force </think> after N think tokens (default -1)\n"
+            "  --reasoning-budget-message MSG  injected before forced </think> (default none)\n",
             argv0);
 }
 
@@ -105,6 +113,7 @@ struct ServerState {
     int n_batch = 512;
     int n_predict_default = 128;
     int query_last_fallback = 64;
+    int query_max_tokens = 512;
     std::string model_name = "kvmem";
     kvmem_spec_session spec;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
@@ -112,16 +121,70 @@ struct ServerState {
     bool spec_mtp = false;
     int spec_n_max = 2;
     float spec_p_min = 0.0f;
+    bool enable_thinking_default = false;
+    int reasoning_budget_default = -1;
+    std::string reasoning_budget_message;
     std::vector<llama_token> cached_tokens;
     int perf_p_eval = 0;
     std::vector<uint8_t> gdn_ckpt;
     int gdn_ckpt_pos = -1; // last pos included in gdn_ckpt
 };
 
-static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, int pos1, int n_batch, const char * what);
-static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, int pos0, int pos1, const char * what);
+struct StreamIo {
+    httplib::DataSink * sink = nullptr;
+    const httplib::Request * req = nullptr;
+    std::chrono::steady_clock::time_point last_beat{};
+    bool aborted = false;
+};
 
-static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & prompt, int n_past) {
+static bool stream_peer_gone(const StreamIo * io) {
+    if (!io) {
+        return false;
+    }
+    if (io->req && io->req->is_connection_closed && io->req->is_connection_closed()) {
+        return true;
+    }
+    if (io->sink && io->sink->is_writable && !io->sink->is_writable()) {
+        return true;
+    }
+    return false;
+}
+
+static bool stream_heartbeat(StreamIo * io) {
+    if (!io) {
+        return true;
+    }
+    if (stream_peer_gone(io)) {
+        io->aborted = true;
+        return false;
+    }
+    if (!io->sink || !io->sink->write) {
+        return true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (io->last_beat.time_since_epoch().count() == 0) {
+        io->last_beat = now;
+        return true;
+    }
+    if (now - io->last_beat < std::chrono::seconds(10)) {
+        return true;
+    }
+    static const char beat[] = ": keepalive\n\n";
+    if (!io->sink->write(beat, sizeof(beat) - 1)) {
+        io->aborted = true;
+        return false;
+    }
+    io->last_beat = now;
+    return true;
+}
+
+static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, int pos1, int n_batch,
+                       const char * what, StreamIo * io = nullptr);
+static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, int pos0, int pos1,
+                                  const char * what, StreamIo * io = nullptr);
+
+static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & prompt, int n_past,
+                        StreamIo * io = nullptr) {
     if (!llama_kvmem_has_recurrent()) {
         return true;
     }
@@ -147,8 +210,14 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
         // spec_decode_span would llama_decode(ctx_dft) at Y=from while X=n_past-1
         // and M-RoPE rejects X < Y.
         llama_kvmem_set_replay(true);
-        const int rc = decode_span(st.ctx, prompt.data(), from, n_past, st.n_batch, "gdn-catchup");
+        const int rc = decode_span(st.ctx, prompt.data(), from, n_past, st.n_batch, "gdn-catchup", io);
         llama_kvmem_set_replay(false);
+        if (rc == KVMEM_DECODE_ABORT) {
+            if (io) {
+                io->aborted = true;
+            }
+            return false;
+        }
         if (rc != 0) {
             return false;
         }
@@ -194,7 +263,8 @@ static void commit_cached(ServerState & st, const std::vector<llama_token> & pro
             llama_kvmem_store_n_tokens());
 }
 
-static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, int pos1, int n_batch, const char * what) {
+static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, int pos1, int n_batch,
+                       const char * what, StreamIo * io) {
     if (pos0 >= pos1) {
         return 0;
     }
@@ -207,6 +277,12 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     int n_pos = pos0;
     while (n_pos < pos1) {
+        if (!stream_heartbeat(io)) {
+            fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
+                    n_pos, what ? what : "");
+            llama_batch_free(batch);
+            return KVMEM_DECODE_ABORT;
+        }
         const int n = std::min(n_batch, pos1 - n_pos);
         common_batch_clear(batch);
         for (int i = 0; i < n; ++i) {
@@ -224,14 +300,21 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
     return 0;
 }
 
-static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, int pos0, int pos1, const char * what) {
+static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, int pos0, int pos1,
+                                 const char * what, StreamIo * io) {
     if (st.spec.ok) {
-        return kvmem_spec_decode_span(st.ctx, st.spec.spec, toks, pos0, pos1, st.n_batch, what);
+        auto abort_fn = [io]() { return !stream_heartbeat(io); };
+        return kvmem_spec_decode_span(st.ctx, st.spec.spec, toks, pos0, pos1, st.n_batch, what, abort_fn);
     }
-    return decode_span(st.ctx, toks, pos0, pos1, st.n_batch, what);
+    return decode_span(st.ctx, toks, pos0, pos1, st.n_batch, what, io);
 }
 
-static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt) {
+static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt, StreamIo * io = nullptr) {
+    if (!stream_heartbeat(io)) {
+        fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill_start n_prompt=%d\n",
+                (int) prompt.size());
+        return false;
+    }
     const int n_prompt = (int) prompt.size();
     llama_context * ctx = st.ctx;
     const int eval_end = st.spec.ok ? n_prompt - 1 : n_prompt;
@@ -264,7 +347,10 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
             if (st.kparams.enabled) {
                 llama_kvmem_truncate_cached((uint32_t) n_past);
             }
-            if (!gdn_sync_to(st, prompt, n_past)) {
+            if (!gdn_sync_to(st, prompt, n_past, io)) {
+                if (io && io->aborted) {
+                    return false;
+                }
                 reused = false;
             }
         }
@@ -275,7 +361,6 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     }
 
     const bool do_retr = st.kparams.enabled && st.kparams.method == 1 && st.kparams.query_begin > 0;
-    const bool recr_ckpt = do_retr && llama_kvmem_has_recurrent();
     int q0 = st.kparams.query_begin;
     int q1 = st.kparams.query_end;
     if (q0 < 0) {
@@ -284,13 +369,25 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     if (q1 <= q0 || q1 > eval_end) {
         q1 = eval_end;
     }
+    const bool replay_fits = llama_kvmem_query_replay_fits(
+            (uint32_t) std::max(q0, 0), (uint32_t) std::max(eval_end, 0));
+    const bool recr_ckpt = do_retr && replay_fits && llama_kvmem_has_recurrent();
     fprintf(stderr,
             "KVMEM_TRACE prefix_reuse reused=%d n_past=%d n_prompt=%d n_cached=%d "
-            "n_new=%d stored=%u query=[%d,%d)\n",
+            "n_new=%d stored=%u query=[%d,%d) replay_fits=%d\n",
             (int) reused, n_past, n_prompt, (int) st.cached_tokens.size(),
             eval_end - n_past, llama_kvmem_store_n_tokens(),
-            q0, q1);
+            q0, q1, (int) replay_fits);
 
+    auto take_rc = [&](int rc) -> bool {
+        if (rc == KVMEM_DECODE_ABORT) {
+            if (io) {
+                io->aborted = true;
+            }
+            return false;
+        }
+        return rc == 0;
+    };
     auto dec = [&](int a, int b, const char * what) -> bool {
         if (a < 0) {
             a = 0;
@@ -301,7 +398,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         if (a >= b) {
             return true;
         }
-        return decode_span_maybe_spec(st, prompt.data(), a, b, what) == 0;
+        return take_rc(decode_span_maybe_spec(st, prompt.data(), a, b, what, io));
     };
     // Hole-fill / recapture of positions that may already sit in KV. Trunk
     // only: MTP draft is M-RoPE and cannot decode Y while X (seq_pos_max)
@@ -317,9 +414,9 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
             return true;
         }
         llama_kvmem_set_replay(true);
-        const int rc = decode_span(st.ctx, prompt.data(), a, b, st.n_batch, what);
+        const int rc = decode_span(st.ctx, prompt.data(), a, b, st.n_batch, what, io);
         llama_kvmem_set_replay(false);
-        return rc == 0;
+        return take_rc(rc);
     };
 
     if (!do_retr) {
@@ -341,7 +438,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     }
     std::vector<uint8_t> gdn_ckpt;
     if (recr_ckpt) {
-        if (n_past > q0 && !gdn_sync_to(st, prompt, q0)) {
+        if (n_past > q0 && !gdn_sync_to(st, prompt, q0, io)) {
             fprintf(stderr, "KVMEM_TRACE gdn_sync to query_begin failed\n");
             return false;
         }
@@ -389,56 +486,63 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     }
 
     llama_kvmem_apply_retrieval(ctx);
-    if (recr_ckpt && !gdn_ckpt.empty()) {
-        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-        if (llama_state_seq_set_data_ext(ctx, gdn_ckpt.data(), gdn_ckpt.size(), 0, fl) != gdn_ckpt.size()) {
-            fprintf(stderr, "GDN restore failed\n");
-            return false;
-        }
-        fprintf(stderr, "KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
-    }
-    llama_memory_t mem = llama_get_memory(ctx);
-    if (mem) {
-        fprintf(stderr, "KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",
-                llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
-                q0, q1);
-        llama_memory_seq_rm(mem, 0, q0, q1);
-        fprintf(stderr, "KVMEM_TRACE after_seq_rm seq_pos=[%d,%d] auto_pos0=%d\n",
-                llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
-                llama_memory_seq_pos_max(mem, 0) + 1);
-    }
-    if (st.spec.ctx_dft) {
-        llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
-        if (md) {
-            llama_memory_seq_rm(md, 0, q0, q1);
-            fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
-                    llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
-        }
-    }
-    if (!replay(q0, q1, "query replay")) {
-        return false;
-    }
-    llama_synchronize(ctx);
-    fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
-            q0, q1 - q0, (int) recr_ckpt);
-    if (n_past > q1 && !replay(q1, n_past, "gdn-after-query")) {
-        return false;
-    }
-    if (st.spec.ctx_dft) {
-        // Query seq_rm left a hole in the draft cache. M-RoPE cannot fill it
-        // while the suffix remains, so drop [q0, inf) and append in order.
-        llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
-        if (md) {
-            llama_memory_seq_rm(md, 0, q0, -1);
-        }
-        const int d_end = std::max(n_past, q1);
-        if (d_end > q0) {
-            const int rc = decode_span(st.spec.ctx_dft, prompt.data(), q0, d_end, st.n_batch,
-                                       "mtp-resync");
-            if (rc != 0) {
+    if (!replay_fits) {
+        fprintf(stderr,
+                "KVMEM_TRACE query_replay_skip query=[%d,%d) eval_end=%d "
+                "(sink+suffix exceeds GPU budget)\n",
+                q0, q1, eval_end);
+    } else {
+        if (recr_ckpt && !gdn_ckpt.empty()) {
+            const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            if (llama_state_seq_set_data_ext(ctx, gdn_ckpt.data(), gdn_ckpt.size(), 0, fl) != gdn_ckpt.size()) {
+                fprintf(stderr, "GDN restore failed\n");
                 return false;
             }
-            fprintf(stderr, "KVMEM_TRACE mtp_resync query=[%d,%d) to=%d\n", q0, q1, d_end);
+            fprintf(stderr, "KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
+        }
+        llama_memory_t mem = llama_get_memory(ctx);
+        if (mem) {
+            fprintf(stderr, "KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",
+                    llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
+                    q0, q1);
+            llama_memory_seq_rm(mem, 0, q0, q1);
+            fprintf(stderr, "KVMEM_TRACE after_seq_rm seq_pos=[%d,%d] auto_pos0=%d\n",
+                    llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
+                    llama_memory_seq_pos_max(mem, 0) + 1);
+        }
+        if (st.spec.ctx_dft) {
+            llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+            if (md) {
+                llama_memory_seq_rm(md, 0, q0, q1);
+                fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
+                        llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+            }
+        }
+        if (!replay(q0, q1, "query replay")) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
+                q0, q1 - q0, (int) recr_ckpt);
+        if (n_past > q1 && !replay(q1, n_past, "gdn-after-query")) {
+            return false;
+        }
+        if (st.spec.ctx_dft) {
+            // Query seq_rm left a hole in the draft cache. M-RoPE cannot fill it
+            // while the suffix remains, so drop [q0, inf) and append in order.
+            llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+            if (md) {
+                llama_memory_seq_rm(md, 0, q0, -1);
+            }
+            const int d_end = std::max(n_past, q1);
+            if (d_end > q0) {
+                const int rc = decode_span(st.spec.ctx_dft, prompt.data(), q0, d_end, st.n_batch,
+                                           "mtp-resync", io);
+                if (!take_rc(rc)) {
+                    return false;
+                }
+                fprintf(stderr, "KVMEM_TRACE mtp_resync query=[%d,%d) to=%d\n", q0, q1, d_end);
+            }
         }
     }
     if (!dec(std::max(n_past, q1), eval_end, "prefill-tail")) {
@@ -480,6 +584,16 @@ static void derive_query_span(ServerState & st, const std::string & prompt, cons
     }
 }
 
+static void clamp_query_span(const ServerState & st, int & qbegin, int & qend) {
+    const int cap = st.query_max_tokens;
+    if (cap > 0 && qend > qbegin && (qend - qbegin) > cap) {
+        fprintf(stderr,
+                "KVMEM_TRACE query_clamp span=[%d,%d) tokens=%d cap=%d -> [%d,%d)\n",
+                qbegin, qend, qend - qbegin, cap, qend - cap, qend);
+        qbegin = qend - cap;
+    }
+}
+
 struct ChatRequest {
     std::vector<common_chat_msg> msgs;
     std::vector<common_chat_tool> tools;
@@ -497,6 +611,8 @@ struct ChatRequest {
     int query_end = -1;
     std::string force_substr;
     bool enable_thinking = false;
+    int reasoning_budget_tokens = -1;
+    std::string reasoning_budget_message;
 };
 
 static common_json nlohmann_to_common(const json & j) {
@@ -571,6 +687,30 @@ static common_params_sampling make_chat_sampling(
         }
     } else {
         sp.grammar_triggers = chat.grammar_triggers;
+    }
+    sp.reasoning_budget_tokens = cr.reasoning_budget_tokens;
+    sp.reasoning_budget_message = cr.reasoning_budget_message;
+    if (vocab && !chat.thinking_end_tags.empty()) {
+        if (!chat.thinking_start_tag.empty()) {
+            sp.reasoning_budget_start = common_tokenize(vocab, chat.thinking_start_tag, false, true);
+        }
+        for (const auto & tag : chat.thinking_end_tags) {
+            if (tag.empty()) {
+                continue;
+            }
+            auto ids = common_tokenize(vocab, tag, false, true);
+            if (!ids.empty()) {
+                sp.reasoning_budget_end.push_back(std::move(ids));
+            }
+        }
+        if (!sp.reasoning_budget_end.empty()) {
+            llama_tokens forced = sp.reasoning_budget_end.front();
+            if (!cr.reasoning_budget_message.empty()) {
+                auto msg = common_tokenize(vocab, cr.reasoning_budget_message, false, true);
+                forced.insert(forced.begin(), msg.begin(), msg.end());
+            }
+            sp.reasoning_budget_forced = std::move(forced);
+        }
     }
     return sp;
 }
@@ -834,7 +974,38 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
                 out.force_substr = k["pin"][0].get<std::string>();
             }
         }
-        out.enable_thinking = k.value("enable_thinking", false);
+        if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean()) {
+            out.enable_thinking = k["enable_thinking"].get<bool>();
+        }
+    }
+    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean()) {
+        out.enable_thinking = body["enable_thinking"].get<bool>();
+    }
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+        const auto & kw = body["chat_template_kwargs"];
+        if (kw.contains("enable_thinking")) {
+            if (kw["enable_thinking"].is_boolean()) {
+                out.enable_thinking = kw["enable_thinking"].get<bool>();
+            } else if (kw["enable_thinking"].is_string()) {
+                out.enable_thinking = kw["enable_thinking"].get<std::string>() == "true";
+            }
+        }
+    }
+    int budget = -1;
+    bool budget_set = false;
+    if (body.contains("reasoning_budget_tokens") && body["reasoning_budget_tokens"].is_number()) {
+        budget = body["reasoning_budget_tokens"].get<int>();
+        budget_set = true;
+    } else if (body.contains("thinking_budget_tokens") && body["thinking_budget_tokens"].is_number()) {
+        budget = body["thinking_budget_tokens"].get<int>();
+        budget_set = true;
+    }
+    // llama-server: omitted or -1 keeps the process default; >= 0 overrides.
+    if (budget_set && budget != -1) {
+        out.reasoning_budget_tokens = budget;
+    }
+    if (body.contains("reasoning_budget_message") && body["reasoning_budget_message"].is_string()) {
+        out.reasoning_budget_message = body["reasoning_budget_message"].get<std::string>();
     }
     return true;
 }
@@ -896,6 +1067,12 @@ int main(int argc, char ** argv) {
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = std::atoi(need(arg));
+        } else if (eq(arg, "--kvmem-query-max-tokens")) {
+            st.query_max_tokens = std::atoi(need(arg));
+            if (st.query_max_tokens <= 0) {
+                fprintf(stderr, "invalid --kvmem-query-max-tokens (want > 0)\n");
+                return 1;
+            }
         } else if (eq(arg, "--kvmem-gpu-ratio")) {
             st.kparams.gpu_memory_ratio = std::strtof(need(arg), nullptr);
         } else if (eq(arg, "--kvmem-cpu-gb")) {
@@ -942,6 +1119,18 @@ int main(int argc, char ** argv) {
             st.spec_n_max = std::atoi(need(arg));
         } else if (eq(arg, "--spec-draft-p-min")) {
             st.spec_p_min = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--enable-thinking")) {
+            st.enable_thinking_default = true;
+        } else if (eq(arg, "--no-think")) {
+            st.enable_thinking_default = false;
+        } else if (eq(arg, "--reasoning-budget")) {
+            st.reasoning_budget_default = std::atoi(need(arg));
+            if (st.reasoning_budget_default < -1) {
+                fprintf(stderr, "invalid --reasoning-budget (want >= -1)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--reasoning-budget-message")) {
+            st.reasoning_budget_message = need(arg);
         } else {
             fprintf(stderr, "unknown flag: %s\n", arg);
             print_usage(argv[0]);
@@ -1058,6 +1247,9 @@ int main(int argc, char ** argv) {
         }
         ChatRequest cr;
         cr.max_tokens = st.n_predict_default;
+        cr.enable_thinking = st.enable_thinking_default;
+        cr.reasoning_budget_tokens = st.reasoning_budget_default;
+        cr.reasoning_budget_message = st.reasoning_budget_message;
         std::string err;
         if (!parse_chat_request(body, cr, err)) {
             res.status = 400;
@@ -1076,6 +1268,9 @@ int main(int argc, char ** argv) {
         inputs.add_generation_prompt = true;
         inputs.use_jinja = true;
         inputs.enable_thinking = cr.enable_thinking;
+        // llama-server default: extract <think> into delta.reasoning_content.
+        // NONE leaves thinking in content, so OpenCode TUI never classifies it.
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
         if (cr.parallel_tool_calls_set) {
             inputs.parallel_tool_calls = cr.parallel_tool_calls;
         } else {
@@ -1102,6 +1297,7 @@ int main(int argc, char ** argv) {
         if (qbegin < 0 || qend < 0) {
             derive_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
         }
+        clamp_query_span(st, qbegin, qend);
         const int force = force_pos_from_substr(st.vocab, toks, cr.force_substr);
         st.kparams.query_begin = qbegin;
         st.kparams.query_end = qend;
@@ -1126,35 +1322,12 @@ int main(int argc, char ** argv) {
                 (int) toks.size(), qbegin, qend, force, cr.last_user.size());
         fprintf(stderr,
                 "KVMEM_TRACE chat_parse n_msg=%zu n_tools=%zu tool_choice=%s tool_hist=%d "
-                "prompt_has_tool=%d grammar_bytes=%zu\n",
+                "prompt_has_tool=%d grammar_bytes=%zu think=%d reasoning=%s parser_bytes=%zu\n",
                 cr.msgs.size(), cr.tools.size(), tool_choice_cstr(cr.tool_choice),
-                n_tool_hist, (int) prompt_has_tool, formatted.grammar.size());
-
-        const auto t_turn0 = std::chrono::steady_clock::now();
-        if (!run_prefill_retrieval(st, toks)) {
-            res.status = 500;
-            res.set_content("{\"error\":\"prefill/retrieval failed\"}", "application/json");
-            return;
-        }
-        const auto t_pf1 = std::chrono::steady_clock::now();
-        const double prefill_ms =
-                std::chrono::duration<double, std::milli>(t_pf1 - t_turn0).count();
-        fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
-                prefill_ms, (int) toks.size());
-
-        llama_kvmem_end_prefill_capture();
-
-        auto emit_gen_wall = [t_turn0, t_pf1, prefill_ms, n_prompt = (int) toks.size()](int n_gen) {
-            const auto now = std::chrono::steady_clock::now();
-            const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
-            const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
-            const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
-            fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
-            fprintf(stderr,
-                    "KVMEM_CHAT_TURN n_prompt=%d n_gen=%d prefill_ms=%.2f gen_ms=%.2f "
-                    "wall_ms=%.2f gen_toks=%.2f\n",
-                    n_prompt, n_gen, prefill_ms, gen_ms, wall_ms, tps);
-        };
+                n_tool_hist, (int) prompt_has_tool, formatted.grammar.size(),
+                (int) cr.enable_thinking,
+                common_reasoning_format_name(inputs.reasoning_format),
+                formatted.parser.size());
 
         const std::string cid = "chatcmpl-kvmem";
         llama_context * ctx = st.ctx;
@@ -1164,9 +1337,15 @@ int main(int argc, char ** argv) {
         std::vector<std::string> stops = cr.stop;
         stops.insert(stops.end(), formatted.additional_stops.begin(), formatted.additional_stops.end());
         fprintf(stderr,
-                "KVMEM_TRACE chat_sample grammar_type=%s lazy=%d n_trig=%zu gen_prompt_bytes=%zu\n",
+                "KVMEM_TRACE chat_sample grammar_type=%s lazy=%d n_trig=%zu gen_prompt_bytes=%zu "
+                "think_start_bytes=%zu think_end_n=%zu rbudget=%d start_toks=%zu end_seqs=%zu forced_toks=%zu\n",
                 grammar_type_cstr(sparams.grammar.type), (int) sparams.grammar_lazy,
-                sparams.grammar_triggers.size(), sparams.generation_prompt.size());
+                sparams.grammar_triggers.size(), sparams.generation_prompt.size(),
+                formatted.thinking_start_tag.size(), formatted.thinking_end_tags.size(),
+                sparams.reasoning_budget_tokens,
+                sparams.reasoning_budget_start.size(),
+                sparams.reasoning_budget_end.size(),
+                sparams.reasoning_budget_forced.size());
         const bool parse_tools = !cr.tools.empty() &&
                 cr.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
@@ -1183,6 +1362,23 @@ int main(int argc, char ** argv) {
                 use_spec = false;
             }
         }
+
+        auto make_emit_gen_wall = [n_prompt = (int) toks.size()](
+                std::chrono::steady_clock::time_point t_turn0,
+                std::chrono::steady_clock::time_point t_pf1,
+                double prefill_ms) {
+            return [t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen) {
+                const auto now = std::chrono::steady_clock::now();
+                const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
+                const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
+                const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
+                fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
+                fprintf(stderr,
+                        "KVMEM_CHAT_TURN n_prompt=%d n_gen=%d prefill_ms=%.2f gen_ms=%.2f "
+                        "wall_ms=%.2f gen_toks=%.2f\n",
+                        n_prompt, n_gen, prefill_ms, gen_ms, wall_ms, tps);
+            };
+        };
 
         auto emit_json = [&](const std::string & content, int n_gen, bool hit_limit) {
             common_chat_msg msg = parse_assistant_output(content, formatted, parse_tools);
@@ -1203,9 +1399,9 @@ int main(int argc, char ** argv) {
             } catch (const std::exception &) {
                 message = json{{"role", "assistant"}, {"content", content}};
             }
-            fprintf(stderr, "KVMEM_TRACE chat_out n_tool_calls=%zu finish=%s content_chars=%zu\n",
+            fprintf(stderr, "KVMEM_TRACE chat_out n_tool_calls=%zu finish=%s content_chars=%zu reasoning_chars=%zu\n",
                     msg.tool_calls.size(), finish.c_str(),
-                    msg.content.size());
+                    msg.content.size(), msg.reasoning_content.size());
             json out = {
                 {"id", cid},
                 {"object", "chat.completion"},
@@ -1224,41 +1420,125 @@ int main(int argc, char ** argv) {
             res.set_content(out.dump(), "application/json");
         };
 
-        if (use_spec) {
-            if (cr.stream) {
-                const int max_tokens = cr.max_tokens;
-                res.set_header("Cache-Control", "no-cache");
-                res.set_chunked_content_provider("text/event-stream",
-                    [slot, &st, toks, cid, max_tokens, sparams, parse_tools, formatted, emit_gen_wall](size_t, httplib::DataSink & sink) mutable {
-                        auto send = [&](const std::string & payload) {
-                            const std::string line = "data: " + payload + "\n\n";
-                            sink.write(line.data(), line.size());
-                        };
-                        send(stream_choice_chunk(cid, json{{"role", "assistant"}}, nullptr).dump());
-                        std::vector<llama_token> gen;
-                        std::string content;
-                        StreamChatOut sco(formatted, parse_tools);
+        if (cr.stream) {
+            const int max_tokens = cr.max_tokens;
+            const bool spec_stream = use_spec;
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
+            res.set_chunked_content_provider("text/event-stream",
+                [slot, &st, &req, toks, cid, max_tokens, sparams, parse_tools, formatted, stops,
+                 spec_stream, ctx, vocab, make_emit_gen_wall](size_t, httplib::DataSink & sink) mutable {
+                    StreamIo io;
+                    io.sink = &sink;
+                    io.req = &req;
+                    auto send = [&](const std::string & payload) -> bool {
+                        const std::string line = "data: " + payload + "\n\n";
+                        if (!sink.write(line.data(), line.size())) {
+                            io.aborted = true;
+                            return false;
+                        }
+                        return true;
+                    };
+                    send(stream_choice_chunk(cid, json{{"role", "assistant"}}, nullptr).dump());
+                    const auto t_turn0 = std::chrono::steady_clock::now();
+                    if (!run_prefill_retrieval(st, toks, &io)) {
+                        if (!io.aborted) {
+                            send(json{{"error", "prefill/retrieval failed"}}.dump());
+                            sink.write("data: [DONE]\n\n", 15);
+                        }
+                        slot->unlock();
+                        sink.done();
+                        return true;
+                    }
+                    const auto t_pf1 = std::chrono::steady_clock::now();
+                    const double prefill_ms =
+                            std::chrono::duration<double, std::milli>(t_pf1 - t_turn0).count();
+                    fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
+                            prefill_ms, (int) toks.size());
+                    llama_kvmem_end_prefill_capture();
+                    auto emit_gen_wall = make_emit_gen_wall(t_turn0, t_pf1, prefill_ms);
+
+                    std::vector<llama_token> gen;
+                    std::string content;
+                    StreamChatOut sco(formatted, parse_tools);
+                    bool aborted = false;
+                    if (spec_stream) {
                         kvmem_spec_generate(st.ctx, st.model, st.spec, toks, max_tokens, sparams,
                             [&](llama_token id, const std::string & piece, bool) {
                                 gen.push_back(id);
                                 content += piece;
-                                if (parse_tools) {
-                                    for (const auto & delta : sco.set_text(content, true)) {
-                                        send(stream_choice_chunk(cid, delta, nullptr).dump());
-                                    }
-                                } else {
-                                    send(stream_choice_chunk(cid, json{{"content", piece}}, nullptr).dump());
+                                for (const auto & delta : sco.set_text(content, true)) {
+                                    send(stream_choice_chunk(cid, delta, nullptr).dump());
                                 }
-                            });
-                        const bool hit_limit = (int) gen.size() >= max_tokens;
-                        if (parse_tools) {
-                            for (const auto & delta : sco.set_text(content, false)) {
+                            },
+                            [&]() { return !stream_heartbeat(&io); });
+                        aborted = io.aborted;
+                    } else {
+                        common_sampler * smpl = nullptr;
+                        try {
+                            common_params_sampling sp = sparams;
+                            smpl = common_sampler_init(st.model, sp);
+                        } catch (const std::exception & e) {
+                            fprintf(stderr, "sampler init failed: %s\n", e.what());
+                            send(json{{"error", std::string("sampler init failed: ") + e.what()}}.dump());
+                            sink.write("data: [DONE]\n\n", 15);
+                            slot->unlock();
+                            sink.done();
+                            return true;
+                        }
+                        if (!smpl) {
+                            send(json{{"error", "sampler init failed"}}.dump());
+                            sink.write("data: [DONE]\n\n", 15);
+                            slot->unlock();
+                            sink.done();
+                            return true;
+                        }
+                        bool stopped = false;
+                        bool hit_stop = false;
+                        while ((int) gen.size() < max_tokens && !stopped) {
+                            if (!stream_heartbeat(&io)) {
+                                aborted = true;
+                                break;
+                            }
+                            llama_token id = common_sampler_sample(smpl, ctx, -1);
+                            common_sampler_accept(smpl, id, true);
+                            if (llama_vocab_is_eog(vocab, id)) {
+                                stopped = true;
+                                break;
+                            }
+                            std::string piece = token_piece(vocab, id);
+                            llama_batch batch = llama_batch_get_one(&id, 1);
+                            if (llama_decode(ctx, batch) != 0) {
+                                fprintf(stderr, "llama_decode(gen) failed\n");
+                                break;
+                            }
+                            content += piece;
+                            gen.push_back(id);
+                            hit_stop = strip_stop(content, stops);
+                            for (const auto & delta : sco.set_text(content, !hit_stop)) {
                                 send(stream_choice_chunk(cid, delta, nullptr).dump());
                             }
+                            if (hit_stop) {
+                                break;
+                            }
                         }
-                        const char * finish = parse_tools ? sco.finish_reason(hit_limit) : "stop";
-                        fprintf(stderr, "KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s\n",
-                                sco.n_tc_delta, finish);
+                        common_sampler_free(smpl);
+                        if (aborted) {
+                            slot->unlock();
+                            sink.done();
+                            return true;
+                        }
+                        const bool hit_limit = !stopped && !hit_stop && (int) gen.size() >= max_tokens;
+                        for (const auto & delta : sco.set_text(content, false)) {
+                            send(stream_choice_chunk(cid, delta, nullptr).dump());
+                        }
+                        const char * finish = sco.finish_reason(hit_limit);
+                        fprintf(stderr,
+                                "KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s "
+                                "content_chars=%zu reasoning_chars=%zu\n",
+                                sco.n_tc_delta, finish,
+                                sco.prev.content.size(), sco.prev.reasoning_content.size());
+                        llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
                         commit_cached(st, toks, gen);
                         send(stream_choice_chunk(cid, json::object(), finish).dump());
@@ -1266,9 +1546,55 @@ int main(int argc, char ** argv) {
                         slot->unlock();
                         sink.done();
                         return true;
-                    });
+                    }
+                    if (aborted) {
+                        slot->unlock();
+                        sink.done();
+                        return true;
+                    }
+                    const bool hit_limit = (int) gen.size() >= max_tokens;
+                    for (const auto & delta : sco.set_text(content, false)) {
+                        send(stream_choice_chunk(cid, delta, nullptr).dump());
+                    }
+                    const char * finish = sco.finish_reason(hit_limit);
+                    fprintf(stderr,
+                            "KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s "
+                            "content_chars=%zu reasoning_chars=%zu\n",
+                            sco.n_tc_delta, finish,
+                            sco.prev.content.size(), sco.prev.reasoning_content.size());
+                    emit_gen_wall((int) gen.size());
+                    commit_cached(st, toks, gen);
+                    send(stream_choice_chunk(cid, json::object(), finish).dump());
+                    sink.write("data: [DONE]\n\n", 15);
+                    slot->unlock();
+                    sink.done();
+                    return true;
+                });
+            return;
+        }
+
+        StreamIo io;
+        io.req = &req;
+        const auto t_turn0 = std::chrono::steady_clock::now();
+        if (!run_prefill_retrieval(st, toks, &io)) {
+            if (io.aborted) {
+                fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill n_prompt=%d\n",
+                        (int) toks.size());
                 return;
             }
+            res.status = 500;
+            res.set_content("{\"error\":\"prefill/retrieval failed\"}", "application/json");
+            return;
+        }
+        const auto t_pf1 = std::chrono::steady_clock::now();
+        const double prefill_ms =
+                std::chrono::duration<double, std::milli>(t_pf1 - t_turn0).count();
+        fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
+                prefill_ms, (int) toks.size());
+        llama_kvmem_end_prefill_capture();
+        auto emit_gen_wall = make_emit_gen_wall(t_turn0, t_pf1, prefill_ms);
+
+        if (use_spec) {
             std::string content;
             std::vector<llama_token> gen;
             const kvmem_spec_gen_stats gst = kvmem_spec_generate(
@@ -1321,66 +1647,6 @@ int main(int argc, char ** argv) {
             return true;
         };
 
-        if (cr.stream) {
-            const int max_tokens = cr.max_tokens;
-            res.set_header("Cache-Control", "no-cache");
-            res.set_chunked_content_provider("text/event-stream",
-                [slot, smpl, cid, gen_one, max_tokens, &st, toks, stops, parse_tools, formatted, emit_gen_wall](size_t, httplib::DataSink & sink) mutable {
-                    auto send = [&](const std::string & payload) {
-                        const std::string line = "data: " + payload + "\n\n";
-                        sink.write(line.data(), line.size());
-                    };
-                    send(stream_choice_chunk(cid, json{{"role", "assistant"}}, nullptr).dump());
-                    std::vector<llama_token> gen;
-                    std::string content;
-                    bool stopped = false;
-                    bool hit_stop = false;
-                    StreamChatOut sco(formatted, parse_tools);
-                    while ((int) gen.size() < max_tokens && !stopped) {
-                        std::string piece;
-                        llama_token id = 0;
-                        if (!gen_one(piece, stopped, id)) {
-                            break;
-                        }
-                        if (stopped) {
-                            break;
-                        }
-                        content += piece;
-                        gen.push_back(id);
-                        hit_stop = strip_stop(content, stops);
-                        if (parse_tools) {
-                            for (const auto & delta : sco.set_text(content, !hit_stop)) {
-                                send(stream_choice_chunk(cid, delta, nullptr).dump());
-                            }
-                        } else {
-                            send(stream_choice_chunk(cid, json{{"content", piece}}, nullptr).dump());
-                        }
-                        if (hit_stop) {
-                            break;
-                        }
-                    }
-                    const bool hit_limit = !stopped && !hit_stop && (int) gen.size() >= max_tokens;
-                    if (parse_tools) {
-                        for (const auto & delta : sco.set_text(content, false)) {
-                            send(stream_choice_chunk(cid, delta, nullptr).dump());
-                        }
-                    }
-                    const char * finish = parse_tools ? sco.finish_reason(hit_limit) : "stop";
-                    fprintf(stderr, "KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s\n",
-                            sco.n_tc_delta, finish);
-                    send(stream_choice_chunk(cid, json::object(), finish).dump());
-                    sink.write("data: [DONE]\n\n", 15);
-                    llama_kvmem_decode_mean_flush();
-                    emit_gen_wall((int) gen.size());
-                    commit_cached(st, toks, gen);
-                    common_sampler_free(smpl);
-                    slot->unlock();
-                    sink.done();
-                    return true;
-                });
-            return;
-        }
-
         std::string content;
         std::vector<llama_token> gen;
         bool stopped = false;
@@ -1412,10 +1678,11 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/chat/completions", handle_chat);
     svr.Post("/chat/completions", handle_chat);
 
-    fprintf(stderr, "llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d\n",
+    fprintf(stderr, "llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
-            st.spec.ok ? "draft-mtp" : "off", st.spec_n_max);
+            st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,
+            st.reasoning_budget_default, st.query_max_tokens);
     if (!svr.listen(host, port)) {
         fprintf(stderr, "listen failed\n");
         return 1;
