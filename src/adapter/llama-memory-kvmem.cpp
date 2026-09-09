@@ -522,6 +522,7 @@ void llama_memory_kvmem::reset_policy() {
     }
     reset_slots();
     retrieval_pinned_ = false;
+    keep_selected_ = false;
     prefill_capture_ = true;
 }
 
@@ -530,6 +531,7 @@ void llama_memory_kvmem::begin_cached_turn() {
     decode_mean_discard();
     reset_query_acc();
     retrieval_pinned_ = false;
+    keep_selected_ = false;
     prefill_capture_ = true;
 }
 
@@ -1115,7 +1117,7 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     // block_count() > budget is true and a recency pressure reselect would
     // drop the resurrected needle on the first generated token. Pin the
     // working set and place decode tokens into gen_reserve slots.
-    if (!retrieval_pinned_) {
+    if (!retrieval_pinned_ && !keep_selected_) {
         try {
             need_offload = runtime_->maybe_offload_during_prefill(
                     n_new_tokens, resident_tokens(), kv_size_, incoming);
@@ -2812,20 +2814,9 @@ void llama_memory_kvmem::apply_retrieval() {
                 mandatory.push_back(b.block_id);
             }
         }
-        // T5: last-user query is in the middle. Tokens after query_end (assistant
-        // tool XML + role=tool) are already in the reused prefix and must stay
-        // resident; recent_tokens=0 would otherwise let retrieval evict them.
-        const uint32_t pe = runtime_->store().total_tokens();
-        if (query_end_ > 0 && qe < pe) {
-            for (const auto & b : runtime_->store().blocks()) {
-                if (b.orig_pos_end() > qe && b.orig_pos_start < pe) {
-                    mandatory.push_back(b.block_id);
-                }
-            }
-            if (trace_) {
-                fprintf(stderr, "KVMEM_TRACE retrieval_protect suffix=[%u,%u)\n", qe, pe);
-            }
-        }
+        // Decode/tool tokens after query_end are recency, not mandatory.
+        // recent_blocks=0 → they are not reserved in the select budget;
+        // pick_topk keeps the newest recent_blocks if configured.
     }
     if (force_pos_ >= 0) {
         const int32_t bid = runtime_->store().block_id_containing(static_cast<uint32_t>(force_pos_));
@@ -3305,6 +3296,25 @@ void llama_kvmem_begin_cached_turn(void) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->begin_cached_turn();
     }
+}
+
+void llama_kvmem_keep_selected(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->keep_selected_window();
+    }
+}
+
+void llama_kvmem_pin_working_set(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->pin_working_set();
+    }
+}
+
+uint32_t llama_kvmem_free_slots(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return (uint32_t) mem->free_slot_count();
+    }
+    return 0;
 }
 
 uint32_t llama_kvmem_store_n_tokens(void) {

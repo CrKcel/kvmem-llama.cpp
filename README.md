@@ -3,17 +3,19 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.11.0`](docs/milestones/v0.11.0.md)** (2026-09-08).
+**Current local milestone: [`v0.12.0`](docs/milestones/v0.12.0.md)** (2026-09-09).
 GPU KV default **q8_0**. Orig-pos cells; restore is packed GPU K/V memcpy
 (no unrotated raw-K on the product path). Retrieval uses pre-RoPE mean-K
 (prefill write + decode running sum after pin). Full blocks copy packed
 K/V to host asynchronously during prefill. `llama-kvmem-server` reuses
-the GPU prefix across requests; `/v1/chat/completions` supports OpenAI
-tools (server does not execute them). Last-user query is clamped
-(`--kvmem-query-max-tokens` 512); stream sends SSE before prefill and
-aborts on disconnect. `--kvmem` is retrieval + query-last 64. MTP remains
-optional (default **none**). 0.8B `server_smoke` T1–T5 GO. P6 is not
-started. Phase D `state_write` is not in this tag.
+the GPU prefix across requests; same last-user tool rounds **skip**
+retrieval/query-replay and only prefill `n_new`. Decode/tool tokens after
+the query are **recency** (`--kvmem-recent-tokens`, default 0), not
+GPU-mandatory; they can still win top-k. Stream sends a trailing
+`usage` chunk (`choices=[]`) before `[DONE]`. `--kvmem` is retrieval +
+query-last 64. MTP remains optional (default **none**). 0.8B
+`server_smoke` T1–T5 GO. P6 is not started. Phase D `state_write` is
+not in this tag.
 
 ## Layout
 
@@ -35,11 +37,11 @@ started. Phase D `state_write` is not in this tag.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.11.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.12.0` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.11.0
+git checkout v0.12.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh

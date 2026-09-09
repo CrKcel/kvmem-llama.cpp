@@ -111,7 +111,23 @@ def main() -> int:
             raise SystemExit(f"stream chat failed {st}: {body[:400]}")
         if "data: [DONE]" not in body:
             raise SystemExit("stream missing [DONE]")
-        print("PASS: streaming /v1/chat/completions")
+        usage = None
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            try:
+                chunk = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+                if chunk.get("choices"):
+                    raise SystemExit(f"stream usage chunk must have empty choices: {chunk}")
+        if not usage or int(usage.get("prompt_tokens") or 0) < 1:
+            raise SystemExit(f"stream missing usage.prompt_tokens: {body[-800:]}")
+        if int(usage.get("total_tokens") or 0) != int(usage["prompt_tokens"]) + int(usage.get("completion_tokens") or 0):
+            raise SystemExit(f"stream usage arithmetic: {usage}")
+        print("PASS: streaming /v1/chat/completions usage", usage)
 
         filler = " lorem ipsum dolor sit amet" * 80
         st, body = post_json(base + "/v1/chat/completions", {
@@ -161,6 +177,10 @@ def main() -> int:
         print("  ", reuse[-1])
         if "reused=1" not in reuse[-1]:
             raise SystemExit("turn 2 did not reuse prefix: " + reuse[-1])
+        if "query_replay_skip_same" in err2:
+            raise SystemExit("turn 2 new user must re-retrieve, not skip_same")
+        if "KVMEM_TRACE query_replay begin=" not in err2:
+            raise SystemExit("turn 2 new user missing query replay")
         def _ival(s, key):
             for part in s.split():
                 if part.startswith(key + "="):
@@ -272,6 +292,67 @@ def main() -> int:
             print("  ", out_ln[-1])
         print("PASS: T3 non-stream OpenAI tool_calls")
 
+        t5_user = "Look up the secret code."
+        t5_msg = t2_msg.get("message") or {}
+        call_id = (calls[0].get("id") if calls else None) or "call_1"
+        mark_t5b = log_path.read_text()
+        st, body = post_json(base + "/v1/chat/completions", {
+            "messages": [
+                {"role": "user", "content": t5_user},
+                t5_msg,
+                {"role": "tool", "tool_call_id": call_id, "content": "BLUEBIRD-42"},
+            ],
+            "tools": tools_body["tools"],
+            "tool_choice": "none",
+            "max_tokens": 48,
+            "temperature": 0,
+            "stream": False,
+        }, timeout=120)
+        if st != 200:
+            raise SystemExit(f"T5 tool-result chat failed {st}: {body}")
+        logf.flush()
+        err_t5 = log_path.read_text()[len(mark_t5b):]
+        reuse_t5 = [ln for ln in err_t5.splitlines() if "prefix_reuse" in ln]
+        if not reuse_t5:
+            raise SystemExit("T5 missing KVMEM_TRACE prefix_reuse")
+        print("  ", reuse_t5[-1])
+        if "reused=1" not in reuse_t5[-1]:
+            raise SystemExit("T5 did not reuse prefix: " + reuse_t5[-1])
+        skip_t5 = [ln for ln in err_t5.splitlines() if "query_replay_skip_same" in ln]
+        if not skip_t5:
+            raise SystemExit("T5 same-user tool round should skip query replay: " + reuse_t5[-1])
+        print("  ", skip_t5[-1])
+        if "warm_skip=1" not in reuse_t5[-1]:
+            raise SystemExit("T5 prefix_reuse missing warm_skip=1: " + reuse_t5[-1])
+        if "gdn-after-query" in err_t5 or "mtp_resync" in err_t5:
+            raise SystemExit("T5 replayed suffix despite same-query skip")
+        if "query_replay begin=" in err_t5:
+            raise SystemExit("T5 still ran query replay")
+        n_prompt_t5 = _ival(reuse_t5[-1], "n_prompt")
+        qspan = reuse_t5[-1].split("query=", 1)[-1] if "query=" in reuse_t5[-1] else ""
+        q0_t5 = q1_t5 = -1
+        if qspan.startswith("["):
+            inner = qspan[1:].split(")", 1)[0]
+            parts = inner.split(",")
+            if len(parts) == 2:
+                q0_t5, q1_t5 = int(parts[0]), int(parts[1])
+        print("T5 query span:", q0_t5, q1_t5, "n_prompt:", n_prompt_t5)
+        if q0_t5 < 0 or q1_t5 <= q0_t5:
+            raise SystemExit("T5 query span missing/invalid: " + reuse_t5[-1])
+        if n_prompt_t5 > 0 and q1_t5 >= n_prompt_t5:
+            raise SystemExit(
+                f"T5 query must be last-user only, not the whole prompt: "
+                f"query=[{q0_t5},{q1_t5}) n_prompt={n_prompt_t5}")
+        t5_out = json.loads(body)["choices"][0]
+        t5_text = (t5_out.get("message") or {}).get("content") or ""
+        print("T5 finish_reason:", t5_out.get("finish_reason"))
+        print("T5 output:", t5_text[:200].replace("\n", " "))
+        if t5_out.get("finish_reason") == "tool_calls":
+            raise SystemExit("T5 tool_choice=none should not return tool_calls")
+        if "BLUEBIRD-42" not in t5_text:
+            raise SystemExit("T5 missed the tool result BLUEBIRD-42")
+        print("PASS: T5 same-user tool round skip_same + last-user query")
+
         mark_t4 = log_path.read_text()
         st, body = post_json(base + "/v1/chat/completions", {
             "messages": [{"role": "user", "content": "Look up the secret code."}],
@@ -317,74 +398,6 @@ def main() -> int:
         if finish != "tool_calls":
             raise SystemExit(f"T4 expected finish_reason=tool_calls, got {finish!r}")
         print("PASS: T4 stream delta.tool_calls")
-
-        t5_user = "Look up the secret code. After the tool returns, reply with only the code."
-        mark_t5 = log_path.read_text()
-        st, body = post_json(base + "/v1/chat/completions", {
-            "messages": [{"role": "user", "content": t5_user}],
-            "tools": tools_body["tools"],
-            "tool_choice": "required",
-            "max_tokens": 64,
-            "temperature": 0,
-            "stream": False,
-        }, timeout=120)
-        if st != 200:
-            raise SystemExit(f"T5 turn-1 required-tool failed {st}: {body}")
-        t5_choice = json.loads(body)["choices"][0]
-        t5_msg = t5_choice.get("message") or {}
-        t5_calls = t5_msg.get("tool_calls") or []
-        if t5_choice.get("finish_reason") != "tool_calls" or not t5_calls:
-            raise SystemExit(f"T5 turn-1 expected tool_calls, got {t5_choice}")
-        call_id = t5_calls[0].get("id") or "call_1"
-        print("T5 turn-1 tool:", (t5_calls[0].get("function") or {}).get("name"), "id:", call_id)
-
-        mark_t5b = log_path.read_text()
-        st, body = post_json(base + "/v1/chat/completions", {
-            "messages": [
-                {"role": "user", "content": t5_user},
-                t5_msg,
-                {"role": "tool", "tool_call_id": call_id, "content": "BLUEBIRD-42"},
-            ],
-            "tools": tools_body["tools"],
-            "tool_choice": "none",
-            "max_tokens": 48,
-            "temperature": 0,
-            "stream": False,
-        }, timeout=120)
-        if st != 200:
-            raise SystemExit(f"T5 turn-2 tool-result chat failed {st}: {body}")
-        logf.flush()
-        err_t5 = log_path.read_text()[len(mark_t5b):]
-        reuse_t5 = [ln for ln in err_t5.splitlines() if "prefix_reuse" in ln]
-        if not reuse_t5:
-            raise SystemExit("T5 missing KVMEM_TRACE prefix_reuse")
-        print("  ", reuse_t5[-1])
-        if "reused=1" not in reuse_t5[-1]:
-            raise SystemExit("T5 turn 2 did not reuse prefix: " + reuse_t5[-1])
-        n_prompt_t5 = _ival(reuse_t5[-1], "n_prompt")
-        qspan = reuse_t5[-1].split("query=", 1)[-1] if "query=" in reuse_t5[-1] else ""
-        q0_t5 = q1_t5 = -1
-        if qspan.startswith("["):
-            inner = qspan[1:].split(")", 1)[0]
-            parts = inner.split(",")
-            if len(parts) == 2:
-                q0_t5, q1_t5 = int(parts[0]), int(parts[1])
-        print("T5 query span:", q0_t5, q1_t5, "n_prompt:", n_prompt_t5)
-        if q0_t5 < 0 or q1_t5 <= q0_t5:
-            raise SystemExit("T5 query span missing/invalid: " + reuse_t5[-1])
-        if n_prompt_t5 > 0 and q1_t5 >= n_prompt_t5:
-            raise SystemExit(
-                f"T5 query must be last-user only, not the whole prompt: "
-                f"query=[{q0_t5},{q1_t5}) n_prompt={n_prompt_t5}")
-        t5_out = json.loads(body)["choices"][0]
-        t5_text = (t5_out.get("message") or {}).get("content") or ""
-        print("T5 finish_reason:", t5_out.get("finish_reason"))
-        print("T5 turn-2 output:", t5_text[:200].replace("\n", " "))
-        if t5_out.get("finish_reason") == "tool_calls":
-            raise SystemExit("T5 tool_choice=none should not return tool_calls")
-        if "BLUEBIRD-42" not in t5_text:
-            raise SystemExit("T5 turn 2 missed the tool result BLUEBIRD-42")
-        print("PASS: T5 tool round-2 prefix reuse + last-user query")
         return 0
     finally:
         proc.terminate()

@@ -75,6 +75,11 @@ LLAMA_API void llama_kvmem_end_prefill_capture(void);
 // Start a follow-up turn that keeps the GPU prefix. Call seq_rm(n_past,-1)
 // on trunk + MTP after this; then prefill only the suffix.
 LLAMA_API void llama_kvmem_begin_cached_turn(void);
+// Same-query skip: do not recency-reselect; keep the retrieved GPU window.
+LLAMA_API void llama_kvmem_keep_selected(void);
+// Pin after skip prefill so decode mean-K uses gen_reserve slots.
+LLAMA_API void llama_kvmem_pin_working_set(void);
+LLAMA_API uint32_t llama_kvmem_free_slots(void);
 LLAMA_API void llama_kvmem_truncate_cached(uint32_t n_past);
 LLAMA_API uint32_t llama_kvmem_store_n_tokens(void);
 LLAMA_API llama_pos llama_kvmem_recr_pos_max(void);
