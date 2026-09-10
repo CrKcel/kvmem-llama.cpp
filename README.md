@@ -3,19 +3,21 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.12.0`](docs/milestones/v0.12.0.md)** (2026-09-09).
+**Current local milestone: [`v0.12.1`](docs/milestones/v0.12.1.md)** (2026-09-10).
 GPU KV default **q8_0**. Orig-pos cells; restore is packed GPU K/V memcpy
 (no unrotated raw-K on the product path). Retrieval uses pre-RoPE mean-K
 (prefill write + decode running sum after pin). Full blocks copy packed
 K/V to host asynchronously during prefill. `llama-kvmem-server` reuses
 the GPU prefix across requests; same last-user tool rounds **skip**
-retrieval/query-replay and only prefill `n_new`. Decode/tool tokens after
-the query are **recency** (`--kvmem-recent-tokens`, default 0), not
-GPU-mandatory; they can still win top-k. Stream sends a trailing
-`usage` chunk (`choices=[]`) before `[DONE]`. `--kvmem` is retrieval +
-query-last 64. MTP remains optional (default **none**). 0.8B
-`server_smoke` T1–T5 GO. P6 is not started. Phase D `state_write` is
-not in this tag.
+retrieval/query-replay and only prefill `n_new`. Compact/rewrite that
+leaves LCP far short of the previous cache **drops reuse** and does a
+full retrieval. Query span is the last ChatML user role block matching
+last-user text. Stream `usage` includes DeepSeek `prompt_cache_hit_tokens`
+/ `prompt_cache_miss_tokens`. Decode/tool tokens after the query are
+**recency** (`--kvmem-recent-tokens`, default 0), not GPU-mandatory.
+`--kvmem` is retrieval + query-last 64. MTP remains optional (default
+**none**). 0.8B `server_smoke` T1–T5 GO. P6 is not started. Phase D
+`state_write` is not in this tag.
 
 ## Layout
 
@@ -37,11 +39,11 @@ not in this tag.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.12.0` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.12.1` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.12.0
+git checkout v0.12.1
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh

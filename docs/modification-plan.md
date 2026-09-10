@@ -1,6 +1,6 @@
 # KVMem × llama.cpp 修改计划
 
-**状态（2026-09-09）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7 **`v0.5.0`**。量化 KV spill **`v0.6.0`**。GPU stage-in **`v0.7.0`**。32 MiB slab **`v0.8.0`**。packed GPU K/V memcpy + mean-K + 块写满异步 D2H **`v0.9.0`**。decode mean-K + 进程内 prefix reuse + chat tools T1–T5 **`v0.10.0`**。query clamp / thinking budget / stream heartbeat **`v0.11.0`**。same-query skip / recency suffix / stream usage **`v0.12.0`**（tag `v0.12.0`）。产品默认 `--kvmem` = retrieval + query-last 64，`--kvmem-query-max-tokens` 512，GPU KV **q8_0**；MTP 可选 `--spec-type draft-mtp`（默认 **none**）。ISTA IQ3_S 默认仍 **none**。阶段测试：[milestones/v0.12.0.md](milestones/v0.12.0.md)。P6 未开始。阶段 D `state_write` 与 T6 json_schema 未进此 tag。
+**状态（2026-09-10）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7 **`v0.5.0`**。量化 KV spill **`v0.6.0`**。GPU stage-in **`v0.7.0`**。32 MiB slab **`v0.8.0`**。packed GPU K/V memcpy + mean-K + 块写满异步 D2H **`v0.9.0`**。decode mean-K + 进程内 prefix reuse + chat tools T1–T5 **`v0.10.0`**。query clamp / thinking budget / stream heartbeat **`v0.11.0`**。same-query skip / recency suffix / stream usage **`v0.12.0`**。compact `drop_reuse` / role-block query / `prompt_cache_*` **`v0.12.1`**（tag `v0.12.1`）。产品默认 `--kvmem` = retrieval + query-last 64，`--kvmem-query-max-tokens` 512，GPU KV **q8_0**；MTP 可选 `--spec-type draft-mtp`（默认 **none**）。ISTA IQ3_S 默认仍 **none**。阶段测试：[milestones/v0.12.1.md](milestones/v0.12.1.md)。P6 未开始。阶段 D `state_write` 与 T6 json_schema 未进此 tag。
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**
 

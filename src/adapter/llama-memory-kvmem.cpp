@@ -526,10 +526,12 @@ void llama_memory_kvmem::reset_policy() {
     prefill_capture_ = true;
 }
 
-void llama_memory_kvmem::begin_cached_turn() {
+void llama_memory_kvmem::begin_cached_turn(bool reset_query) {
     decode_mean_flush();
     decode_mean_discard();
-    reset_query_acc();
+    if (reset_query) {
+        reset_query_acc();
+    }
     retrieval_pinned_ = false;
     keep_selected_ = false;
     prefill_capture_ = true;
@@ -3294,7 +3296,13 @@ void llama_kvmem_end_prefill_capture(void) {
 
 void llama_kvmem_begin_cached_turn(void) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
-        mem->begin_cached_turn();
+        mem->begin_cached_turn(true);
+    }
+}
+
+void llama_kvmem_begin_cached_turn_keep_query(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->begin_cached_turn(false);
     }
 }
 

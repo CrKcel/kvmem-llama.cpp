@@ -37,6 +37,31 @@ def post_json(url: str, body: dict, timeout: int = 180) -> tuple[int, str]:
         return e.code, e.read().decode()
 
 
+def check_usage(usage, *, expect_hit=None, label="usage"):
+    if not isinstance(usage, dict):
+        raise SystemExit(f"{label} missing: {usage!r}")
+    pt = int(usage.get("prompt_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or 0)
+    tt = int(usage.get("total_tokens") or 0)
+    if "prompt_cache_hit_tokens" not in usage or "prompt_cache_miss_tokens" not in usage:
+        raise SystemExit(f"{label} missing prompt_cache_* : {usage}")
+    hit = int(usage["prompt_cache_hit_tokens"])
+    miss = int(usage["prompt_cache_miss_tokens"])
+    if pt < 1:
+        raise SystemExit(f"{label} prompt_tokens < 1: {usage}")
+    if tt != pt + ct:
+        raise SystemExit(f"{label} total arithmetic: {usage}")
+    if hit + miss != pt:
+        raise SystemExit(f"{label} hit+miss != prompt_tokens: {usage}")
+    if hit < 0 or miss < 0:
+        raise SystemExit(f"{label} negative cache counts: {usage}")
+    if "prompt_tokens_details" in usage:
+        raise SystemExit(f"{label} must not emit prompt_tokens_details: {usage}")
+    if expect_hit is not None and hit != expect_hit:
+        raise SystemExit(f"{label} hit {hit} != {expect_hit}: {usage}")
+    return usage
+
+
 def wait_health(base: str, timeout: float = 60.0) -> None:
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -99,7 +124,9 @@ def main() -> int:
         text = greedy["choices"][0]["message"]["content"]
         if not text.strip():
             raise SystemExit("greedy chat returned empty content")
+        greedy_usage = check_usage(greedy.get("usage"), expect_hit=0, label="greedy usage")
         print("PASS: greedy /v1/chat/completions ->", text[:80].replace("\n", " "))
+        print("  usage", greedy_usage)
 
         st, body = post_json(base + "/v1/chat/completions", {
             "messages": [{"role": "user", "content": "Count to three."}],
@@ -123,10 +150,9 @@ def main() -> int:
                 usage = chunk["usage"]
                 if chunk.get("choices"):
                     raise SystemExit(f"stream usage chunk must have empty choices: {chunk}")
-        if not usage or int(usage.get("prompt_tokens") or 0) < 1:
-            raise SystemExit(f"stream missing usage.prompt_tokens: {body[-800:]}")
-        if int(usage.get("total_tokens") or 0) != int(usage["prompt_tokens"]) + int(usage.get("completion_tokens") or 0):
-            raise SystemExit(f"stream usage arithmetic: {usage}")
+        if not usage:
+            raise SystemExit(f"stream missing usage: {body[-800:]}")
+        check_usage(usage, label="stream usage")
         print("PASS: streaming /v1/chat/completions usage", usage)
 
         filler = " lorem ipsum dolor sit amet" * 80
@@ -149,7 +175,9 @@ def main() -> int:
         if "KVMEM_TRACE retrieval" not in err and "KVMEM_TRACE selected" not in err:
             raise SystemExit("missing retrieval TRACE in server log")
         print("PASS: query-conditioned request printed retrieval TRACE")
-        retr_text = json.loads(body)["choices"][0]["message"]["content"]
+        retr_json = json.loads(body)
+        check_usage(retr_json.get("usage"), label="retrieval usage")
+        retr_text = retr_json["choices"][0]["message"]["content"]
         print("retrieval output:", retr_text[:200].replace("\n", " "))
         if "BLUEBIRD-42" not in retr_text:
             print("WARN: turn-1 did not emit BLUEBIRD-42; still testing prefix reuse")
@@ -191,11 +219,42 @@ def main() -> int:
         n_new = _ival(reuse[-1], "n_new")
         if n_past < 64 or n_new < 1 or n_new >= n_past or n_past + n_new > n_prompt + 8:
             raise SystemExit(f"prefix reuse sizes look wrong: {reuse[-1]}")
-        turn2 = json.loads(body)["choices"][0]["message"]["content"]
+        turn2_json = json.loads(body)
+        turn2 = turn2_json["choices"][0]["message"]["content"]
         print("turn-2 output:", turn2[:200].replace("\n", " "))
         if "BLUEBIRD-42" not in turn2:
             raise SystemExit("turn 2 missed the old needle")
+        check_usage(turn2_json.get("usage"), expect_hit=n_past, label="turn-2 usage")
         print("PASS: prefix reuse + old needle still recalled")
+
+        mark_c = log_path.read_text()
+        st, body = post_json(base + "/v1/chat/completions", {
+            "messages": [
+                {"role": "system", "content": "Read the notes and answer the user."},
+                {"role": "user", "content": "Compacted notes. " + NEEDLE},
+                {"role": "user", "content": "What was the secret code again? Reply with the code only."},
+            ],
+            "max_tokens": 48,
+            "temperature": 0,
+            "stream": False,
+        }, timeout=180)
+        if st != 200:
+            raise SystemExit(f"compact-rewrite chat failed {st}: {body}")
+        logf.flush()
+        err_c = log_path.read_text()[len(mark_c):]
+        if "query_reuse_q" in err_c or "query_replay_skip_same" in err_c:
+            raise SystemExit("compact rewrite must not skip/reuse_q:\n" + err_c[-2000:])
+        drop_c = [ln for ln in err_c.splitlines() if "prefix_rewrite drop_reuse=1" in ln]
+        reuse_c = [ln for ln in err_c.splitlines() if "prefix_reuse" in ln]
+        if drop_c:
+            print("  ", drop_c[-1])
+        elif reuse_c and "suffix_cont=1" in reuse_c[-1] and "reused=1" in reuse_c[-1]:
+            raise SystemExit("compact rewrite kept suffix_cont=1: " + reuse_c[-1])
+        compact_text = json.loads(body)["choices"][0]["message"]["content"]
+        print("compact-rewrite output:", compact_text[:200].replace("\n", " "))
+        if "BLUEBIRD-42" not in compact_text:
+            raise SystemExit("compact rewrite missed the needle")
+        print("PASS: compact rewrite drops skip/reuse_q and still recalls")
 
         mark_t1 = log_path.read_text()
         tools_body = {
@@ -324,10 +383,19 @@ def main() -> int:
         print("  ", skip_t5[-1])
         if "warm_skip=1" not in reuse_t5[-1]:
             raise SystemExit("T5 prefix_reuse missing warm_skip=1: " + reuse_t5[-1])
+        if "suffix_cont=1" not in reuse_t5[-1]:
+            raise SystemExit("T5 prefix_reuse missing suffix_cont=1: " + reuse_t5[-1])
         if "gdn-after-query" in err_t5 or "mtp_resync" in err_t5:
             raise SystemExit("T5 replayed suffix despite same-query skip")
         if "query_replay begin=" in err_t5:
             raise SystemExit("T5 still ran query replay")
+        if "query-q-capture" in err_t5:
+            raise SystemExit("T5 recaptured query despite same-user continuation")
+        loc_t5 = [ln for ln in err_t5.splitlines() if "query_loc" in ln]
+        if loc_t5:
+            print("  ", loc_t5[-1])
+            if "method=role_block" not in loc_t5[-1]:
+                raise SystemExit("T5 query should use role_block, not rfind: " + loc_t5[-1])
         n_prompt_t5 = _ival(reuse_t5[-1], "n_prompt")
         qspan = reuse_t5[-1].split("query=", 1)[-1] if "query=" in reuse_t5[-1] else ""
         q0_t5 = q1_t5 = -1
@@ -343,7 +411,8 @@ def main() -> int:
             raise SystemExit(
                 f"T5 query must be last-user only, not the whole prompt: "
                 f"query=[{q0_t5},{q1_t5}) n_prompt={n_prompt_t5}")
-        t5_out = json.loads(body)["choices"][0]
+        t5_json = json.loads(body)
+        t5_out = t5_json["choices"][0]
         t5_text = (t5_out.get("message") or {}).get("content") or ""
         print("T5 finish_reason:", t5_out.get("finish_reason"))
         print("T5 output:", t5_text[:200].replace("\n", " "))
@@ -351,6 +420,8 @@ def main() -> int:
             raise SystemExit("T5 tool_choice=none should not return tool_calls")
         if "BLUEBIRD-42" not in t5_text:
             raise SystemExit("T5 missed the tool result BLUEBIRD-42")
+        n_past_t5 = _ival(reuse_t5[-1], "n_past")
+        check_usage(t5_json.get("usage"), expect_hit=n_past_t5, label="T5 usage")
         print("PASS: T5 same-user tool round skip_same + last-user query")
 
         mark_t4 = log_path.read_text()
@@ -369,6 +440,7 @@ def main() -> int:
         saw_tc = False
         finish = None
         name_acc = ""
+        t4_usage = None
         for ln in body.splitlines():
             if not ln.startswith("data:") or ln.strip() == "data: [DONE]":
                 continue
@@ -376,6 +448,8 @@ def main() -> int:
             if not raw:
                 continue
             chunk = json.loads(raw)
+            if chunk.get("usage"):
+                t4_usage = chunk["usage"]
             ch0 = (chunk.get("choices") or [{}])[0]
             if ch0.get("finish_reason"):
                 finish = ch0["finish_reason"]
@@ -397,6 +471,7 @@ def main() -> int:
             raise SystemExit(f"T4 stream tool name {name_acc!r} != lookup_code")
         if finish != "tool_calls":
             raise SystemExit(f"T4 expected finish_reason=tool_calls, got {finish!r}")
+        check_usage(t4_usage, label="T4 stream usage")
         print("PASS: T4 stream delta.tool_calls")
         return 0
     finally:

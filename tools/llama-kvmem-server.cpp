@@ -133,6 +133,9 @@ struct ServerState {
     // replay or a later same-query skip). -1 = nothing to skip against.
     int last_query_begin = -1;
     int last_query_end = -1;
+    std::string last_user_text;
+    std::string turn_last_user;
+    int last_n_gen = 0;
 };
 
 struct StreamIo {
@@ -259,12 +262,15 @@ static void memory_clear_all(ServerState & st) {
     st.gdn_ckpt_pos = -1;
     st.last_query_begin = -1;
     st.last_query_end = -1;
+    st.last_user_text.clear();
+    st.last_n_gen = 0;
 }
 
 static void commit_cached(ServerState & st, const std::vector<llama_token> & prompt,
                           const std::vector<llama_token> & gen) {
     st.cached_tokens = prompt;
     st.cached_tokens.insert(st.cached_tokens.end(), gen.begin(), gen.end());
+    st.last_n_gen = (int) gen.size();
     fprintf(stderr, "KVMEM_TRACE cache_commit n_prompt=%d n_gen=%d n_cached=%d stored=%u\n",
             (int) prompt.size(), (int) gen.size(), (int) st.cached_tokens.size(),
             llama_kvmem_store_n_tokens());
@@ -316,7 +322,8 @@ static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, in
     return decode_span(st.ctx, toks, pos0, pos1, st.n_batch, what, io);
 }
 
-static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt, StreamIo * io = nullptr) {
+static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt,
+                                 StreamIo * io = nullptr, int * n_cache_hit = nullptr) {
     if (!stream_heartbeat(io)) {
         fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill_start n_prompt=%d\n",
                 (int) prompt.size());
@@ -360,25 +367,46 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     const llama_pos gdn_rmax = llama_kvmem_has_recurrent()
             ? llama_kvmem_recr_pos_max()
             : (n_past > 0 ? (llama_pos) (n_past - 1) : (llama_pos) -1);
-    const bool same_query = st.last_query_begin >= 0 &&
-            st.last_query_begin == q0 && st.last_query_end == q1;
+    const bool same_query = !st.last_user_text.empty() &&
+            st.last_user_text == st.turn_last_user;
     const bool gdn_at_tip = !llama_kvmem_has_recurrent() ||
             (n_past > 0 && gdn_rmax == (llama_pos) (n_past - 1));
     const bool kv_at_tip = n_past > 0 && kv_smax >= (llama_pos) (n_past - 1);
     // Same last-user: keep the GPU window and only prefill the new tail.
     // Suffix after query is recency (recent_tokens), not skip-gated.
     // New user / miss / GDN not at tip / no gen slots → full retrieval.
+    const int n_cached = (int) st.cached_tokens.size();
+    // Continuation: LCP covers the previous cache except last gen (thinking
+    // stripped / re-templated). +64 is a few prompt-side template tokens.
+    // Compact leaves LCP far short of n_cached.
+    const uint32_t suffix_slack = (uint32_t) std::max(0, st.last_n_gen) + 64u;
+    const bool suffix_cont = reused
+            && (uint32_t) (n_cached - n_past) <= suffix_slack;
+    if (reused && !suffix_cont) {
+        fprintf(stderr,
+                "KVMEM_TRACE prefix_rewrite drop_reuse=1 n_past=%d n_cached=%d "
+                "n_prompt=%d last_n_gen=%d slack=%u same_query=%d\n",
+                n_past, n_cached, n_prompt, st.last_n_gen, suffix_slack,
+                (int) same_query);
+        memory_clear_all(st);
+        n_past = 0;
+        reused = false;
+    }
     const uint32_t n_new_tok = (uint32_t) std::max(0, eval_end - n_past);
     const uint32_t bt = std::max(1u, st.kparams.block_tokens);
     const uint32_t need_slots = n_new_tok == 0 ? 0u : (n_new_tok + bt - 1) / bt;
     const uint32_t free_slots = llama_kvmem_free_slots();
     bool past_query = n_past > q1;
-    bool warm_skip = do_retr && reused && same_query && past_query &&
+    bool warm_skip = do_retr && reused && suffix_cont && same_query && past_query &&
             gdn_at_tip && kv_at_tip && free_slots >= need_slots;
 
     if (reused) {
         if (st.kparams.enabled) {
-            llama_kvmem_begin_cached_turn();
+            if (past_query && same_query) {
+                llama_kvmem_begin_cached_turn_keep_query();
+            } else {
+                llama_kvmem_begin_cached_turn();
+            }
             if (warm_skip) {
                 llama_kvmem_keep_selected();
             }
@@ -396,7 +424,9 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         if (st.kparams.enabled) {
             llama_kvmem_truncate_cached((uint32_t) n_past);
         }
-        if (!warm_skip && !gdn_sync_to(st, prompt, n_past, io)) {
+        // Continuation already has GDN at n_past. Catch-up from query would
+        // llama_decode at q0 while seq_pos_max is n_past-1 (M-RoPE X < Y).
+        if (!warm_skip && !past_query && !gdn_sync_to(st, prompt, n_past, io)) {
             if (io && io->aborted) {
                 return false;
             }
@@ -410,6 +440,14 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         warm_skip = false;
         past_query = false;
     }
+    // DeepSeek usage: prefix cache hit = kept LCP (n_past). Full miss if reuse
+    // was dropped (gdn_sync fail / empty cache).
+    if (n_cache_hit) {
+        *n_cache_hit = n_past < 0 ? 0 : n_past;
+        if (*n_cache_hit > n_prompt) {
+            *n_cache_hit = n_prompt;
+        }
+    }
 
     // GDN ckpt/rewind only on the first pass of this query. Continuation
     // already has GDN at n_past; replaying the decode suffix is recency, not
@@ -419,10 +457,12 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     fprintf(stderr,
             "KVMEM_TRACE prefix_reuse reused=%d n_past=%d n_prompt=%d n_cached=%d "
             "n_new=%d stored=%u query=[%d,%d) replay_fits=%d warm_skip=%d "
-            "same_query=%d gdn_rmax=%d kv_smax=%d free_slots=%u need_slots=%u\n",
+            "same_query=%d suffix_cont=%d last_n_gen=%d slack=%u "
+            "gdn_rmax=%d kv_smax=%d free_slots=%u need_slots=%u\n",
             (int) reused, n_past, n_prompt, (int) st.cached_tokens.size(),
             eval_end - n_past, llama_kvmem_store_n_tokens(),
             q0, q1, (int) replay_fits, (int) warm_skip, (int) same_query,
+            (int) suffix_cont, st.last_n_gen, suffix_slack,
             (int) gdn_rmax, (int) kv_smax, free_slots, need_slots);
 
     auto take_rc = [&](int rc) -> bool {
@@ -477,9 +517,11 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         if (ok) {
             st.last_query_begin = q0;
             st.last_query_end = q1;
+            st.last_user_text = st.turn_last_user;
         } else {
             st.last_query_begin = -1;
             st.last_query_end = -1;
+            st.last_user_text.clear();
         }
     };
 
@@ -487,6 +529,30 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         fprintf(stderr,
                 "KVMEM_TRACE query_replay_skip_same query=[%d,%d) n_past=%d n_new=%d\n",
                 q0, q1, n_past, eval_end - n_past);
+        if (!dec(n_past, eval_end, "prefill-tail")) {
+            return false;
+        }
+        if (st.spec.ctx_dft) {
+            llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+            if (md) {
+                fprintf(stderr, "KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
+                        llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+            }
+        }
+        llama_kvmem_pin_working_set();
+        note_prefill();
+        commit_last_query(true);
+        return true;
+    }
+
+    // Same last-user, query already in the prefix, but skip could not keep
+    // the window (usually gen-reserve full). Reuse the captured Q for top-k;
+    // do not llama_decode at q0 (M-RoPE requires seq_pos_max < q0).
+    if (do_retr && reused && suffix_cont && same_query && past_query) {
+        fprintf(stderr,
+                "KVMEM_TRACE query_reuse_q reselect=1 query=[%d,%d) n_past=%d n_new=%d\n",
+                q0, q1, n_past, eval_end - n_past);
+        llama_kvmem_apply_retrieval(ctx);
         if (!dec(n_past, eval_end, "prefill-tail")) {
             return false;
         }
@@ -636,18 +702,107 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     return true;
 }
 
+static std::string trim_copy(const std::string & s) {
+    size_t a = 0;
+    size_t b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\n' || s[a] == '\r' || s[a] == '\t')) {
+        ++a;
+    }
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\n' || s[b - 1] == '\r' || s[b - 1] == '\t')) {
+        --b;
+    }
+    return s.substr(a, b - a);
+}
+
+// Last ChatML user *role block* in the rendered prompt, not rfind(content).
+// Thinking/tool text can quote last_user; only <|im_start|>user ... <|im_end|>
+// counts. If last_user is set, pick the last block whose content equals it
+// (two identical user turns → the later block).
+static bool find_last_user_role_block(const std::string & prompt, const std::string & last_user,
+                                      size_t & content0, size_t & content1, int & n_blocks, int & pick) {
+    static const char * hdrs[] = {
+        "<|im_start|>user\n",
+        "<|im_start|>user\r\n",
+        "<|im_start|>user",
+    };
+    struct Blk {
+        size_t c0;
+        size_t c1;
+    };
+    std::vector<Blk> blks;
+    size_t search = 0;
+    while (search < prompt.size()) {
+        size_t best = std::string::npos;
+        size_t best_len = 0;
+        for (const char * h : hdrs) {
+            const size_t n = std::strlen(h);
+            const size_t p = prompt.find(h, search);
+            if (p == std::string::npos) {
+                continue;
+            }
+            if (best == std::string::npos || p < best || (p == best && n > best_len)) {
+                best = p;
+                best_len = n;
+            }
+        }
+        if (best == std::string::npos) {
+            break;
+        }
+        const size_t c0 = best + best_len;
+        const size_t end = prompt.find("<|im_end|>", c0);
+        if (end == std::string::npos) {
+            break;
+        }
+        blks.push_back(Blk{c0, end});
+        search = best + 1;
+    }
+    n_blocks = (int) blks.size();
+    pick = -1;
+    if (blks.empty()) {
+        return false;
+    }
+    const std::string want = trim_copy(last_user);
+    if (!want.empty()) {
+        for (int i = n_blocks - 1; i >= 0; --i) {
+            const std::string got = trim_copy(prompt.substr(blks[(size_t) i].c0,
+                    blks[(size_t) i].c1 - blks[(size_t) i].c0));
+            if (got == want) {
+                pick = i;
+                break;
+            }
+        }
+    }
+    if (pick < 0) {
+        // No exact content match (template wrapping). Do not fall back to
+        // the last user-role header: Qwen tools are often rendered as user
+        // + <tool_response>. Leave the caller to query-last fallback.
+        if (!want.empty()) {
+            return false;
+        }
+        pick = n_blocks - 1;
+    }
+    content0 = blks[(size_t) pick].c0;
+    content1 = blks[(size_t) pick].c1;
+    return content0 < content1;
+}
+
 static void derive_query_span(ServerState & st, const std::string & prompt, const std::string & last_user,
                               const std::vector<llama_token> & toks, int & qbegin, int & qend) {
     qbegin = -1;
     qend = (int) toks.size();
-    if (!last_user.empty()) {
-        const auto idx = prompt.rfind(last_user);
-        if (idx != std::string::npos) {
-            const std::string prefix = prompt.substr(0, idx);
-            const std::string through = prompt.substr(0, idx + last_user.size());
-            qbegin = (int) tokenize_text(st.vocab, prefix, true).size();
-            qend = (int) tokenize_text(st.vocab, through, true).size();
-        }
+    size_t c0 = 0;
+    size_t c1 = 0;
+    int n_blocks = 0;
+    int pick = -1;
+    if (find_last_user_role_block(prompt, last_user, c0, c1, n_blocks, pick)) {
+        const std::string prefix = prompt.substr(0, c0);
+        const std::string through = prompt.substr(0, c1);
+        qbegin = (int) tokenize_text(st.vocab, prefix, true).size();
+        qend = (int) tokenize_text(st.vocab, through, true).size();
+        fprintf(stderr,
+                "KVMEM_TRACE query_loc method=role_block n_user_blocks=%d pick=%d "
+                "span=[%zu,%zu) tokens=[%d,%d)\n",
+                n_blocks, pick, c0, c1, qbegin, qend);
     }
     if (qend > (int) toks.size()) {
         qend = (int) toks.size();
@@ -656,6 +811,8 @@ static void derive_query_span(ServerState & st, const std::string & prompt, cons
         qend = (int) toks.size();
         const int last = std::min(st.query_last_fallback, qend);
         qbegin = qend > last ? qend - last : 0;
+        fprintf(stderr, "KVMEM_TRACE query_loc method=query_last tokens=[%d,%d)\n",
+                qbegin, qend);
     }
     if (qbegin >= qend) {
         qbegin = 0;
@@ -925,21 +1082,39 @@ static json stream_choice_chunk(const std::string & cid, const json & delta, con
     };
 }
 
-static json usage_json(int n_prompt, int n_gen) {
+// DeepSeek Chat Completions usage: prompt_tokens = hit + miss.
+// Hit = reused prefix (n_past / LCP). Do not also emit OpenAI
+// prompt_tokens_details.cached_tokens — OpenCode isOverflow would
+// double-count cache.read against the context window.
+static json usage_json(int n_prompt, int n_gen, int n_cache_hit) {
+    if (n_prompt < 0) {
+        n_prompt = 0;
+    }
+    if (n_gen < 0) {
+        n_gen = 0;
+    }
+    if (n_cache_hit < 0) {
+        n_cache_hit = 0;
+    }
+    if (n_cache_hit > n_prompt) {
+        n_cache_hit = n_prompt;
+    }
     return json{
         {"prompt_tokens", n_prompt},
         {"completion_tokens", n_gen},
         {"total_tokens", n_prompt + n_gen},
+        {"prompt_cache_hit_tokens", n_cache_hit},
+        {"prompt_cache_miss_tokens", n_prompt - n_cache_hit},
     };
 }
 
 // OpenAI: last stream chunk has empty choices + usage, no finish_reason.
-static json stream_usage_chunk(const std::string & cid, int n_prompt, int n_gen) {
+static json stream_usage_chunk(const std::string & cid, int n_prompt, int n_gen, int n_cache_hit) {
     return json{
         {"id", cid},
         {"object", "chat.completion.chunk"},
         {"choices", json::array()},
-        {"usage", usage_json(n_prompt, n_gen)},
+        {"usage", usage_json(n_prompt, n_gen, n_cache_hit)},
     };
 }
 
@@ -1398,6 +1573,7 @@ int main(int argc, char ** argv) {
 
         int qbegin = cr.query_begin;
         int qend = cr.query_end;
+        st.turn_last_user = cr.last_user;
         if (qbegin < 0 || qend < 0) {
             derive_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
         }
@@ -1484,6 +1660,7 @@ int main(int argc, char ** argv) {
             };
         };
 
+        int n_cache_hit = 0;
         auto emit_json = [&](const std::string & content, int n_gen, bool hit_limit) {
             common_chat_msg msg = parse_assistant_output(content, formatted, parse_tools);
             std::vector<std::string> tc_ids;
@@ -1515,7 +1692,7 @@ int main(int argc, char ** argv) {
                     {"message", message},
                     {"finish_reason", finish},
                 }})},
-                {"usage", usage_json((int) toks.size(), n_gen)},
+                {"usage", usage_json((int) toks.size(), n_gen, n_cache_hit)},
             };
             res.set_content(out.dump(), "application/json");
         };
@@ -1541,7 +1718,8 @@ int main(int argc, char ** argv) {
                     };
                     send(stream_choice_chunk(cid, json{{"role", "assistant"}}, nullptr).dump());
                     const auto t_turn0 = std::chrono::steady_clock::now();
-                    if (!run_prefill_retrieval(st, toks, &io)) {
+                    int n_cache_hit = 0;
+                    if (!run_prefill_retrieval(st, toks, &io, &n_cache_hit)) {
                         if (!io.aborted) {
                             send(json{{"error", "prefill/retrieval failed"}}.dump());
                             sink.write("data: [DONE]\n\n", 15);
@@ -1642,7 +1820,7 @@ int main(int argc, char ** argv) {
                         emit_gen_wall((int) gen.size());
                         commit_cached(st, toks, gen);
                         send(stream_choice_chunk(cid, json::object(), finish).dump());
-                        send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size()).dump());
+                        send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit).dump());
                         sink.write("data: [DONE]\n\n", 15);
                         slot->unlock();
                         sink.done();
@@ -1666,7 +1844,7 @@ int main(int argc, char ** argv) {
                     emit_gen_wall((int) gen.size());
                     commit_cached(st, toks, gen);
                     send(stream_choice_chunk(cid, json::object(), finish).dump());
-                    send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size()).dump());
+                    send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit).dump());
                     sink.write("data: [DONE]\n\n", 15);
                     slot->unlock();
                     sink.done();
@@ -1678,7 +1856,7 @@ int main(int argc, char ** argv) {
         StreamIo io;
         io.req = &req;
         const auto t_turn0 = std::chrono::steady_clock::now();
-        if (!run_prefill_retrieval(st, toks, &io)) {
+        if (!run_prefill_retrieval(st, toks, &io, &n_cache_hit)) {
             if (io.aborted) {
                 fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill n_prompt=%d\n",
                         (int) toks.size());

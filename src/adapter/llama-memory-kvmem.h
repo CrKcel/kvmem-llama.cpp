@@ -117,12 +117,11 @@ public:
     void end_prefill_capture() { prefill_capture_ = false; }
     // Next request continues this sequence: flush decode mean, unpin
     // retrieval, harvest mean-K for the suffix. Does not wipe prefix KV.
-    void begin_cached_turn();
+    void begin_cached_turn(bool reset_query = true);
     // Same-query skip: keep the retrieved GPU window. Prefill still harvests
     // the new tail; recency pressure must not evict selected history.
     void keep_selected_window() { keep_selected_ = true; }
-    // After skip prefill: pin so decode mean-K lands in gen_reserve, not a
-    // recency reselect. Next full retrieval will mandatory-protect the suffix.
+    // After skip/reselect prefill: pin so decode mean-K uses gen_reserve.
     void pin_working_set() {
         retrieval_pinned_ = true;
         keep_selected_ = true;
