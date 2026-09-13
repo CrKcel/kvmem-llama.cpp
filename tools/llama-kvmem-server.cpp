@@ -128,7 +128,9 @@ struct ServerState {
     std::vector<llama_token> cached_tokens;
     int perf_p_eval = 0;
     std::vector<uint8_t> gdn_ckpt;
-    int gdn_ckpt_pos = -1; // last pos included in gdn_ckpt
+    int gdn_ckpt_pos = -1; // gen-start (eval_end-1); next-turn suffix rewind
+    std::vector<uint8_t> gdn_ckpt_query;
+    int gdn_ckpt_query_pos = -1; // last query-begin; fallback if LCP < gen-start
     // Last query span that actually landed query+suffix on GPU (retrieval
     // replay or a later same-query skip). -1 = nothing to skip against.
     int last_query_begin = -1;
@@ -201,18 +203,32 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
     if (rmax == want) {
         return true;
     }
-    if (st.gdn_ckpt.empty() || st.gdn_ckpt_pos < 0 || st.gdn_ckpt_pos > want) {
-        fprintf(stderr, "KVMEM_TRACE gdn_sync fail rmax=%d want=%d ckpt_pos=%d\n",
-                (int) rmax, (int) want, st.gdn_ckpt_pos);
+    const uint8_t * blob = nullptr;
+    size_t blob_n = 0;
+    int ckpt_pos = -1;
+    auto consider = [&](const std::vector<uint8_t> & buf, int pos) {
+        if (buf.empty() || pos < 0 || pos > want) {
+            return;
+        }
+        if (pos >= ckpt_pos) {
+            blob = buf.data();
+            blob_n = buf.size();
+            ckpt_pos = pos;
+        }
+    };
+    consider(st.gdn_ckpt, st.gdn_ckpt_pos);
+    consider(st.gdn_ckpt_query, st.gdn_ckpt_query_pos);
+    if (blob == nullptr) {
+        fprintf(stderr, "KVMEM_TRACE gdn_sync fail rmax=%d want=%d ckpt_pos=%d query_pos=%d\n",
+                (int) rmax, (int) want, st.gdn_ckpt_pos, st.gdn_ckpt_query_pos);
         return false;
     }
     const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    if (llama_state_seq_set_data_ext(st.ctx, st.gdn_ckpt.data(), st.gdn_ckpt.size(), 0, fl)
-            != st.gdn_ckpt.size()) {
+    if (llama_state_seq_set_data_ext(st.ctx, blob, blob_n, 0, fl) != blob_n) {
         fprintf(stderr, "GDN catch-up restore failed\n");
         return false;
     }
-    const int from = st.gdn_ckpt_pos + 1;
+    const int from = ckpt_pos + 1;
     if (from < n_past) {
         // Trunk only. MTP draft still holds [from, n_past) after seq_rm(n_past,-1);
         // spec_decode_span would llama_decode(ctx_dft) at Y=from while X=n_past-1
@@ -232,7 +248,7 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
     }
     rmax = llama_kvmem_recr_pos_max();
     fprintf(stderr, "KVMEM_TRACE gdn_sync ckpt_pos=%d from=%d n_past=%d rmax=%d\n",
-            st.gdn_ckpt_pos, from, n_past, (int) rmax);
+            ckpt_pos, from, n_past, (int) rmax);
     return rmax == want;
 }
 
@@ -260,10 +276,37 @@ static void memory_clear_all(ServerState & st) {
     st.cached_tokens.clear();
     st.gdn_ckpt.clear();
     st.gdn_ckpt_pos = -1;
+    st.gdn_ckpt_query.clear();
+    st.gdn_ckpt_query_pos = -1;
     st.last_query_begin = -1;
     st.last_query_end = -1;
     st.last_user_text.clear();
     st.last_n_gen = 0;
+}
+
+// Persist GDN after a successful prefill (eval_end-1) for the next turn's
+// suffix rewind. Intra-turn query rewind uses a local snapshot, not this slot.
+static void persist_gdn_ckpt_gen_start(ServerState & st, int eval_end) {
+    if (!st.ctx || eval_end <= 0 || !llama_kvmem_has_recurrent()) {
+        return;
+    }
+    llama_synchronize(st.ctx);
+    const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const size_t sz = llama_state_seq_get_size_ext(st.ctx, 0, fl);
+    if (sz == 0) {
+        fprintf(stderr, "KVMEM_TRACE gdn_ckpt gen_start skipped size=0 eval_end=%d\n", eval_end);
+        return;
+    }
+    std::vector<uint8_t> buf(sz);
+    if (llama_state_seq_get_data_ext(st.ctx, buf.data(), sz, 0, fl) != sz) {
+        fprintf(stderr, "KVMEM_TRACE gdn_ckpt gen_start copy failed eval_end=%d\n", eval_end);
+        return;
+    }
+    st.gdn_ckpt.swap(buf);
+    st.gdn_ckpt_pos = eval_end - 1;
+    fprintf(stderr,
+            "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu ckpt_pos=%d what=gen_start\n",
+            eval_end, sz, st.gdn_ckpt_pos);
 }
 
 static void commit_cached(ServerState & st, const std::vector<llama_token> & prompt,
@@ -542,6 +585,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         llama_kvmem_pin_working_set();
         note_prefill();
         commit_last_query(true);
+        persist_gdn_ckpt_gen_start(st, eval_end);
         return true;
     }
 
@@ -566,6 +610,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         llama_kvmem_pin_working_set();
         note_prefill();
         commit_last_query(true);
+        persist_gdn_ckpt_gen_start(st, eval_end);
         return true;
     }
 
@@ -575,6 +620,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         }
         note_prefill();
         commit_last_query(false);
+        persist_gdn_ckpt_gen_start(st, eval_end);
         return true;
     }
 
@@ -600,10 +646,11 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
             fprintf(stderr, "GDN checkpoint copy failed\n");
             return false;
         }
-        st.gdn_ckpt = gdn_ckpt;
-        st.gdn_ckpt_pos = q0 > 0 ? q0 - 1 : -1;
-        fprintf(stderr, "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu query_begin=%d ckpt_pos=%d\n",
-                q0, sz, q0, st.gdn_ckpt_pos);
+        st.gdn_ckpt_query = gdn_ckpt;
+        st.gdn_ckpt_query_pos = q0 > 0 ? q0 - 1 : -1;
+        fprintf(stderr,
+                "KVMEM_TRACE gdn_ckpt_query pos_end=%d bytes=%zu query_begin=%d ckpt_pos=%d\n",
+                q0, sz, q0, st.gdn_ckpt_query_pos);
     }
     // Query may already sit inside the reused prefix (T5: last user, then
     // assistant tool XML + role=tool). Recapture Q over the cached part
@@ -631,65 +678,82 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                 d, (int) reused, n_past, eval_end - n_past);
     }
 
-    llama_kvmem_apply_retrieval(ctx);
-    if (!replay_fits) {
-        fprintf(stderr,
-                "KVMEM_TRACE query_replay_skip query=[%d,%d) eval_end=%d "
-                "(sink+suffix exceeds GPU budget)\n",
-                q0, q1, eval_end);
-    } else {
-        if (recr_ckpt && !gdn_ckpt.empty()) {
-            const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-            if (llama_state_seq_set_data_ext(ctx, gdn_ckpt.data(), gdn_ckpt.size(), 0, fl) != gdn_ckpt.size()) {
-                fprintf(stderr, "GDN restore failed\n");
-                return false;
-            }
-            fprintf(stderr, "KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
-        }
-        llama_memory_t mem = llama_get_memory(ctx);
-        if (mem) {
-            fprintf(stderr, "KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",
-                    llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
-                    q0, q1);
-            llama_memory_seq_rm(mem, 0, q0, q1);
-            fprintf(stderr, "KVMEM_TRACE after_seq_rm seq_pos=[%d,%d] auto_pos0=%d\n",
-                    llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
-                    llama_memory_seq_pos_max(mem, 0) + 1);
-        }
-        if (st.spec.ctx_dft && !past_query) {
-            llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
-            if (md) {
-                llama_memory_seq_rm(md, 0, q0, q1);
-                fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
-                        llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
-            }
-        }
-        if (!replay(q0, q1, "query replay")) {
-            return false;
-        }
-        llama_synchronize(ctx);
-        fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
-                q0, q1 - q0, (int) recr_ckpt);
-        if (st.spec.ctx_dft && !past_query) {
-            // First pass of this query: seq_rm left a hole in the draft cache.
-            // M-RoPE cannot fill it while a suffix remains, so drop [q0, inf)
-            // and append in order up to q1. Continuation keeps draft suffix.
-            llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
-            if (md) {
-                llama_memory_seq_rm(md, 0, q0, -1);
-            }
-            if (q1 > q0) {
-                const int rc = decode_span(st.spec.ctx_dft, prompt.data(), q0, q1, st.n_batch,
-                                           "mtp-resync", io);
-                if (!take_rc(rc)) {
+    const int tail0 = std::max(n_past, q1);
+    const uint32_t tail_tok = (uint32_t) std::max(0, eval_end - tail0);
+    const uint32_t gen_res = std::max(1u, st.kparams.gen_reserve);
+    const bool tail_fits_gen = tail_tok <= gen_res;
+
+    if (tail_fits_gen) {
+        llama_kvmem_apply_retrieval(ctx);
+        if (!replay_fits) {
+            fprintf(stderr,
+                    "KVMEM_TRACE query_replay_skip query=[%d,%d) eval_end=%d "
+                    "(sink+suffix exceeds GPU budget)\n",
+                    q0, q1, eval_end);
+        } else {
+            if (recr_ckpt && !gdn_ckpt.empty()) {
+                const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+                if (llama_state_seq_set_data_ext(ctx, gdn_ckpt.data(), gdn_ckpt.size(), 0, fl) != gdn_ckpt.size()) {
+                    fprintf(stderr, "GDN restore failed\n");
                     return false;
                 }
-                fprintf(stderr, "KVMEM_TRACE mtp_resync query=[%d,%d) to=%d\n", q0, q1, q1);
+                fprintf(stderr, "KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
+            }
+            llama_memory_t mem = llama_get_memory(ctx);
+            if (mem) {
+                fprintf(stderr, "KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",
+                        llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
+                        q0, q1);
+                llama_memory_seq_rm(mem, 0, q0, q1);
+                fprintf(stderr, "KVMEM_TRACE after_seq_rm seq_pos=[%d,%d] auto_pos0=%d\n",
+                        llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
+                        llama_memory_seq_pos_max(mem, 0) + 1);
+            }
+            if (st.spec.ctx_dft && !past_query) {
+                llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+                if (md) {
+                    llama_memory_seq_rm(md, 0, q0, q1);
+                    fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
+                            llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
+                }
+            }
+            if (!replay(q0, q1, "query replay")) {
+                return false;
+            }
+            llama_synchronize(ctx);
+            fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
+                    q0, q1 - q0, (int) recr_ckpt);
+            if (st.spec.ctx_dft && !past_query) {
+                // First pass of this query: seq_rm left a hole in the draft cache.
+                // M-RoPE cannot fill it while a suffix remains, so drop [q0, inf)
+                // and append in order up to q1. Continuation keeps draft suffix.
+                llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
+                if (md) {
+                    llama_memory_seq_rm(md, 0, q0, -1);
+                }
+                if (q1 > q0) {
+                    const int rc = decode_span(st.spec.ctx_dft, prompt.data(), q0, q1, st.n_batch,
+                                               "mtp-resync", io);
+                    if (!take_rc(rc)) {
+                        return false;
+                    }
+                    fprintf(stderr, "KVMEM_TRACE mtp_resync query=[%d,%d) to=%d\n", q0, q1, q1);
+                }
             }
         }
-    }
-    if (!dec(std::max(n_past, q1), eval_end, "prefill-tail")) {
-        return false;
+        if (!dec(tail0, eval_end, "prefill-tail")) {
+            return false;
+        }
+    } else {
+        // Compact / long history after last-user: tail is not this turn's
+        // decode slack. Prefill with spill, then retrieve.
+        fprintf(stderr,
+                "KVMEM_TRACE prefill_tail_offload n=%u gen_reserve=%u query=[%d,%d)\n",
+                tail_tok, gen_res, q0, q1);
+        if (!dec(tail0, eval_end, "prefill-tail")) {
+            return false;
+        }
+        llama_kvmem_apply_retrieval(ctx);
     }
     if (st.spec.ctx_dft) {
         llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
@@ -699,6 +763,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         }
     }
     commit_last_query(true);
+    persist_gdn_ckpt_gen_start(st, eval_end);
     return true;
 }
 

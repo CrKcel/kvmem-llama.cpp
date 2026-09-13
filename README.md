@@ -3,7 +3,7 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.12.1`](docs/milestones/v0.12.1.md)** (2026-09-10).
+**Current local milestone: [`v0.12.2`](docs/milestones/v0.12.2.md)** (2026-09-13).
 GPU KV default **q8_0**. Orig-pos cells; restore is packed GPU K/V memcpy
 (no unrotated raw-K on the product path). Retrieval uses pre-RoPE mean-K
 (prefill write + decode running sum after pin). Full blocks copy packed
@@ -11,13 +11,15 @@ K/V to host asynchronously during prefill. `llama-kvmem-server` reuses
 the GPU prefix across requests; same last-user tool rounds **skip**
 retrieval/query-replay and only prefill `n_new`. Compact/rewrite that
 leaves LCP far short of the previous cache **drops reuse** and does a
-full retrieval. Query span is the last ChatML user role block matching
-last-user text. Stream `usage` includes DeepSeek `prompt_cache_hit_tokens`
-/ `prompt_cache_miss_tokens`. Decode/tool tokens after the query are
-**recency** (`--kvmem-recent-tokens`, default 0), not GPU-mandatory.
-`--kvmem` is retrieval + query-last 64. MTP remains optional (default
-**none**). 0.8B `server_smoke` T1–T5 GO. P6 is not started. Phase D
-`state_write` is not in this tag.
+full retrieval. If the post-query tail is longer than gen-reserve, prefill
+that tail with offload then retrieve. Query span is the last ChatML user
+role block matching last-user text. Persistent GDN snapshot is at
+**prefill end / gen-start**, not last query. Stream `usage` includes
+DeepSeek `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+Decode/tool tokens after the query are **recency** (`--kvmem-recent-tokens`,
+default 0), not GPU-mandatory. `--kvmem` is retrieval + query-last 64.
+MTP remains optional (default **none**). 0.8B `server_smoke` T1–T5 GO.
+P6 is not started. Phase D `state_write` is not in this tag.
 
 ## Layout
 
@@ -39,11 +41,11 @@ last-user text. Stream `usage` includes DeepSeek `prompt_cache_hit_tokens`
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.12.1` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.12.2` is the pin plus patches; run apply-patches
 before building.
 
 ```bash
-git checkout v0.12.1
+git checkout v0.12.2
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh
@@ -77,14 +79,14 @@ python3 scripts/server_smoke.py
 | nvidia-smi index | Card | VRAM | Use |
 |---|---|---|---|
 | 0 | RTX 5050 Laptop | 8 GiB | every model **below 27B** |
-| 1 | RTX 5090 Laptop | 24 GiB | **27B only** |
+| 1 | RTX 5090 Laptop (24 GiB) or RTX 5060 Ti (16 GiB) | **27B only** |
 
-CUDA's default device order is FASTEST_FIRST, so CUDA device 0 is the **5090**.
-`scripts/gpu.sh` sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` and binds the 5050/5090 by UUID.
+CUDA's default device order is FASTEST_FIRST unless `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+`scripts/gpu.sh` binds by UUID. Never put 27B on the 5050.
 
 ```bash
-source scripts/gpu.sh small   # CUDA_VISIBLE_DEVICES=0
-source scripts/gpu.sh 27b     # CUDA_VISIBLE_DEVICES=1
+source scripts/gpu.sh small   # 5050
+source scripts/gpu.sh 27b     # 5090 if present, else 5060 Ti
 ```
 
 ## Test models (Unsloth, ModelScope only)

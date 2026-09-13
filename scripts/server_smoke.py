@@ -256,6 +256,58 @@ def main() -> int:
             raise SystemExit("compact rewrite missed the needle")
         print("PASS: compact rewrite drops skip/reuse_q and still recalls")
 
+        mark_tail = log_path.read_text()
+        tail_tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup_code",
+                "description": "Look up a secret code",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            },
+        }]
+        st, body = post_json(base + "/v1/chat/completions", {
+            "messages": [
+                {"role": "user", "content": "What is the secret code?"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_tail",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_code",
+                            "arguments": "{\"q\":\"secret\"}",
+                        },
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_tail",
+                 "content": NEEDLE + "\n" + filler},
+            ],
+            "tools": tail_tools,
+            "tool_choice": "none",
+            "max_tokens": 48,
+            "temperature": 0,
+            "stream": False,
+        }, timeout=180)
+        if st != 200:
+            raise SystemExit(f"long-tail-after-query chat failed {st}: {body}")
+        logf.flush()
+        err_tail = log_path.read_text()[len(mark_tail):]
+        if "llama_decode(prefill-tail) failed" in err_tail or "no free GPU slot" in err_tail:
+            raise SystemExit("long tail after query exhausted GPU slots:\n" + err_tail[-2000:])
+        off_ln = [ln for ln in err_tail.splitlines() if "prefill_tail_offload" in ln]
+        if not off_ln:
+            raise SystemExit("expected prefill_tail_offload (query mid-prompt, tail > gen-reserve)")
+        print("  ", off_ln[-1])
+        tail_text = json.loads(body)["choices"][0]["message"]["content"]
+        print("long-tail output:", tail_text[:200].replace("\n", " "))
+        if "BLUEBIRD-42" not in tail_text:
+            raise SystemExit("long tail after query missed the needle")
+        print("PASS: query-mid long tail prefills with offload")
+
         mark_t1 = log_path.read_text()
         tools_body = {
             "messages": [
