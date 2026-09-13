@@ -29,6 +29,9 @@ ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
     if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "q4") == 0) {
         return GGML_TYPE_Q4_0;
     }
+    if (std::strcmp(s, "q5_0") == 0 || std::strcmp(s, "q5") == 0) {
+        return GGML_TYPE_Q5_0;
+    }
     if (ok) {
         *ok = false;
     }
@@ -72,6 +75,9 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     p.n_outputs_max_per_seq = p.n_outputs_max;
     p.cache_type_k = opts.type_k;
     p.cache_type_v = opts.type_v;
+    // The speculative conversion reads the draft cache types, not the base types.
+    p.speculative.draft.cache_type_k = opts.draft_type == GGML_TYPE_COUNT ? opts.type_k : opts.draft_type;
+    p.speculative.draft.cache_type_v = opts.draft_type == GGML_TYPE_COUNT ? opts.type_v : opts.draft_type;
 
     common_params p_dft = common_base_params_to_speculative(p);
     sess.init = common_speculative_init_from_params(p_dft, model_tgt, ctx_tgt);

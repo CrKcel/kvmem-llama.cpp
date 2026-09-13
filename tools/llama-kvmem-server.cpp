@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
+#include "kvmem-chat-sampling.h"
 
 #include "chat.h"
 #include "common.h"
@@ -18,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,16 @@ static void print_usage(const char * argv0) {
             "  -n, --n-predict N          default max_tokens (default 128)\n"
             "  -b, --batch-size N         logical batch (default 512)\n"
             "  -ngl, --n-gpu-layers N     GPU layers (default 99)\n"
+            "  Sampling defaults: Qwen3.8-27B Thinking / non-Thinking, selected per request.\n"
+            "  --temp, --temperature T    temperature [0,2] (1.0 / 0.7); 0 = greedy\n"
+            "  --top-p P                  nucleus threshold [0,1] (0.95 / 0.80)\n"
+            "  --top-k K                  integer >= 0; 0 disables (20)\n"
+            "  --min-p P                  minimum relative probability [0,1] (0)\n"
+            "  --presence-penalty P       presence penalty [-2,2] (0 / 1.5)\n"
+            "  --frequency-penalty P      frequency penalty [-2,2] (0)\n"
+            "  --repeat-penalty P         repetition penalty > 0 (1); --repetition-penalty alias\n"
+            "  --seed N                   uint32 seed (default random)\n"
+            "                            request fields override these process defaults\n"
             "  --kvmem / --no-kvmem       enable KVMem (default on)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx\n"
             "  --kvmem-block-tokens N     block size (default 32)\n"
@@ -55,10 +67,11 @@ static void print_usage(const char * argv0) {
             "  --kvmem-nvme-dir PATH      NVMe directory (default /tmp/kvmem_nvme)\n"
             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
-            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | q8_0 | q4_0 (default q8_0)\n"
+            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (must match K when quantized)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
+            "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
             "  --enable-thinking          Qwen thinking on (default off; request can override)\n"
@@ -113,12 +126,14 @@ struct ServerState {
     llama_kvmem_params kparams {};
     int n_batch = 512;
     int n_predict_default = 128;
+    json sampling_overrides = json::object();
     int query_last_fallback = 64;
     int query_max_tokens = 512;
     std::string model_name = "kvmem";
     kvmem_spec_session spec;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
+    ggml_type spec_cache_type = GGML_TYPE_COUNT;
     bool spec_mtp = false;
     int spec_n_max = 2;
     float spec_p_min = 0.0f;
@@ -905,7 +920,7 @@ struct ChatRequest {
     std::vector<std::string> stop;
     std::string last_user;
     int max_tokens = 128;
-    float temperature = 0.0f;
+    common_params_sampling sampling;
     bool stream = false;
     int query_begin = -1;
     int query_end = -1;
@@ -938,20 +953,10 @@ static const char * grammar_type_cstr(common_grammar_type t) {
 
 static common_params_sampling make_chat_sampling(
         const llama_vocab * vocab,
-        float temp,
         const common_chat_params & chat,
         const ChatRequest & cr) {
-    common_params_sampling sp;
-    if (temp <= 0.0f) {
-        sp.temp = 0.0f;
-        sp.min_p = 0.0f;
-        sp.top_p = 1.0f;
-        sp.top_k = 0;
-        sp.penalty_repeat = 1.0f;
-        sp.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
-    } else {
-        sp.temp = temp;
-    }
+    common_params_sampling sp = cr.sampling;
+    kvmem_chat_sampling_normalize(sp);
     std::string g = chat.grammar.empty() ? cr.grammar : chat.grammar;
     if (!g.empty()) {
         common_grammar_type ty = COMMON_GRAMMAR_TYPE_USER;
@@ -1197,6 +1202,10 @@ static bool strip_stop(std::string & content, const std::vector<std::string> & s
 }
 
 static bool parse_chat_request(const json & body, ChatRequest & out, std::string & err) {
+    if (!body.is_object()) {
+        err = "request must be a JSON object";
+        return false;
+    }
     if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty()) {
         err = "messages array required";
         return false;
@@ -1290,7 +1299,6 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
     } else if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()) {
         out.max_tokens = body["max_completion_tokens"].get<int>();
     }
-    out.temperature = body.value("temperature", 0.0f);
     out.stream = body.value("stream", false);
     if (body.contains("kvmem") && body["kvmem"].is_object()) {
         const auto & k = body["kvmem"];
@@ -1389,6 +1397,24 @@ int main(int argc, char ** argv) {
             st.n_batch = std::atoi(need(arg));
         } else if (eq(arg, "-ngl") || eq(arg, "--n-gpu-layers")) {
             ngl = std::atoi(need(arg));
+        } else if (!kvmem_chat_sampling_cli_key(arg).empty()) {
+            const auto key = kvmem_chat_sampling_cli_key(arg);
+            const char * value = need(arg);
+            std::string err;
+            try {
+                auto parsed = json::parse(value);
+                if (!parsed.is_number()) {
+                    throw std::runtime_error("expected a number");
+                }
+                auto sp = kvmem_chat_sampling_defaults(true);
+                if (!kvmem_chat_sampling_override(json{{key, parsed}}, sp, err)) {
+                    throw std::runtime_error(err);
+                }
+                st.sampling_overrides[key] = parsed;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "invalid %s: %s\n", arg, e.what());
+                return 1;
+            }
         } else if (eq(arg, "--kvmem")) {
             st.kparams.enabled = true;
         } else if (eq(arg, "--no-kvmem")) {
@@ -1448,6 +1474,13 @@ int main(int argc, char ** argv) {
             } else {
                 st.cache_type_k = t;
                 st.cache_type_v = t;
+            }
+        } else if (eq(arg, "--spec-kv-dtype")) {
+            bool ok = false;
+            st.spec_cache_type = kvmem_parse_cache_type(need(arg), &ok);
+            if (!ok) {
+                fprintf(stderr, "unsupported MTP cache type (want f16|q8_0|q5_0|q4_0|f32)\n");
+                return 1;
             }
         } else if (eq(arg, "--spec-type")) {
             const char * t = need(arg);
@@ -1551,6 +1584,7 @@ int main(int argc, char ** argv) {
         sopts.kvmem_enabled = st.kparams.enabled;
         sopts.type_k = st.cache_type_k;
         sopts.type_v = st.cache_type_v;
+        sopts.draft_type = st.spec_cache_type;
         if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
             return 1;
         }
@@ -1596,6 +1630,14 @@ int main(int argc, char ** argv) {
         cr.reasoning_budget_message = st.reasoning_budget_message;
         std::string err;
         if (!parse_chat_request(body, cr, err)) {
+            res.status = 400;
+            res.set_content(json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+
+        cr.sampling = kvmem_chat_sampling_defaults(cr.enable_thinking);
+        if (!kvmem_chat_sampling_override(st.sampling_overrides, cr.sampling, err) ||
+            !kvmem_chat_sampling_override(body, cr.sampling, err)) {
             res.status = 400;
             res.set_content(json{{"error", err}}.dump(), "application/json");
             return;
@@ -1678,7 +1720,12 @@ int main(int argc, char ** argv) {
         llama_context * ctx = st.ctx;
         const llama_vocab * vocab = st.vocab;
 
-        common_params_sampling sparams = make_chat_sampling(vocab, cr.temperature, formatted, cr);
+        common_params_sampling sparams = make_chat_sampling(vocab, formatted, cr);
+        fprintf(stderr,
+                "KVMEM_TRACE sampling thinking=%d temperature=%.6g top_p=%.6g top_k=%d min_p=%.6g "
+                "presence_penalty=%.6g frequency_penalty=%.6g repetition_penalty=%.6g seed=%u\n",
+                (int) cr.enable_thinking, sparams.temp, sparams.top_p, sparams.top_k, sparams.min_p,
+                sparams.penalty_present, sparams.penalty_freq, sparams.penalty_repeat, sparams.seed);
         std::vector<std::string> stops = cr.stop;
         stops.insert(stops.end(), formatted.additional_stops.begin(), formatted.additional_stops.end());
         fprintf(stderr,

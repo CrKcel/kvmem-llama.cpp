@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Start IQ3 llama-kvmem-server detached from the caller (Grok session, ssh, etc.).
-# Qwen3.8-27B Thinking sampling defaults below; request fields can override them.
+# Start IQ4_XS + Q4_0 MTP with target Q5 KV / MTP F16 KV on the RTX 5060 Ti.
+# Server selects Qwen3.8 sampling defaults per request: Thinking temp=1/top_p=.95/
+# top_k=20/min_p=0/presence=0/repeat=1; request fields can override these defaults.
 # setsid -f puts it in a new session so a parent SIGKILL does not take it down.
 # Kill only by PID (pidfile or :18200 listener). Never pkill -f.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-PIDFILE="$ROOT/logs/iq3_18200.pid"
-STDOUT="$ROOT/logs/opencode_kvmem_iq3_256k.stdout.log"
-STDERR="$ROOT/logs/opencode_kvmem_iq3_256k.stderr.log"
+PIDFILE="$ROOT/logs/iq4_18200.pid"
+STDOUT="$ROOT/logs/opencode_kvmem_iq4_256k.stdout.log"
+STDERR="$ROOT/logs/opencode_kvmem_iq4_256k.stderr.log"
 BIN="$ROOT/build/bin/llama-kvmem-server"
-MODEL="$ROOT/models/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
+MODEL="$ROOT/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf"
 PORT=18200
 RESTART=0
 [[ "${1:-}" == "--restart" ]] && RESTART=1
@@ -30,7 +31,7 @@ listener_pid() {
 }
 
 health_ok() {
-    curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
+    curl --noproxy '*' -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
 }
 
 alive_pid() {
@@ -83,7 +84,7 @@ ts="$(date +%Y%m%d_%H%M%S)"
 [[ -f "$STDOUT" ]] && mv "$STDOUT" "${STDOUT}.${ts}"
 
 # shellcheck disable=SC1091
-source "$ROOT/scripts/gpu.sh" 27b
+source "$ROOT/scripts/gpu.sh" 5060ti
 export LD_LIBRARY_PATH="/home/leye/kvmem_qw3/.cu13-env/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 setsid -f "$BIN" \
@@ -91,12 +92,10 @@ setsid -f "$BIN" \
     --host 127.0.0.1 --port "$PORT" \
     -c 262144 -n 16000 -b 512 -ngl 99 \
     --kvmem --kvmem-method retrieval \
-    --kvmem-budget 40000 --kvmem-gen-reserve 16000 \
-    --kvmem-block-tokens 128 --kv-dtype q8_0 \
-    --spec-type draft-mtp --spec-draft-n-max 2 \
+    --kvmem-budget 32000 --kvmem-gen-reserve 12000 \
+    --kvmem-block-tokens 128 --kv-dtype q5_0 \
+    --spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16 \
     --enable-thinking --reasoning-budget 4096 \
-    --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
-    --presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0 \
     > "$STDOUT" 2> "$STDERR" < /dev/null
 
 ok=0

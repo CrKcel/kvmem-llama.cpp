@@ -24,12 +24,13 @@ struct kvmem_spec_opts {
     std::string draft_model; // optional sidecar GGUF; empty = welded nextn
     ggml_type type_k = GGML_TYPE_Q8_0;
     ggml_type type_v = GGML_TYPE_Q8_0;
+    ggml_type draft_type = GGML_TYPE_COUNT; // inherit target K/V types unless overridden
 };
 
-// llama.cpp cache types that CUDA FA supports without GGML_CUDA_FA_ALL_QUANTS:
-// f16, q8_0, q4_0 (K and V must match when quantized). Also f32.
+// Supported cache types: f16, f32, q8_0, q5_0, q4_0.
+// q5_0 requires GGML_CUDA_FA_ALL_QUANTS (enabled by this project's build).
 ggml_type kvmem_parse_cache_type(const char * s, bool * ok);
-// False if quantized K/V differ (default CUDA FA has no mixed-type kernels).
+// Quantized K/V must match in the supported configurations.
 bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v);
 
 struct kvmem_spec_session {

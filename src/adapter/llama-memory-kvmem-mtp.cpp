@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 static uint8_t * kvmem_mtp_cuda_ptr(ggml_tensor * t) {
@@ -50,11 +51,12 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     }
     n_layer_trunk_ = model.hparams.n_layer();
     il_graph_ = n_layer_trunk_;
-    n_embd_k_ = target_->n_embd_k();
-    n_embd_v_ = target_->n_embd_v();
-    type_k_ = target_->type_k();
-    type_v_ = target_->type_v();
-    v_trans_ = target_->v_trans();
+    // Only slots follow the target. Byte layout follows the draft cache.
+    n_embd_k_ = model.hparams.n_embd_k_gqa(il_graph_);
+    n_embd_v_ = model.hparams.n_embd_v_gqa(il_graph_);
+    type_k_ = params.type_k;
+    type_v_ = params.type_v;
+    v_trans_ = !cparams.flash_attn;
     rope_ = target_->rope();
 
     const uint32_t n_layer = n_layer_trunk_;
@@ -64,9 +66,9 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     kv_ = std::make_unique<llama_kv_cache>(
             model,
             model.hparams,
-            params.type_k,
-            params.type_v,
-            !cparams.flash_attn,
+            type_k_,
+            type_v_,
+            v_trans_,
             cparams.offload_kqv,
             /* unified */ true,
             kv_size_,
@@ -80,11 +82,20 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
             nullptr,
             "kvmem-mtp");
 
+    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
+    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const ggml_tensor * kt = kv_->get_k_storage(il_graph_);
+    const ggml_tensor * vt = kv_->get_v_storage(il_graph_);
+    if (!kt || !vt || kt->type != type_k_ || vt->type != type_v_ ||
+            kt->ne[0] != n_embd_k_ || kt->ne[1] != kv_size_ || kt->nb[1] != krow ||
+            (!v_trans_ && (vt->ne[0] != n_embd_v_ || vt->ne[1] != kv_size_ || vt->nb[1] != vrow))) {
+        throw std::runtime_error("KVMem MTP cache layout does not match packed K/V transfers");
+    }
+
     kvmem::RawKvStoreConfig rcfg;
     rcfg.n_layer = std::max(1u, model.hparams.n_layer_nextn);
-    const uint32_t il_mtp = n_layer;
-    rcfg.n_embd_k = model.hparams.n_embd_k_gqa(il_mtp);
-    rcfg.n_embd_v = model.hparams.n_embd_v_gqa(il_mtp);
+    rcfg.n_embd_k = n_embd_k_;
+    rcfg.n_embd_v = n_embd_v_;
     rcfg.block_tokens = block_tokens_;
     if (ggml_is_quantized(type_k_)) {
         rcfg.k_row_bytes = ggml_row_size(type_k_, n_embd_k_);
@@ -114,8 +125,10 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     }
     const uint32_t n_layers = (uint32_t) kv_->get_layer_ids().size();
     fprintf(stderr,
-            "KVMEM_TRACE mtp_pool cells=%u target_cells=%u n_ctx=%u bytes=%zu layers=%u block_tokens=%u\n",
-            kv_size_, target_->kv_size(), cparams.n_ctx, bytes, n_layers, block_tokens_);
+            "KVMEM_TRACE mtp_pool cells=%u target_cells=%u n_ctx=%u bytes=%zu layers=%u block_tokens=%u"
+            " type_k=%s type_v=%s k_row_bytes=%zu v_row_bytes=%zu v_trans=%d\n",
+            kv_size_, target_->kv_size(), cparams.n_ctx, bytes, n_layers, block_tokens_,
+            ggml_type_name(kt->type), ggml_type_name(vt->type), krow, vrow, (int) v_trans_);
     LLAMA_LOG_INFO(
             "%s: KVMem MTP follower cells=%u target_cells=%u n_ctx=%u bytes=%.2f MiB layers=%u\n",
             __func__, kv_size_, target_->kv_size(), cparams.n_ctx,

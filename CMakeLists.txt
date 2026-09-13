@@ -20,6 +20,11 @@ if (KVMEM_BUILD_LLAMA)
     endif()
 
     option(GGML_CUDA "ggml: use CUDA" ON)
+    # Default llama.cpp FA vec kernels are only F16/Q4_0/Q8_0/BF16. q5_0 KV
+    # (and q4_1/q5_1) need this or FlashAttention refuses those types and
+    # Qwen3.8 hybrid prefill collapses (~75 t/s vs ~500).
+    set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL
+        "compile all FlashAttention KV quants (needed for --kv-dtype q5_0)" FORCE)
     set(LLAMA_KVMEM ON CACHE BOOL "" FORCE)
     set(LLAMA_KVMEM_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "" FORCE)
     set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -48,4 +53,11 @@ if (KVMEM_BUILD_LLAMA)
         llama.cpp/vendor/cpp-httplib)
     target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib)
     target_compile_features(llama-kvmem-server PRIVATE cxx_std_17)
+
+    # Run manually with an MTP GGUF path; no model is downloaded by CTest.
+    add_executable(kvmem-mtp-kv-test tests/mtp-kv-test.cpp tools/kvmem-spec.cpp)
+    target_include_directories(kvmem-mtp-kv-test PRIVATE src/adapter tools llama.cpp/src)
+    target_link_libraries(kvmem-mtp-kv-test PRIVATE llama llama-common kvmem)
+    add_test(NAME kvmem-mtp-kv-test COMMAND kvmem-mtp-kv-test)
+    set_tests_properties(kvmem-mtp-kv-test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
