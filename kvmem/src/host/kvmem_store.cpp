@@ -874,6 +874,19 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids,
     return plan;
 }
 
+bool KvMemStore::commit_resident_selection(const std::vector<uint32_t> & selected_ids) {
+    std::vector<uint32_t> resident;
+    for (const auto & b : blocks_) {
+        if (b.gpu_slot >= 0 && b.n_tokens) {
+            if (b.tier != KvTier::GPU || b.in_flight) return false;
+            resident.push_back(b.block_id);
+        }
+    }
+    if (resident != selected_ids) return false;
+    for (auto & b : blocks_) b.in_working_set = b.gpu_slot >= 0 && b.n_tokens > 0;
+    return true;
+}
+
 void KvMemStore::clear_working_set() {
     for (auto &b : blocks_) {
         b.in_working_set = false;

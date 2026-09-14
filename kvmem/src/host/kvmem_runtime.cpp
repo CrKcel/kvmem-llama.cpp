@@ -95,11 +95,25 @@ std::vector<KvMemDroppedBlock> KvMemRuntime::truncate_to(uint32_t token_pos) {
 
 KvMemPlan KvMemRuntime::prepare_reselect(
         const std::vector<uint32_t> &mandatory, bool force_raw_refresh) {
-    last_plan_ = store_.set_selection(store_.pick_topk_blocks(mandatory),
-                                      force_raw_refresh);
+    return prepare_selection(preview_reselect(mandatory), force_raw_refresh);
+}
+
+std::vector<uint32_t> KvMemRuntime::preview_reselect(const std::vector<uint32_t> & mandatory) const {
+    return store_.pick_topk_blocks(mandatory);
+}
+
+KvMemPlan KvMemRuntime::prepare_selection(const std::vector<uint32_t> & selected, bool force_raw_refresh) {
+    last_plan_ = store_.set_selection(selected, force_raw_refresh);
     pending_ = true;
     start_prefetch();
     return last_plan_;
+}
+
+bool KvMemRuntime::commit_resident_selection(const std::vector<uint32_t> & selected) {
+    if (pending_ || !store_.commit_resident_selection(selected)) return false;
+    last_plan_ = {};
+    for (uint32_t id : selected) last_plan_.total_window_tokens += store_.blocks()[id].n_tokens;
+    return true;
 }
 
 KvMemPlan KvMemRuntime::prepare_prefill_pressure(

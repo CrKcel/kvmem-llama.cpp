@@ -10,6 +10,8 @@
 #include <vector>
 
 struct server_tokens;
+struct common_chat_msg_delimiters;
+struct common_chat_msg_spans;
 
 // Native media chunks and prefix matching, with a row view for the existing sampler.
 class kvmem_prompt {
@@ -23,6 +25,8 @@ public:
     size_t media_end(size_t row) const;
     const mtmd_input_chunk * chunk(size_t row) const;
     std::vector<std::pair<uint32_t, uint32_t>> media_ranges() const;
+    common_chat_msg_spans message_spans(const common_chat_msg_delimiters & delimiters) const;
+    std::vector<std::pair<uint32_t, std::string>> media_identity() const;
     std::shared_ptr<kvmem_prompt> with_generated(const std::vector<llama_token> & gen) const;
     std::shared_ptr<kvmem_prompt> prefix(size_t rows) const;
 private:

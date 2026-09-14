@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -17,6 +18,9 @@ struct test_spec_session : kvmem_spec_session {
 };
 
 struct kvmem_transfer_test_access {
+    static bool complete(const llama_memory_kvmem & mem, uint32_t id, const llama_kv_cache * cache) {
+        return mem.gpu_kv_complete(id, cache);
+    }
     static void save(llama_memory_kvmem & mem, uint32_t id) { mem.harvest_gpu_v(id); }
     static void flush(llama_memory_kvmem & mem) { mem.harvest_gpu_v_commit(); }
     static void restore(llama_memory_kvmem & mem, uint32_t id) { mem.write_block_to_gpu(id); }
@@ -67,6 +71,11 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type) {
     llama_kv_cache::slot_info_vec_t slots;
     require(mtp.target()->prepare_ubatches({ub}, nt, slots), "visual row slot preparation failed");
     for (uint32_t id = 0; id < 3; ++id) mtp.occupy_block(id);
+    require(kvmem_transfer_test_access::complete(*mtp.target(), 0, kv), "complete visual draft block was rejected");
+    require(mtp.remove_logical(11, 12), "cannot create a middle-row coverage gap");
+    require(!kvmem_transfer_test_access::complete(*mtp.target(), 0, kv), "middle-row draft gap was missed");
+    mtp.occupy_block(0);
+    require(kvmem_transfer_test_access::complete(*mtp.target(), 2, kv), "partial visual block was rejected");
 
     std::vector<uint8_t> original[2];
     for (int i = 0; i < 2; ++i) {
@@ -141,6 +150,20 @@ static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type) {
         tensors.push_back(kv->get_v_storage(il));
     }
     for (uint32_t id = 0; id < 3; ++id) mem.occupy_in(kv, id);
+    require(kvmem_transfer_test_access::complete(mem, 0, kv), "complete target block was rejected");
+    require(kv->seq_rm_logical(0, 11, 12), "cannot create target coverage gap");
+    require(!kvmem_transfer_test_access::complete(mem, 0, kv), "middle-row target gap was missed");
+    mem.occupy_in(kv, 0);
+    llama_kvmem_turn_spans spans;
+    spans.query = {{10, 20}, {30, 32}};
+    spans.mandatory = {{0, 64}};
+    spans.replay_begin = 0;
+    mem.set_turn_spans(spans);
+    require(mem.query_contains(10) && mem.query_contains(31) && !mem.query_contains(25), "query spans were conflated with mandatory rows");
+    mem.freeze_query(true);
+    require(!mem.query_contains(10), "frozen Q can still accumulate");
+    mem.freeze_query(false);
+    mem.set_query_span(-1, -1);
     for (auto * tensor : tensors) {
         original.push_back(pattern(ggml_nbytes(tensor), 123 + tensors.size()));
         ggml_backend_tensor_set(tensor, original.back().data(), 0, original.back().size());
@@ -250,6 +273,125 @@ static void check_batch_inputs(llama_model * model) {
     std::puts("PASS visual batch split: logical rows, M-RoPE, separate hidden input");
 }
 
+static void check_replay_logits(llama_model * model, ggml_type type) {
+    llama_kvmem_params kp{};
+    kp.enabled = true;
+    kp.method = 1;
+    kp.block_tokens = 32;
+    kp.budget = 1024;
+    kp.gen_reserve = 256;
+    kp.query_begin = kp.query_end = kp.force_pos = -1;
+    llama_kvmem_set_params(&kp);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 2048;
+    cp.n_batch = cp.n_ubatch = 128;
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = 2;
+    cp.type_k = cp.type_v = type;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
+    require(bool(ctx), "logits test context init failed");
+    std::string text = "<|im_start|>user\n";
+    for (int i = 0; i < 24; ++i) text += "The secret code is 7391. Keep this number in memory.\n";
+    text += "What is the secret code? Reply with its four digits.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    auto tokens = common_tokenize(llama_model_get_vocab(model), text, true, true);
+    const int end = tokens.size(), query = end - 24;
+    require(query > 0 && end < 1024, "unexpected logits fixture length");
+    llama_kvmem_set_request_span(query, end, -1);
+    llama_kvmem_set_turn_spans({{{query, end}}, {{query, end}}, query});
+    auto decode = [&](int begin, int stop) {
+        for (int row = begin; row < stop;) {
+            const int n = std::min(128, stop - row);
+            auto batch = llama_batch_get_one(tokens.data() + row, n);
+            std::vector<llama_pos> pos(n);
+            for (int i = 0; i < n; ++i) pos[i] = row + i;
+            batch.pos = batch.logical_pos = pos.data();
+            require(llama_decode(ctx.get(), batch) == 0, "logits fixture decode failed");
+            row += n;
+        }
+        llama_synchronize(ctx.get());
+    };
+    decode(0, query);
+    const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> checkpoint(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+    require(llama_state_seq_get_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0, flags) == checkpoint.size(),
+            "logits checkpoint save failed");
+    const auto before = llama_kvmem_get_attention_view();
+    decode(query, end);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto logits = [&]() {
+        const auto * p = llama_get_logits_ith(ctx.get(), -1);
+        require(p != nullptr, "missing logits");
+        return std::vector<float>(p, p + n_vocab);
+    };
+    const auto single = logits();
+    auto selection = llama_kvmem_preview_retrieval();
+    require(llama_kvmem_commit_unchanged(before, selection), "identical attention view rejected");
+    llama_kvmem_query_state q;
+    require(llama_kvmem_get_query(q) && *std::max_element(q.count.begin(), q.count.end()) == 24,
+            "query capture count differs from explicit span");
+    auto missing_required = selection;
+    missing_required.blocks.pop_back();
+    require(!llama_kvmem_selection_fits(missing_required, end, 0), "trimmed mandatory tail accepted for continuation");
+    std::string reason;
+    require(!llama_kvmem_can_append(end, cp.n_ctx, true, reason), "oversized generation reserve accepted");
+    auto invalid_query = q;
+    invalid_query.count.pop_back();
+    require(!llama_kvmem_set_query(invalid_query), "invalid Q state dimensions accepted");
+    std::vector<std::vector<float>> repeated;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        llama_kvmem_apply_selection(selection);
+        require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0, flags) == checkpoint.size(),
+                "logits checkpoint restore failed");
+        require(llama_kvmem_remove_logical(ctx.get(), query, -1), "logits suffix removal failed");
+        require(!llama_kvmem_commit_unchanged(before, selection), "stale attention view accepted after restore");
+        bool rejected = false;
+        try { llama_kvmem_apply_selection(selection); } catch (const std::runtime_error &) { rejected = true; }
+        require(rejected, "stale selection accepted after restore");
+        llama_kvmem_set_replay(true);
+        decode(query, end);
+        llama_kvmem_set_replay(false);
+        repeated.push_back(logits());
+        selection = llama_kvmem_preview_retrieval();
+    }
+    auto compare_logits = [&](const std::vector<float> & a, const std::vector<float> & b, const char * label) {
+        double sum = 0, maxabs = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            require(std::isfinite(a[i]) && std::isfinite(b[i]), "nonfinite logits");
+            const double d = a[i] - b[i];
+            sum += d*d;
+            maxabs = std::max(maxabs, std::abs(d));
+        }
+        const double rmse = std::sqrt(sum / a.size());
+        const auto top_a = std::max_element(a.begin(), a.end()) - a.begin();
+        const auto top_b = std::max_element(b.begin(), b.end()) - b.begin();
+        std::printf("LOGITS type=%s comparison=%s rmse=%.9f maxabs=%.9f top=%td/%td\n",
+                    ggml_type_name(type), label, rmse, maxabs, top_a, top_b);
+        require(rmse < .0001 && maxabs < .001 && top_a == top_b, "replay logits exceed numerical tolerance");
+    };
+    compare_logits(repeated[0], repeated[1], "replay_repeat");
+    compare_logits(single, repeated[0], "single_vs_replay");
+    // A sparse view can also remain unchanged while its partial tail grows.
+    // Exercise the proof independently of the scoring policy's chosen budget.
+    auto sparse = llama_kvmem_preview_retrieval();
+    sparse.blocks = {sparse.blocks.front(), sparse.blocks.back()};
+    llama_kvmem_apply_selection(sparse);
+    llama_kvmem_begin_cached_turn();
+    llama_kvmem_keep_selected();
+    const auto sparse_before = llama_kvmem_get_attention_view();
+    auto extra = common_tokenize(llama_model_get_vocab(model), " Additional note.", false, true);
+    tokens.insert(tokens.end(), extra.begin(), extra.end());
+    const int new_end = tokens.size();
+    llama_kvmem_set_turn_spans({{{end, new_end}}, {{end, new_end}}, end});
+    decode(end, new_end);
+    const auto sparse_after = llama_kvmem_get_attention_view();
+    auto same_sparse = llama_kvmem_preview_retrieval();
+    same_sparse.blocks = sparse_after.blocks;
+    require(llama_kvmem_commit_unchanged(sparse_before, same_sparse), "unchanged sparse attention view rejected");
+    require(sparse_after.blocks.size() < (uint32_t) (end / 32), "test did not create sparse history");
+    std::printf("PASS type=%s: unchanged view, explicit Q, stale plan rejection, replay logits\n", ggml_type_name(type));
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) {
         std::fprintf(stderr, "Usage: %s model-mtp.gguf (requires CUDA)\n", argv[0]);
@@ -315,6 +457,8 @@ int main(int argc, char ** argv) {
             std::printf("PASS target=%s draft=%s override=%d: GPU save/restore, cycle, partial block\n",
                         ggml_type_name(type), ggml_type_name(draft_type), test.draft != GGML_TYPE_COUNT);
         }
+        check_replay_logits(model.get(), GGML_TYPE_Q8_0);
+        check_replay_logits(model.get(), GGML_TYPE_Q5_0);
         llama_kvmem_set_params(nullptr);
     } catch (const std::exception & e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());

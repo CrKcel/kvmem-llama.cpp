@@ -3,6 +3,7 @@
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
 #include "kvmem-vision.h"
+#include "kvmem-prefill-policy.h"
 
 #include "chat.h"
 #include "common.h"
@@ -67,6 +68,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
             "  --kvmem-query-max-tokens N cap last-user retrieval query to this many tokens\n"
             "                            from the end of the span (default 512; qw3-style)\n"
+            "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
+            "  --kvmem-query-policy MODE  legacy or user (default legacy)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -124,12 +127,35 @@ static int force_pos_from_substr(const llama_vocab * vocab, const std::vector<ll
     return -1;
 }
 
-struct MultimodalCheckpoint {
-    int row = 0;
-    bool media_boundary = false;
+struct MultimodalCheckpointAccounting {
+    size_t live_bytes = 0;
+    size_t peak_bytes = 0;
+};
+
+struct MultimodalCheckpointData {
+    MultimodalCheckpointData() = default;
+    MultimodalCheckpointData(const MultimodalCheckpointData &) = delete;
+    MultimodalCheckpointData & operator=(const MultimodalCheckpointData &) = delete;
+    ~MultimodalCheckpointData() { if (accounting) accounting->live_bytes -= bytes(); }
     std::vector<uint8_t> recurrent;
     std::vector<uint8_t> draft_carry;
     std::vector<float> tail_mean;
+    std::shared_ptr<MultimodalCheckpointAccounting> accounting;
+    size_t bytes() const { return recurrent.size() + draft_carry.size() + tail_mean.size()*sizeof(float); }
+};
+
+struct MultimodalCheckpoint {
+    int row = 0;
+    bool media_boundary = false;
+    std::shared_ptr<const MultimodalCheckpointData> data;
+};
+
+struct MultimodalQuery {
+    int begin = -1, end = -1, force = -1;
+    std::string user;
+    std::shared_ptr<kvmem_prompt> prefix;
+    std::vector<std::pair<uint32_t, std::string>> media;
+    llama_kvmem_query_state state;
 };
 
 struct ServerState {
@@ -144,6 +170,10 @@ struct ServerState {
     json sampling_overrides = json::object();
     int query_last_fallback = 64;
     int query_max_tokens = 512;
+    bool query_replay_auto = true;
+    bool query_policy_user = false;
+    uint32_t turn_generation_rows = 0;
+    bool turn_query_exact = false;
     std::string model_name = "kvmem";
     kvmem_spec_session spec;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
@@ -163,6 +193,11 @@ struct ServerState {
     std::shared_ptr<MultimodalCheckpoint> mm_rollback;
     std::shared_ptr<kvmem_prompt> mm_rollback_prompt;
     int mm_live_row = 0;
+    std::shared_ptr<const MultimodalCheckpointData> mm_live_checkpoint;
+    kvmem_prefill_perf mm_perf;
+    std::shared_ptr<MultimodalCheckpointAccounting> mm_checkpoint_accounting = std::make_shared<MultimodalCheckpointAccounting>();
+    std::shared_ptr<const MultimodalQuery> mm_query;
+    std::shared_ptr<const MultimodalQuery> mm_pending_query;
     bool mm_committed = true;
     uint32_t mm_new_text = 0;
     uint32_t mm_new_image = 0;
@@ -333,6 +368,9 @@ static void memory_clear_all(ServerState & st) {
     st.cached_prompt.reset();
     st.mm_checkpoints.clear();
     st.mm_live_row = 0;
+    st.mm_live_checkpoint.reset();
+    st.mm_query.reset();
+    st.mm_pending_query.reset();
     st.gdn_ckpt.clear();
     st.gdn_carry.clear();
     st.gdn_query_carry.clear();
@@ -382,7 +420,7 @@ static void commit_cached(ServerState & st, const std::vector<llama_token> & pro
     st.cached_tokens = prompt;
     st.cached_tokens.insert(st.cached_tokens.end(), gen.begin(), gen.end());
     st.last_n_gen = (int) gen.size();
-    if (st.vision) multimodal_commit(st, gen);
+    if (st.vision || st.query_policy_user) multimodal_commit(st, gen);
     else st.cached_prompt = st.active_prompt->with_generated(gen);
     fprintf(stderr, "KVMEM_TRACE cache_commit n_prompt=%d n_gen=%d n_cached=%d stored=%u\n",
             (int) prompt.size(), (int) gen.size(), (int) st.cached_tokens.size(),
@@ -439,7 +477,7 @@ static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, in
 
 static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt,
                                  StreamIo * io = nullptr, int * n_cache_hit = nullptr) {
-    if (st.vision) return run_prefill_multimodal(st, io, n_cache_hit);
+    if (st.vision || st.query_policy_user) return run_prefill_multimodal(st, io, n_cache_hit);
     if (!stream_heartbeat(io)) {
         fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill_start n_prompt=%d\n",
                 (int) prompt.size());
@@ -956,6 +994,51 @@ static void derive_query_span(ServerState & st, const std::string & prompt, cons
     if (qbegin >= qend) {
         qbegin = 0;
     }
+}
+
+static bool derive_native_query_span(const ServerState & st, const std::string & formatted,
+                                      const common_chat_templates_inputs & inputs, const kvmem_prompt & prompt,
+                                      int & begin, int & end) {
+    // Render the structured prefix ending at the real last user. This retains
+    // native vision wrappers and does not confuse tool_response user-style
+    // blocks with an actual user message. Require an exact causal prefix match.
+    auto prefix_inputs = inputs;
+    while (!prefix_inputs.messages.empty() && prefix_inputs.messages.back().role != "user")
+        prefix_inputs.messages.pop_back();
+    if (prefix_inputs.messages.empty()) return false;
+    prefix_inputs.add_generation_prompt = false;
+    std::string prefix;
+    try {
+        prefix = common_chat_templates_apply(st.tmpls.get(), prefix_inputs).prompt;
+    } catch (const std::exception &) {
+        return false; // A template may require the full trailing tool sequence.
+    }
+    size_t c0 = 0, c1 = 0;
+    int count = 0, pick = -1;
+    if (!find_last_user_role_block(prefix, "", c0, c1, count, pick) ||
+            formatted.compare(0, c1, prefix, 0, c1) != 0) return false;
+    int full_count = 0, unused = -1;
+    if (!find_last_user_role_block(formatted, "", c0, c1, full_count, unused)) return false;
+    common_chat_msg_delimiters delimiters;
+    delimiters.add(COMMON_CHAT_ROLE_USER, "<|im_start|>user");
+    delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, "<|im_end|>");
+    delimiters.tokenize(st.vocab);
+    const auto spans = prompt.message_spans(delimiters);
+    std::vector<common_chat_msg_span> users;
+    for (const auto & span : spans.spans) if (span.role == COMMON_CHAT_ROLE_USER) users.push_back(span);
+    if ((int) users.size() != full_count || pick < 0 || pick >= (int) users.size()) return false;
+    begin = users[pick].pos + delimiters.delimiters.front().tokens.size();
+    end = users[pick].pos + users[pick].len;
+    for (const auto & image : prompt.media_ranges()) {
+        if ((int) image.first >= begin && (int) image.second <= end) begin = image.second;
+    }
+    if (begin >= end) return false;
+    std::string text;
+    for (int row = begin; row < end; ++row)
+        text += common_token_to_piece(st.vocab, prompt.tokens[row], false);
+    if (trim_copy(text).empty()) return false;
+    fprintf(stderr, "KVMEM_TRACE query_loc method=native_role pick=%d tokens=[%d,%d)\n", pick, begin, end);
+    return true;
 }
 
 static void clamp_query_span(const ServerState & st, int & qbegin, int & qend) {
@@ -1516,6 +1599,14 @@ int main(int argc, char ** argv) {
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = std::atoi(need(arg));
+        } else if (eq(arg, "--kvmem-query-replay")) {
+            const std::string mode = need(arg);
+            if (mode != "legacy" && mode != "auto") { fprintf(stderr, "invalid query replay mode\n"); return 1; }
+            st.query_replay_auto = mode == "auto";
+        } else if (eq(arg, "--kvmem-query-policy")) {
+            const std::string mode = need(arg);
+            if (mode != "legacy" && mode != "user") { fprintf(stderr, "invalid query policy\n"); return 1; }
+            st.query_policy_user = mode == "user";
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = std::atoi(need(arg));
             if (st.query_max_tokens <= 0) {
@@ -1774,6 +1865,8 @@ int main(int argc, char ** argv) {
             return;
         }
         st.active_prompt = parsed_prompt;
+        st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
+                (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
         auto toks = parsed_prompt->tokens;
         if (toks.empty()) {
             res.status = 400;
@@ -1788,11 +1881,18 @@ int main(int argc, char ** argv) {
 
         int qbegin = cr.query_begin;
         int qend = cr.query_end;
+        st.turn_query_exact = false;
         st.turn_last_user = cr.last_user;
         if (qbegin < 0 || qend < 0) {
             derive_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
         }
-        if (parsed_prompt->has_media() && cr.query_begin < 0) {
+        if (st.query_policy_user) {
+            st.turn_query_exact = cr.query_begin >= 0 && cr.query_end > cr.query_begin && cr.query_end <= (int) toks.size();
+            if (cr.query_begin < 0 && cr.query_end < 0) {
+                st.turn_query_exact = derive_native_query_span(st, prompt, inputs, *parsed_prompt, qbegin, qend);
+            }
+        }
+        if (parsed_prompt->has_media() && cr.query_begin < 0 && !st.turn_query_exact) {
             // The final text question follows native visual chunks and their boundaries.
             int last_media_end = 0;
             for (const auto & range : parsed_prompt->media_ranges()) last_media_end = range.second;
@@ -1800,8 +1900,12 @@ int main(int argc, char ** argv) {
             qbegin = std::max(last_media_end, qend - st.query_max_tokens);
         }
         clamp_query_span(st, qbegin, qend);
+        if (st.turn_query_exact && std::find(toks.begin() + qbegin, toks.begin() + qend, LLAMA_TOKEN_NULL) != toks.begin() + qend) {
+            st.turn_query_exact = false;
+            fprintf(stderr, "KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
+        }
         try {
-            multimodal_validate_capacity(st, *parsed_prompt, qbegin, (int) toks.size());
+            multimodal_validate_capacity(st, *parsed_prompt, st.query_policy_user ? (int) toks.size() : qbegin, (int) toks.size());
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
@@ -1877,7 +1981,7 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if (st.vision && st.spec.ok && !use_spec) {
+        if ((st.vision || st.query_policy_user) && st.spec.ok && !use_spec) {
             res.status = 400;
             res.set_content("{\"error\":\"MTP sampler could not initialize for this request\"}", "application/json");
             return;
@@ -1975,6 +2079,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
                             prefill_ms, (int) toks.size());
                     llama_kvmem_end_prefill_capture();
+                    st.mm_live_checkpoint.reset();
                     auto emit_gen_wall = make_emit_gen_wall(t_turn0, t_pf1, prefill_ms);
 
                     std::vector<llama_token> gen;
@@ -2117,7 +2222,7 @@ int main(int argc, char ** argv) {
                         (int) toks.size());
                 return;
             }
-            res.status = st.vision ? st.mm_error_status : 500;
+            res.status = (st.vision || st.query_policy_user) ? st.mm_error_status : 500;
             res.set_content(json{{"error", st.mm_error.empty() ? "prefill/retrieval failed" : st.mm_error}}.dump(), "application/json");
             return;
         }
@@ -2127,6 +2232,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
                 prefill_ms, (int) toks.size());
         llama_kvmem_end_prefill_capture();
+        st.mm_live_checkpoint.reset();
         auto emit_gen_wall = make_emit_gen_wall(t_turn0, t_pf1, prefill_ms);
 
         if (use_spec) {

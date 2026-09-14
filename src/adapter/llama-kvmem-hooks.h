@@ -114,6 +114,50 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 }
 
 #include <vector>
+#include <string>
+
+struct llama_kvmem_row_range {
+    int32_t begin = 0;
+    int32_t end = 0;
+};
+struct llama_kvmem_transfer_stats {
+    bool enabled = false;
+    uint64_t bytes[3] = {}; // H2D, D2H, D2D; adapter operations, including copy kernels
+    uint64_t calls[3] = {};
+};
+LLAMA_API llama_kvmem_transfer_stats llama_kvmem_get_transfer_stats();
+void kvmem_record_transfer(int cuda_kind, uint64_t bytes);
+struct llama_kvmem_turn_spans {
+    std::vector<llama_kvmem_row_range> query;
+    std::vector<llama_kvmem_row_range> mandatory;
+    int32_t replay_begin = 0;
+};
+struct llama_kvmem_query_state {
+    std::vector<std::vector<float>> sum;
+    std::vector<uint32_t> count;
+};
+struct llama_kvmem_attention_view {
+    uint64_t epoch = 0;
+    uint32_t rows = 0;
+    bool valid = false;
+    std::vector<uint32_t> blocks;
+};
+struct llama_kvmem_selection {
+    uint64_t epoch = 0;
+    uint32_t rows = 0;
+    std::vector<uint32_t> blocks;
+};
+LLAMA_API void llama_kvmem_set_turn_spans(const llama_kvmem_turn_spans & spans);
+LLAMA_API llama_kvmem_attention_view llama_kvmem_get_attention_view();
+LLAMA_API bool llama_kvmem_can_append(uint32_t end, uint32_t generation_rows, bool all_history, std::string & reason);
+LLAMA_API llama_kvmem_selection llama_kvmem_preview_retrieval();
+LLAMA_API bool llama_kvmem_selection_fits(const llama_kvmem_selection & selection, uint32_t end, uint32_t generation_rows);
+LLAMA_API bool llama_kvmem_commit_unchanged(const llama_kvmem_attention_view & view, const llama_kvmem_selection & selection);
+LLAMA_API void llama_kvmem_apply_selection(const llama_kvmem_selection & selection);
+LLAMA_API bool llama_kvmem_commit_resident(bool canonical = true);
+LLAMA_API bool llama_kvmem_get_query(llama_kvmem_query_state & state);
+LLAMA_API bool llama_kvmem_set_query(const llama_kvmem_query_state & state);
+LLAMA_API void llama_kvmem_freeze_query(bool frozen);
 LLAMA_API void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state);
 LLAMA_API void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state);
 #endif

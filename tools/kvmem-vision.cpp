@@ -54,6 +54,16 @@ std::shared_ptr<kvmem_prompt> kvmem_prompt::with_generated(const std::vector<lla
     return std::make_shared<kvmem_prompt>(std::move(native));
 }
 
+common_chat_msg_spans kvmem_prompt::message_spans(const common_chat_msg_delimiters & delimiters) const {
+    return native_->find_message_spans(delimiters);
+}
+
+std::vector<std::pair<uint32_t, std::string>> kvmem_prompt::media_identity() const {
+    std::vector<std::pair<uint32_t, std::string>> ids;
+    for (const auto & range : media_ranges()) ids.emplace_back(range.first, mtmd_input_chunk_get_id(chunk(range.first)));
+    return ids;
+}
+
 std::shared_ptr<kvmem_prompt> kvmem_prompt::prefix(size_t rows) const {
     auto native = std::make_shared<server_tokens>(native_->clone());
     native->keep_first(rows);

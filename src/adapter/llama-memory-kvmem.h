@@ -2,6 +2,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-kvmem-hooks.h"
 
 #include "kvmem/kvmem_runtime.hpp"
 #include "kvmem/raw_kv_store.hpp"
@@ -100,6 +101,21 @@ public:
     void harvest_perf_print_sum();
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
+    void set_turn_spans(const llama_kvmem_turn_spans & spans);
+    bool query_contains(llama_pos row) const;
+    bool query_overlaps(uint32_t n, const llama_pos * rows) const;
+    llama_kvmem_attention_view attention_view(bool canonical = true) const;
+    bool can_append(uint32_t end, uint32_t generation_rows, bool all_history, std::string & reason) const;
+    llama_kvmem_selection preview_retrieval();
+    bool selection_fits(const llama_kvmem_selection & selection, uint32_t end, uint32_t generation_rows) const;
+    bool commit_unchanged(const llama_kvmem_attention_view & view, const llama_kvmem_selection & selection);
+    void apply_selection(const llama_kvmem_selection & selection);
+    bool commit_resident(bool canonical = true);
+    bool get_query(llama_kvmem_query_state & state);
+    bool set_query(const llama_kvmem_query_state & state);
+    void freeze_query(bool frozen) { query_frozen_ = frozen; }
+    // The follower also invalidates a pending proof when old draft KV changes.
+    void note_attention_change() { ++attention_epoch_; }
     bool query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const;
     void dump_kv_compare(int32_t block_id, bool writeback_test = false);
     void trace_working_set(const char * tag) const;
@@ -110,7 +126,8 @@ public:
     }
     // Recapture Q for retrieval even while replaying a cached query span.
     bool want_q_capture() const {
-        return method_ == 1 && !retrieval_pinned_ && query_begin_ >= 0;
+        return method_ == 1 && !retrieval_pinned_ && !query_frozen_ &&
+            (explicit_spans_ ? !turn_spans_.query.empty() : query_begin_ >= 0);
     }
     bool want_decode_mean() const {
         return retrieval_pinned_ && method_ == 1 && !replay_;
@@ -142,6 +159,8 @@ public:
     void set_recurrent(llama_memory_recurrent * recr) { recr_ = recr; }
     bool has_recurrent() const { return recr_ != nullptr; }
     void set_query_span(int32_t begin, int32_t end) {
+        harvest_flush();
+        explicit_spans_ = false;
         query_begin_ = begin;
         query_end_ = end;
     }
@@ -181,6 +200,8 @@ private:
     // Resident KV is copied slot-to-slot; cold blocks memcpy packed GPU K/V.
     bool layout_gpu_slots_by_orig_pos();
     bool gpu_kv_already_resident(uint32_t block_id) const;
+    bool gpu_kv_complete(uint32_t block_id, const llama_kv_cache * cache) const;
+    std::vector<uint32_t> retrieval_mandatory() const;
     void occupy_block_cells(uint32_t block_id);
     void reset_slots();
     void trace_plan(const char * tag, const kvmem::KvMemPlan & plan) const;
@@ -324,6 +345,7 @@ private:
     struct RowPosition {
         std::array<llama_pos, 4> pos{};
         llama_token token = LLAMA_TOKEN_NULL;
+        bool spatial = false;
     };
     std::vector<RowPosition> row_positions_;
 
@@ -345,6 +367,10 @@ private:
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t force_pos_ = -1;
+    llama_kvmem_turn_spans turn_spans_;
+    bool explicit_spans_ = false;
+    bool query_frozen_ = false;
+    uint64_t attention_epoch_ = 0;
 
     std::vector<std::vector<llama_pos>> pos_queue_;
     std::vector<llama_pos> cur_pos_;

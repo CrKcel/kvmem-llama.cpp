@@ -463,7 +463,9 @@ public:
     // it is sorted ascending internally so window order is deterministic (sink
     // first ... recent last). Blocks are packed contiguously from window pos 0.
     KvMemPlan set_selection(std::vector<uint32_t> selected_ids,
-                            bool force_raw_refresh = false);
+                           bool force_raw_refresh = false);
+    // Metadata only; every live GPU block must be selected and already valid.
+    bool commit_resident_selection(const std::vector<uint32_t> & selected_ids);
 
     // Reset working-set membership (e.g. new session). Block table + baked_pos
     // are kept (the cache still holds K baked at whatever position it was left).

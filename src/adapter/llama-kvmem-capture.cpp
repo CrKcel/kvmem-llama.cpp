@@ -85,6 +85,7 @@ void kvmem_capture_harvest_ubatch(struct ggml_backend_sched * sched, int is_mtp)
 }
 
 static bool ubatch_overlaps_query(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) {
+    if (g_mem) return g_mem->query_overlaps(n_tokens, pos);
     const llama_kvmem_params * kp = llama_kvmem_get_params();
     if (!kp || !kp->enabled || kp->method != 1 || kp->query_begin < 0 || n_tokens == 0) {
         return false;

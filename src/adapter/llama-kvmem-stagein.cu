@@ -1,4 +1,5 @@
 #include "llama-kvmem-stagein.h"
+#include "llama-kvmem-transfer.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -448,7 +449,7 @@ bool kvmem_stagein_h2d_packed(const void * host, size_t n) {
     if (!host || n == 0 || !g_st.dev_q || n > g_st.n_q) {
         return false;
     }
-    if (!cuda_ok(cudaMemcpyAsync(g_st.dev_q, host, n, cudaMemcpyHostToDevice, stream()),
+    if (!cuda_ok(kvmem_copy_async(g_st.dev_q, host, n, cudaMemcpyHostToDevice, stream()),
                  "H2D packed")) {
         return false;
     }
@@ -517,7 +518,7 @@ bool kvmem_stagein_rope_neox(int64_t n_tokens, int n_head, int n_embd_head, int 
         }
         g_st.n_theta = (size_t) n_theta;
     }
-    if (!cuda_ok(cudaMemcpyAsync(g_st.dev_theta, theta, (size_t) n_theta * sizeof(float),
+    if (!cuda_ok(kvmem_copy_async(g_st.dev_theta, theta, (size_t) n_theta * sizeof(float),
                                  cudaMemcpyHostToDevice, stream()),
                  "H2D theta")) {
         return false;
@@ -534,7 +535,7 @@ bool kvmem_stagein_h2d_f32(const float * host, int64_t n) {
     if (!host || n <= 0 || !g_st.dev_f32 || (size_t) n > g_st.n_f32) {
         return false;
     }
-    if (!cuda_ok(cudaMemcpyAsync(g_st.dev_f32, host, (size_t) n * sizeof(float),
+    if (!cuda_ok(kvmem_copy_async(g_st.dev_f32, host, (size_t) n * sizeof(float),
                                  cudaMemcpyHostToDevice, stream()),
                  "H2D f32")) {
         return false;
@@ -607,7 +608,7 @@ bool kvmem_stagein_h2d_bytes(void * gpu_dst, const void * host, size_t n) {
     if (!gpu_dst || !host || n == 0) {
         return n == 0;
     }
-    return cuda_ok(cudaMemcpyAsync(gpu_dst, host, n, cudaMemcpyHostToDevice, stream()),
+    return cuda_ok(kvmem_copy_async(gpu_dst, host, n, cudaMemcpyHostToDevice, stream()),
                    "H2D bytes");
 }
 
@@ -640,7 +641,7 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
     }
     {
         const int64_t t0 = ggml_time_us();
-        if (!cuda_ok(cudaMemcpyAsync(g_st.dev_q, g_st.pin[0], g_st.used,
+        if (!cuda_ok(kvmem_copy_async(g_st.dev_q, g_st.pin[0], g_st.used,
                                      cudaMemcpyHostToDevice, stream()),
                      "slab H2D")) {
             g_st.used = 0;
@@ -680,7 +681,7 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
             }
             g_st.n_theta = g_st.theta.size();
         }
-        if (!cuda_ok(cudaMemcpyAsync(g_st.dev_theta, g_st.theta.data(),
+        if (!cuda_ok(kvmem_copy_async(g_st.dev_theta, g_st.theta.data(),
                                      g_st.theta.size() * sizeof(float),
                                      cudaMemcpyHostToDevice, stream()),
                      "H2D theta")) {
@@ -694,7 +695,7 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
         uint8_t * src = g_st.dev_q + it.off;
         if (it.kind == ITEM_V) {
             const int64_t t0 = ggml_time_us();
-            ok = cuda_ok(cudaMemcpyAsync(it.dst, src, it.nbytes,
+            ok = cuda_ok(kvmem_copy_async(it.dst, src, it.nbytes,
                                          cudaMemcpyDeviceToDevice, stream()),
                          "slab V D2D");
             if (set_us) {
@@ -890,23 +891,28 @@ int kvmem_stageout_submit(int64_t * copy_us) {
             g_st.host_ops[i].pad = 0;
         }
         if (ops_ok &&
-            cuda_ok(cudaMemcpyAsync(g_st.dev_ops, g_st.host_ops.data(),
+            cuda_ok(kvmem_copy_async(g_st.dev_ops, g_st.host_ops.data(),
                                     (size_t) nitem * sizeof(CopyOp),
                                     cudaMemcpyHostToDevice, stream()),
                     "gather ops H2D")) {
             copy_bytes<<<nitem, 256, 0, stream()>>>(g_st.dev_ops, nitem);
             packed = cuda_ok(cudaGetLastError(), "gather kernel");
+            if (packed) {
+                uint64_t bytes = 0;
+                for (const auto & item : g_st.outs) bytes += item.nbytes;
+                kvmem_record_transfer(cudaMemcpyDeviceToDevice, bytes);
+            }
         }
     }
     if (packed) {
-        packed = cuda_ok(cudaMemcpyAsync(dst, g_st.dev_q, g_st.used,
+        packed = cuda_ok(kvmem_copy_async(dst, g_st.dev_q, g_st.used,
                                          cudaMemcpyDeviceToHost, stream()),
                          "stageout D2H");
     }
     if (!packed) {
         cudaStreamSynchronize(stream());
         for (const Stage::OutItem & o : g_st.outs) {
-            if (!cuda_ok(cudaMemcpyAsync(dst + o.off, o.gpu_src, o.nbytes,
+            if (!cuda_ok(kvmem_copy_async(dst + o.off, o.gpu_src, o.nbytes,
                                          cudaMemcpyDeviceToHost, stream()),
                          "stageout D2H item")) {
                 return -1;
@@ -975,14 +981,20 @@ bool kvmem_d2d_batched(const void * const * src, void * const * dst,
         g_st.host_ops[i].nbytes = (uint32_t) nbytes[i];
         g_st.host_ops[i].pad = 0;
     }
-    if (!cuda_ok(cudaMemcpyAsync(g_st.dev_ops, g_st.host_ops.data(),
+    if (!cuda_ok(kvmem_copy_async(g_st.dev_ops, g_st.host_ops.data(),
                                  (size_t) n * sizeof(CopyOp),
                                  cudaMemcpyHostToDevice, stream()),
                  "layout ops H2D")) {
         return false;
     }
     copy_bytes<<<n, 256, 0, stream()>>>(g_st.dev_ops, n);
-    return cuda_ok(cudaGetLastError(), "layout copy kernel");
+    const bool ok = cuda_ok(cudaGetLastError(), "layout copy kernel");
+    if (ok) {
+        uint64_t bytes = 0;
+        for (int i = 0; i < n; ++i) bytes += nbytes[i];
+        kvmem_record_transfer(cudaMemcpyDeviceToDevice, bytes);
+    }
+    return ok;
 }
 
 bool kvmem_meank_ready(uint32_t n_layer, uint32_t n_embd) {
@@ -1054,7 +1066,7 @@ bool kvmem_meank_d2h(uint32_t il, float * host, uint32_t n_embd) {
     if (!g_mk.acc || !host || il >= g_mk.n_layer || n_embd != g_mk.n_embd) {
         return false;
     }
-    return cuda_ok(cudaMemcpyAsync(host, g_mk.acc + (size_t) il * g_mk.n_embd,
+    return cuda_ok(kvmem_copy_async(host, g_mk.acc + (size_t) il * g_mk.n_embd,
                                    (size_t) n_embd * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream()),
                    "meank D2H");

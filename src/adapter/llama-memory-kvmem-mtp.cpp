@@ -6,6 +6,7 @@
 #include "llama-kvmem-capture.h"
 #include "llama-kvmem-hooks.h"
 #include "llama-kvmem-stagein.h"
+#include "llama-kvmem-transfer.h"
 #include "llama-model.h"
 
 #include "llama.h"
@@ -245,28 +246,35 @@ llama_memory_context_ptr llama_memory_kvmem_mtp::init_update(llama_context * lct
 }
 
 void llama_memory_kvmem_mtp::clear(bool data) {
+    if (target_) target_->note_attention_change();
     kv_->clear(data);
     raw_->clear();
     pos_queue_.clear();
 }
 
 bool llama_memory_kvmem_mtp::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (target_ && kv_->seq_pos_max(seq_id) >= std::max<llama_pos>(0, p0) &&
+            (p1 < 0 || kv_->seq_pos_min(seq_id) < p1)) target_->note_attention_change();
     return kv_->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_kvmem_mtp::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (target_) target_->note_attention_change();
     kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_kvmem_mtp::seq_keep(llama_seq_id seq_id) {
+    if (target_) target_->note_attention_change();
     kv_->seq_keep(seq_id);
 }
 
 void llama_memory_kvmem_mtp::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (target_) target_->note_attention_change();
     kv_->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_kvmem_mtp::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (target_) target_->note_attention_change();
     kv_->seq_div(seq_id, p0, p1, d);
 }
 
@@ -287,6 +295,7 @@ void llama_memory_kvmem_mtp::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_kvmem_mtp::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (target_) target_->note_attention_change();
     kv_->state_read(io, seq_id, flags);
 }
 
@@ -347,7 +356,7 @@ void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
     const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
     const size_t row = ggml_row_size(type_k_, n_embd_k_);
     std::vector<uint8_t> packed((size_t) nt * row);
-    ggml_backend_tensor_get(kt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
+    kvmem_tensor_get(kt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
     raw_->write_layer_k_gpu(blk.orig_pos_start, nt, 0, packed.data());
 }
 
@@ -380,7 +389,7 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     }
     const size_t row = ggml_row_size(type_v_, n_embd_v_);
     std::vector<uint8_t> packed((size_t) nt * row);
-    ggml_backend_tensor_get(vt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
+    kvmem_tensor_get(vt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
     raw_->write_layer_v_gpu(blk.orig_pos_start, nt, 0, packed.data());
 }
 
@@ -465,7 +474,7 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     const int ng = (int) gsrc.size();
     if (ng > 0 && !kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
         for (int j = 0; j < ng && ok; ++j) {
-            ok = cudaMemcpyAsync(gdst[j], gsrc[j], gbytes[j],
+            ok = kvmem_copy_async(gdst[j], gsrc[j], gbytes[j],
                                  cudaMemcpyDeviceToDevice) == cudaSuccess;
         }
     }
@@ -475,7 +484,7 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     const int ns = (int) ssrc.size();
     if (ok && ns > 0 && !kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
         for (int j = 0; j < ns && ok; ++j) {
-            ok = cudaMemcpyAsync(sdst[j], ssrc[j], sbytes[j],
+            ok = kvmem_copy_async(sdst[j], ssrc[j], sbytes[j],
                                  cudaMemcpyDeviceToDevice) == cudaSuccess;
         }
     }
@@ -498,6 +507,7 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     if (blk.gpu_slot < 0) {
         return;
     }
+    target_->note_attention_change();
     const uint32_t nt = blk.n_tokens;
     occupy_block(block_id);
     ggml_tensor * kt = kv_->get_k_storage((int32_t) il_graph_);
@@ -514,16 +524,17 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     // does not match the live MTP graph and zeroes accept rate.
     std::vector<uint8_t> kpack((size_t) nt * krow);
     if (raw_->copy_k_gpu(block_id, 0, kpack.data(), nt)) {
-        ggml_backend_tensor_set(kt, kpack.data(), cell0 * krow, nt * krow);
+        kvmem_tensor_set(kt, kpack.data(), cell0 * krow, nt * krow);
     }
 
     std::vector<uint8_t> vpack((size_t) nt * vrow);
     if (vt && !v_trans_ && raw_->copy_v_gpu(block_id, 0, vpack.data(), nt)) {
-        ggml_backend_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
+        kvmem_tensor_set(vt, vpack.data(), cell0 * vrow, nt * vrow);
     }
 }
 
 void llama_memory_kvmem_mtp::on_stage_out(uint32_t block_id) {
+    if (target_) target_->note_attention_change();
     if (!target_) {
         return;
     }

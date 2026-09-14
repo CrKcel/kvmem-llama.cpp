@@ -44,6 +44,9 @@ public:
     // Recency / retrieval selection. `mandatory` consumes budget slots.
     KvMemPlan prepare_reselect(const std::vector<uint32_t> &mandatory = {},
                                bool force_raw_refresh = false);
+    std::vector<uint32_t> preview_reselect(const std::vector<uint32_t> & mandatory = {}) const;
+    KvMemPlan prepare_selection(const std::vector<uint32_t> & selected, bool force_raw_refresh = false);
+    bool commit_resident_selection(const std::vector<uint32_t> & selected);
     KvMemPlan prepare_prefill_pressure(
         const std::vector<uint32_t> &mandatory = {});
 

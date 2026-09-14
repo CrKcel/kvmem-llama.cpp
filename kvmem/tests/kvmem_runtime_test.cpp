@@ -214,7 +214,38 @@ static void test_cpu_full_spills_to_nvme_and_roundtrips() {
     CHECK(payload[0] == 5);
 }
 
+static void test_selection_preview_and_resident_commit() {
+    RecordingBackend be;
+    KvMemRuntime rt(make_cfg(), &be);
+    rt.register_append(32 * 3 + 7);
+    for (uint32_t id = 0; id < rt.store().block_count(); ++id) {
+        rt.store().set_block_gpu_slot(id, be.alloc_gpu_slot());
+    }
+    be.ops.clear();
+    const auto before = rt.store().blocks();
+    const auto selected = rt.preview_reselect();
+    CHECK(selected.size() == 4);
+    CHECK(be.ops.empty());
+    for (uint32_t id = 0; id < before.size(); ++id) {
+        const auto & after = rt.store().blocks()[id];
+        CHECK(after.gpu_slot == before[id].gpu_slot);
+        CHECK(after.in_working_set == before[id].in_working_set);
+        CHECK(after.baked_pos == before[id].baked_pos);
+    }
+    CHECK(!rt.commit_resident_selection({0, 1, 2}));
+    CHECK(!rt.store().blocks()[0].in_working_set);
+    CHECK(rt.commit_resident_selection(selected));
+    CHECK(be.ops.empty());
+    CHECK(rt.last_plan().total_window_tokens == 103);
+    CHECK(rt.store().blocks().back().n_tokens == 7);
+    auto pending = rt.prepare_selection(selected);
+    CHECK(!rt.commit_resident_selection(selected));
+    rt.finish_reselect();
+    CHECK(rt.commit_resident_selection(selected));
+}
+
 int main() {
+    test_selection_preview_and_resident_commit();
     test_stage_out_before_stage_in();
     test_high_overlap_skips_stage_in();
     test_pressure_keeps_sink_and_tail();
