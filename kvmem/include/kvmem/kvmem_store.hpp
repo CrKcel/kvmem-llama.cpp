@@ -470,6 +470,14 @@ public:
     void clear_working_set();
 
 private:
+    std::vector<uint32_t> constrain_media(std::vector<uint32_t> selected,
+        const std::vector<uint32_t> & mandatory, uint32_t budget, bool recency) const;
+    std::vector<uint32_t> pick_topk_ungrouped(const std::vector<uint32_t> & mandatory) const;
+    std::vector<uint32_t> pick_prefill_ungrouped(const std::vector<uint32_t> & mandatory) const;
+    std::vector<std::pair<uint32_t, uint32_t>> media_ranges_;
+public:
+    void set_media_ranges(std::vector<std::pair<uint32_t, uint32_t>> ranges) { media_ranges_ = std::move(ranges); }
+private:
     KvMemStoreConfig cfg_;
     uint32_t runtime_select_budget_ = 0;
     std::vector<KvMemBlock> blocks_;

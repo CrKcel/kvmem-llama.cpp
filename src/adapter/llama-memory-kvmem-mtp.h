@@ -82,6 +82,9 @@ public:
     bool slot_holds(int32_t slot, uint32_t orig_pos) const;
     bool layout_d2d(const LayoutMove * moves, size_t n_moves);
     void occupy_block(uint32_t block_id);
+    bool remove_logical(llama_pos p0, llama_pos p1) { return kv_->seq_rm_logical(0, p0, p1); }
+    void truncate_cached(uint32_t n) { raw_->truncate_to(n); }
+    void invalidate_packed_from(uint32_t n) { raw_->invalidate_packed_from(n); }
 
 private:
     bool fill_from_target(const llama_ubatch & ubatch, llama_kv_cache::slot_info & out);

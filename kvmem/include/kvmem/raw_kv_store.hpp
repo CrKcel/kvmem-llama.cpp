@@ -63,9 +63,9 @@ public:
 
     bool has_block(uint32_t block_id) const;
     bool has_k(uint32_t block_id, uint32_t il) const;
-    bool has_k_gpu(uint32_t block_id, uint32_t il) const;
+    bool has_k_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
     bool has_v(uint32_t block_id, uint32_t il) const;
-    bool has_v_gpu(uint32_t block_id, uint32_t il) const;
+    bool has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
     uint32_t n_tokens(uint32_t block_id) const;
 
     bool copy_k(uint32_t block_id, uint32_t il, float * out) const;
@@ -85,12 +85,18 @@ public:
 
     void wait_writes();
     void clear();
-    // Drop blocks whose orig start is >= token_pos. Partial last block kept.
+    // Preserve only the valid prefix, including a partial last block.
     void truncate_to(uint32_t token_pos);
+    void invalidate_packed_from(uint32_t token_pos);
+    std::vector<float> mean_checkpoint(uint32_t token_pos) const;
+    void restore_mean_checkpoint(uint32_t token_pos, const std::vector<float> & state);
 
 private:
     struct LayerBlk {
         uint32_t n_tokens = 0;
+        uint32_t k_gpu_tokens = 0;
+        uint32_t v_gpu_tokens = 0;
+        uint32_t mean_tokens = 0;
         std::vector<uint8_t> k;
         std::vector<uint16_t> v;
         std::vector<uint8_t> k_gpu;

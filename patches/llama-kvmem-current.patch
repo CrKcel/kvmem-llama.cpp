@@ -1,0 +1,1064 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -127,6 +127,11 @@
+ 
+ # utils
+ option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
++
++# KVMem out-of-tree adapter (kvmem_llamacpp). Off by default so a vanilla
++# submodule build stays bit-identical to upstream.
++option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
++set(LLAMA_KVMEM_ROOT "" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)")
+ 
+ # extra artifacts
+ option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1332,6 +1332,9 @@
+     std::vector<llama_sampler *> backend_chains;
+ 
+     int32_t n_embd = 0;
++    std::vector<llama_pos> logical_pos;
++    std::vector<llama_pos> synced_rows;
++    std::vector<llama_pos> verify_start;
+ 
+     // One MTP draft driver, three modes (set once in the ctor):
+     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
+@@ -1386,6 +1389,11 @@
+         // TODO: fix, how to call without malloc
+         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+ 
++        logical_pos.resize(n_b);
++        batch.logical_pos = logical_pos.data();
++        synced_rows.assign(n_seq, 0);
++        verify_start.assign(n_seq, 0);
++
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+@@ -1414,7 +1422,10 @@
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
+-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
++        // ctx_other is also set for Qwen MTP so the KVMem factory can follow
++        // the target slot-pool. Shared-KV (Gemma4) is the same memory object.
++        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt
++                && llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
+         if (chain_heads) {
+@@ -1464,7 +1475,8 @@
+         }
+ 
+         auto * ctx_dft = this->params.ctx_dft;
+-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++        const llama_pos pos_max = std::find(prompt.begin(), prompt.end(), LLAMA_TOKEN_NULL) != prompt.end()
++                ? synced_rows[seq_id] - 1 : llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+ 
+         if (pos_max < N - 1 && !is_mem_shared) {
+             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
+@@ -1480,10 +1492,7 @@
+             return true;
+         }
+ 
+-        // TODO: how to make it work with vision tokens?
+-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+-            return true;
+-        }
++        if (!batch_in.token && !batch_in.embd) return false;
+ 
+         const int32_t n_tokens = batch_in.n_tokens;
+ 
+@@ -1514,7 +1523,8 @@
+             common_batch_clear(batch);
+ 
+             for (int k = 0; k < n_tokens; ++k) {
+-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                common_batch_add(batch, batch_in.token ? batch_in.token[k] : 0, batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                batch.logical_pos[k] = batch_in.logical_pos ? batch_in.logical_pos[k] : batch_in.pos[k];
+             }
+ 
+             // shift the tgt embeddings to the right by one position
+@@ -1540,6 +1550,13 @@
+                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+             }
+ 
++            llama_batch sync_batch = batch;
++            sync_batch.embd_nextn = batch.embd;
++            if (!batch_in.token) {
++                sync_batch.token = nullptr;
++                sync_batch.embd = batch_in.embd;
++                sync_batch.pos = batch_in.pos;
++            }
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+@@ -1555,7 +1572,7 @@
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+ 
+-                const int32_t rc = llama_decode(ctx_dft, batch);
++                const int32_t rc = llama_decode(ctx_dft, sync_batch);
+                 if (rc != 0) {
+                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                             head, (int) rc, (int) batch_in.pos[0]);
+@@ -1579,6 +1596,9 @@
+ 
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
++            const int first = i_batch_beg[seq_id];
++            verify_start[seq_id] = batch_in.logical_pos ? batch_in.logical_pos[first] : batch_in.pos[first];
++            synced_rows[seq_id] = verify_start[seq_id] + n_rows;
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+ 
+             for (int32_t i = 0; i < n_rows; ++i) {
+@@ -1616,6 +1636,7 @@
+             common_sampler_reset(smpls[seq_id].get());
+ 
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
++            batch.logical_pos[batch.n_tokens - 1] = dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past;
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+ 
+             i_last[seq_id] = batch.n_tokens - 1;
+@@ -1705,6 +1726,7 @@
+                     for (int t = 0; t < n_rows; ++t) {
+                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
+                         common_batch_add(batch, tok, dp.n_past + t, { seq_id }, t == n_rows - 1);
++                        batch.logical_pos[batch.n_tokens - 1] = (dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past) + t;
+                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
+                     }
+@@ -1712,9 +1734,11 @@
+                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+                     common_batch_add(batch, id, dp.n_past, { seq_id }, true);
++                    batch.logical_pos[batch.n_tokens - 1] = dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past;
+                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                 } else {
+                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
++                    batch.logical_pos[batch.n_tokens - 1] = (dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past) + i + 1;
+                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                 }
+ 
+@@ -1755,9 +1779,28 @@
+         }
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
++        synced_rows[seq_id] = verify_start[seq_id] + i_h + 1;
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+     }
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        if (seq_id < 0 || (uint32_t) seq_id >= n_seq) return false;
++        data.resize(sizeof(llama_pos) + (size_t) n_embd*sizeof(float));
++        std::memcpy(data.data(), &synced_rows[seq_id], sizeof(llama_pos));
++        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        if (seq_id < 0 || (uint32_t) seq_id >= n_seq) return;
++        if (data.size() != sizeof(llama_pos) + (size_t) n_embd*sizeof(float)) {
++            throw std::runtime_error("invalid MTP carry state");
++        }
++        std::memcpy(&synced_rows[seq_id], data.data(), sizeof(llama_pos));
++        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd*sizeof(float));
++        verify_h_rows[seq_id] = 0;
++    }
++
+ };
+ 
+ // state of self-speculation (simple implementation, not ngram-map)
+diff --git a/common/speculative.h b/common/speculative.h
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -69,6 +69,7 @@
+ 
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
++    llama_pos n_past_logical = -1; // optional cache row cursor for multimodal input
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -268,6 +268,10 @@
+         int32_t      *  n_seq_id;
+         llama_seq_id ** seq_id;
+         int8_t       *  logits;   // TODO: rename this to "output"
++
++        // Optional borrowed arrays; llama_batch_free does not free these.
++        llama_pos    *  logical_pos; // unique cache row IDs, independent of M-RoPE
++        float        *  embd_nextn;  // previous target hidden rows for MTP
+     } llama_batch;
+ 
+     enum llama_model_kv_override_type {
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -63,6 +63,41 @@
+ 
+ target_link_libraries(llama PUBLIC ggml)
+ 
++if (LLAMA_KVMEM)
++    if (LLAMA_KVMEM_ROOT STREQUAL "")
++        message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
++    endif()
++    target_sources(llama PRIVATE
++        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp
++        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-hybrid.cpp
++        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-mtp.cpp
++        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-batch.cpp
++        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-capture.cpp
++    )
++    if (GGML_CUDA)
++        enable_language(CUDA)
++        target_sources(llama PRIVATE
++            ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein.cu)
++        if (DEFINED CMAKE_CUDA_ARCHITECTURES)
++            set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
++        endif()
++    endif()
++    target_include_directories(llama PRIVATE
++        ${LLAMA_KVMEM_ROOT}/kvmem/include
++        ${LLAMA_KVMEM_ROOT}/src/adapter
++        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src
++    )
++    target_compile_definitions(llama PRIVATE LLAMA_KVMEM=1)
++    if (NOT TARGET kvmem)
++        add_subdirectory(${LLAMA_KVMEM_ROOT}/kvmem ${CMAKE_BINARY_DIR}/kvmem-from-llama)
++    endif()
++    target_link_libraries(llama PRIVATE kvmem)
++    find_package(CUDAToolkit QUIET)
++    if (CUDAToolkit_FOUND)
++        target_link_libraries(llama PRIVATE CUDA::cudart)
++    endif()
++endif()
++
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -758,6 +758,8 @@
+ 
+     udata->token     .resize(n_tokens);
+     udata->embd      .resize(n_embd_all);
++    udata->embd_nextn.resize(batch.embd_nextn ? (int64_t) n_tokens*n_embd : 0);
++    udata->logical_pos.resize(batch.logical_pos ? n_tokens : 0);
+     udata->pos       .resize(n_pos_all);
+     udata->n_seq_id  .resize(n_tokens);
+     udata->seq_id    .resize(n_tokens);
+@@ -776,6 +778,12 @@
+ 
+         if (batch.embd) {
+             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
++        }
++        if (batch.embd_nextn) {
++            memcpy(udata->embd_nextn.data() + i*n_embd, batch.embd_nextn + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
++        }
++        if (batch.logical_pos) {
++            udata->logical_pos[i] = batch.logical_pos[idxs[i]];
+         }
+ 
+         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
+@@ -833,6 +841,9 @@
+         /*.output       =*/ udata->output.data(),
+         /*.data         =*/ std::move(udata),
+     };
++
++    res.logical_pos = batch.logical_pos ? res.data->logical_pos.data() : nullptr;
++    res.embd_nextn = batch.embd_nextn ? res.data->embd_nextn.data() : nullptr;
+ 
+     if (debug > 0) {
+         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -54,6 +54,8 @@
+     struct data_t {
+         std::vector<llama_token>    token;
+         std::vector<float>          embd;
++        std::vector<float>          embd_nextn;
++        std::vector<llama_pos>      logical_pos;
+         std::vector<llama_pos>      pos;
+         std::vector<int32_t>        n_seq_id;
+         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
+@@ -66,6 +68,8 @@
+ 
+     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
+     std::shared_ptr<data_t> data;
++    llama_pos * logical_pos = nullptr;
++    float * embd_nextn = nullptr;
+ };
+ 
+ // a helper for sanitizing, fulfilling and splitting a batch
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,6 +12,9 @@
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
++#if defined(LLAMA_KVMEM)
++#include "llama-kvmem-hooks.h"
++#endif
+ 
+ #include <cinttypes>
+ #include <cmath>
+@@ -141,6 +144,12 @@
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
+     cparams.ctx_other = nullptr;
++
++    // MTP draft context needs the target so KVMem can size the follower
++    // slot-pool from the target pool instead of n_ctx.
++    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
++        cparams.ctx_other = params.ctx_other;
++    }
+ 
+     // TODO: more generic
+     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+@@ -1344,7 +1353,12 @@
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
++    if (!graph_reuse_disable && res->can_reuse(gparams)
++#if defined(LLAMA_KVMEM)
++        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, 1, ubatch.logical_pos ? ubatch.logical_pos : ubatch.pos,
++                                         gtype == LLM_GRAPH_TYPE_DECODER_MTP)
++#endif
++            ) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1363,6 +1377,9 @@
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
++#if defined(LLAMA_KVMEM)
++        llama_kvmem_capture_on_new_graph(gtype == LLM_GRAPH_TYPE_DECODER_MTP);
++#endif
+         gf = model.build_graph(gparams);
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+@@ -1396,6 +1413,10 @@
+         ret = status;
+         return nullptr;
+     }
++
++#if defined(LLAMA_KVMEM)
++    llama_kvmem_harvest_ubatch(sched.get(), gtype == LLM_GRAPH_TYPE_DECODER_MTP);
++#endif
+ 
+     ret = GGML_STATUS_SUCCESS;
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -15,6 +15,9 @@
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
++#if defined(LLAMA_KVMEM)
++#include "llama-kvmem-hooks.h"
++#endif
+ 
+ #include <cassert>
+ #include <cmath>
+@@ -104,13 +107,11 @@
+         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+     }
+ 
+-    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
+-    //       for now, we assume that the hidden state is always provided as an embedding
+-    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
+-    if (ubatch->embd) {
++    const float * hidden = ubatch->embd_nextn ? ubatch->embd_nextn : ubatch->embd;
++    if (hidden) {
+         GGML_ASSERT(n_embd == h->ne[0]);
+ 
+-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
++        ggml_backend_tensor_set(h, hidden, 0, n_tokens*n_embd*ggml_element_size(h));
+     }
+ }
+ 
+@@ -119,7 +120,7 @@
+ 
+     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
+-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
++    res &= (!params.ubatch.embd && !params.ubatch.embd_nextn) || (h && h->ne[1] == params.ubatch.n_tokens);
+ 
+     return res;
+ }
+@@ -1500,6 +1501,88 @@
+     }
+ }
+ 
++static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * src, int il, const char * tag) {
++#if defined(LLAMA_KVMEM)
++    const llama_kvmem_params * kp = llama_kvmem_get_params();
++    if (!src || !kp->enabled) {
++        return;
++    }
++    // Recency/identity does not need host raw-K. Skip pinning intermediates
++    // unless retrieval is on, harvest-V is on (V only), or an explicit dump.
++    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
++        if (!kp->harvest_v || tag[0] != 'v') {
++            return;
++        }
++    }
++    // Keep the pre-RoPE tensor itself (rope_ext is not in-place). Avoids a
++    // per-layer GPU cpy; harvest reads this buffer after the full graph.
++    GGML_UNUSED(ctx0);
++    ggml_format_name(src, "kvmem_%s-%d", tag, il);
++    ggml_set_output(src);
++    ggml_build_forward_expand(gf, src);
++    llama_kvmem_register_capture(src, il, tag[0]);
++#else
++    GGML_UNUSED(ctx0);
++    GGML_UNUSED(gf);
++    GGML_UNUSED(src);
++    GGML_UNUSED(il);
++    GGML_UNUSED(tag);
++#endif
++}
++
++void llm_graph_context::kvmem_capture_k(ggml_tensor * k_prerope, int il) const {
++#if defined(LLAMA_KVMEM)
++    // Prefill: full ubatch mean-K. Decode / MTP verify after pin: running mean-K.
++    if (ubatch.n_tokens <= 1) {
++        if (!llama_kvmem_want_decode_mean()) {
++            return;
++        }
++        kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
++        return;
++    }
++    if (llama_kvmem_want_prefill_capture() || llama_kvmem_want_decode_mean()) {
++        kvmem_capture_impl(ctx0, gf, k_prerope, il, "k");
++    }
++#else
++    GGML_UNUSED(k_prerope);
++    GGML_UNUSED(il);
++#endif
++}
++
++void llm_graph_context::kvmem_capture_q(ggml_tensor * q, int il) const {
++    if (ubatch.n_tokens <= 1) {
++        return;
++    }
++#if defined(LLAMA_KVMEM)
++    if (!llama_kvmem_want_q_capture(ubatch.n_tokens, 1, ubatch.logical_pos ? ubatch.logical_pos : ubatch.pos)) {
++        return;
++    }
++#endif
++    kvmem_capture_impl(ctx0, gf, q, il, "q");
++}
++
++void llm_graph_context::kvmem_capture_v(ggml_tensor * v, int il) const {
++    // Default: no prefill V. --kvmem-harvest-v (or dump) copies token-major
++    // Vcur on the same pipe as K so evict / apply_retrieval skip read_gpu_block.
++    if (ubatch.n_tokens <= 1) {
++        return;
++    }
++#if defined(LLAMA_KVMEM)
++    if (!llama_kvmem_want_prefill_capture()) {
++        return;
++    }
++    const llama_kvmem_params * kp = llama_kvmem_get_params();
++    if (!(kp && kp->harvest_v) && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
++        return;
++    }
++#else
++    GGML_UNUSED(v);
++    GGML_UNUSED(il);
++    return;
++#endif
++    kvmem_capture_impl(ctx0, gf, v, il, "v");
++}
++
+ 
+ 
+ ggml_tensor * llm_graph_context::build_cvec(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -819,6 +819,7 @@
+             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
+             ubatch.n_seqs       == other.ubatch.n_seqs &&
+             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
++            ubatch.n_pos        == other.ubatch.n_pos &&
+             (
+                 (!ubatch.token && !other.ubatch.token) ||
+                 (!ubatch.embd  && !other.ubatch.embd)  ||
+@@ -1039,6 +1040,15 @@
+     virtual ~llm_graph_context() = default;
+ 
+     void cb(ggml_tensor * cur, const char * name, int il) const;
++
++    // KVMem: side-channel copies. No-ops unless LLAMA_KVMEM is enabled and
++    // llama_kvmem_get_params()->enabled. Q is copied only when the ubatch
++    // overlaps the retrieval query span. V is copied in prefill only with
++    // --kvmem-harvest-v (or KVMEM_DUMP_CAPTURE); otherwise D2H on stage-out.
++    // Dest tensors are graph outputs named kvmem_{k,q,v}-<il>.
++    void kvmem_capture_k(ggml_tensor * k_prerope, int il) const;
++    void kvmem_capture_q(ggml_tensor * q, int il) const;
++    void kvmem_capture_v(ggml_tensor * v, int il) const;
+ 
+     //
+     // common
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -379,6 +379,31 @@
+     }
+ }
+ 
++bool llama_kv_cache::seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
++    p0 = std::max<llama_pos>(p0, 0);
++    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        auto & cells = v_cells[s];
++        for (uint32_t i = 0; i < cells.size(); ++i) {
++            if (cells.is_empty(i)) {
++                continue;
++            }
++            const auto logical = cells.ext_get(i).logical_pos;
++            const auto p = logical >= 0 ? logical : cells.pos_get(i);
++            if (p < p0 || p >= p1 || (seq_id >= 0 && !cells.seq_has(i, seq_id))) {
++                continue;
++            }
++            if (seq_id < 0) {
++                cells.rm(i);
++            } else {
++                cells.seq_rm(i, seq_id);
++            }
++            v_heads[s] = std::min(v_heads[s], i);
++        }
++    }
++    return true;
++}
++
+ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+@@ -1130,8 +1155,9 @@
+ 
+             cells.pos_set(idx, ubatch.pos[i]);
+ 
+-            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
++            if (ubatch.is_pos_2d() || ubatch.token || ubatch.logical_pos || hparams.ple_n_heads > 0) {
+                 llama_kv_cell_ext ext;
++                ext.logical_pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
+ 
+                 if (ubatch.is_pos_2d()) {
+                     ext.x = ubatch.pos[i + ubatch.n_tokens*2];
+@@ -1157,23 +1183,30 @@
+         }
+     }
+ 
+-    // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
+-    //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
+-    //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
+-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+-        if (seq_pos_max_rm[s] == -1) {
+-            continue;
+-        }
+-
+-        GGML_ASSERT(s < seq_to_stream.size());
+-
+-        auto & cells = v_cells[seq_to_stream[s]];
+-
+-        if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
+-            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
+-                    __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
+-
+-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
++    // SWA reuses cells by sliding the window; overwriting a cell means every
++    // position below the overwritten one is gone, so purge the gap. Non-SWA
++    // (including KVMem's bounded slot-pool) may hold holes: resurrected blocks
++    // sit at their original pos while the tail stays at high pos. Purging
++    // [pos_min, overwritten] would delete those holes. The comment below notes
++    // seq_pos_max_rm is empty for non-SWA when cells are not reused; if it is
++    // not empty, still do not invent a contiguous-cache invariant.
++    // ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
++    if (swa_type != LLAMA_SWA_TYPE_NONE) {
++        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
++            if (seq_pos_max_rm[s] == -1) {
++                continue;
++            }
++
++            GGML_ASSERT(s < seq_to_stream.size());
++
++            auto & cells = v_cells[seq_to_stream[s]];
++
++            if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
++                LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
++                        __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
++
++                seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
++            }
+         }
+     }
+ 
+@@ -1239,6 +1272,12 @@
+     const int32_t ikv = map_layer_ids.at(il);
+ 
+     return layers[ikv].k;
++}
++
++ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
++    const int32_t ikv = map_layer_ids.at(il);
++
++    return layers[ikv].v;
+ }
+ 
+ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+@@ -1610,7 +1649,16 @@
+ 
+             auto & idxs = seq_idxs[seq_id];
+ 
+-            if (!alibi) {
++            // The copy-and-patch shortcut only records cells near seq_pos_min.
++            // KVMem resurrects mid-document holes far below that window; they
++            // would keep a stale mask (or never be patched). Skip the shortcut
++            // when [pos_min, pos_max] is not fully populated.
++            const llama_pos sp_min = cells.seq_pos_min(seq_id);
++            const llama_pos sp_max = cells.seq_pos_max(seq_id);
++            const bool holes = sp_min >= 0 && sp_max >= sp_min &&
++                cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
++
++            if (!alibi && !holes) {
+                 if (seq_srct.find(seq_id) != seq_srct.end()) {
+                     const uint32_t srct = seq_srct[seq_id];
+ 
+@@ -1695,6 +1743,26 @@
+                 continue;
+ skip:
+                 data[idst + j] = mask_drop;
++            }
++            if (getenv("KVMEM_TRACE") && i + 1 == ubatch->n_tokens && ubatch->n_tokens > 1) {
++                int keep = 0;
++                llama_pos nmin = INT32_MAX;
++                llama_pos nmax = -1;
++                for (uint32_t j = 0; j < (uint32_t) n_kv; ++j) {
++                    if (data[idst + j] != mask_keep) {
++                        continue;
++                    }
++                    keep++;
++                    if (j < cells.size() && !cells.is_empty(j)) {
++                        const llama_pos p = cells.pos_get(j);
++                        nmin = std::min(nmin, p);
++                        nmax = std::max(nmax, p);
++                    }
++                }
++                fprintf(stderr,
++                        "KVMEM_TRACE mask last_pos=%d n_kv=%d keep=%d holes=%d keep_pos=[%d,%d]\n",
++                        (int) p1, (int) n_kv, keep, (int) holes,
++                        nmin == INT32_MAX ? -1 : (int) nmin, (int) nmax);
+             }
+         }
+     }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -165,8 +165,10 @@
+ 
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
++    ggml_tensor * get_v_storage(int32_t il) const;
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
++    bool seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+ 
+     // state_read, plus the cells the restored tokens were placed in
+     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -18,6 +18,7 @@
+     // when tok = LLAMA_TOKEN_NULL when the cell is produced by embedding input (i.e. multimodal)
+     // use case: n-gram embeddings hash
+     llama_token tok = LLAMA_TOKEN_NULL;
++    llama_pos logical_pos = -1;
+ 
+     // return true if the current 2D spatial position is greater than other
+     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -18,6 +18,7 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-kvmem-factory.h"
+ 
+ #include "llama.h"
+ #include "models/models.h"
+@@ -2213,6 +2214,12 @@
+ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+     llama_memory_i * res;
+ 
++#if defined(LLAMA_KVMEM)
++    if (llama_memory_i * kvmem = llama_memory_kvmem_maybe_create(*this, params, cparams)) {
++        return kvmem;
++    }
++#endif
++
+     switch (arch) {
+         // Models that need specific instantiation should be handled in the
+         // switch statement
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -88,6 +88,7 @@
+             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
++            kvmem_capture_q(Qcur, il);
+             Qcur = ggml_rope_ext(
+                     ctx0, Qcur, inp_pos, nullptr,
+                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+@@ -97,6 +98,7 @@
+             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+             cb(Kcur, "Kcur_normed", il);
+ 
++            kvmem_capture_k(Kcur, il);
+             Kcur = ggml_rope_ext(
+                     ctx0, Kcur, inp_pos, nullptr,
+                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+@@ -106,6 +108,7 @@
+             cb(Qcur, "Qcur", il);
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
++            kvmem_capture_v(Vcur, il);
+ 
+             cur = build_attn(inp_attn,
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -275,6 +275,8 @@
+     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Qcur, "Qcur_normed", il);
+ 
++    kvmem_capture_q(Qcur, il);
++
+     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+     cb(Kcur, "Kcur", il);
+ 
+@@ -285,6 +287,8 @@
+     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Kcur, "Kcur_normed", il);
++
++    kvmem_capture_k(Kcur, il);
+ 
+     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+         ggml_element_size(Qcur_full) * n_embd_head * 2,
+@@ -311,6 +315,7 @@
+     cb(Qcur, "Qcur", il);
+     cb(Kcur, "Kcur", il);
+     cb(Vcur, "Vcur", il);
++    kvmem_capture_v(Vcur, il);
+ 
+     // Attention computation
+     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+@@ -576,10 +581,12 @@
+     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Kcur, "mtp_Kcur_normed", il);
++    kvmem_capture_k(Kcur, il);
+ 
+     ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+     cb(Vcur, "mtp_Vcur", il);
++    kvmem_capture_v(Vcur, il);
+ 
+     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
+--- a/tools/mtmd/mtmd-helper.cpp
++++ b/tools/mtmd/mtmd-helper.cpp
+@@ -115,7 +115,7 @@
+ };
+ 
+ // Helper function for decoding an image whose embeddings have already been calculated
+-int32_t mtmd_helper_decode_image_chunk(
++int32_t mtmd_helper_decode_image_chunk_with_decoder(
+         mtmd_context * ctx,
+         struct llama_context * lctx,
+         const mtmd_input_chunk * chunk,
+@@ -125,7 +125,7 @@
+         int32_t n_batch,
+         llama_pos * new_n_past,
+         mtmd_helper_post_decode_callback callback,
+-        void * user_data) {
++        void * user_data, mtmd_helper_decode_callback decoder) {
+     GGML_ASSERT(n_batch > 0);
+     auto chunk_type = mtmd_input_chunk_get_type(chunk);
+     const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
+@@ -174,7 +174,7 @@
+         LOG_INF("decoding %s batch %d/%d, n_tokens_batch = %d\n", name, i_batch+1, n_img_batches, n_tokens_batch);
+ 
+         int64_t t1 = ggml_time_ms();
+-        int32_t ret = llama_decode(lctx, batch_embd_view);
++        int32_t ret = decoder ? decoder(lctx, batch_embd_view, user_data) : llama_decode(lctx, batch_embd_view);
+         if (ret != 0) {
+             LOG_ERR("failed to decode %s\n", name);
+             return ret;
+@@ -197,6 +197,14 @@
+     *new_n_past = n_past;
+ 
+     return 0;
++}
++
++int32_t mtmd_helper_decode_image_chunk(
++        mtmd_context * ctx, llama_context * lctx, const mtmd_input_chunk * chunk,
++        float * encoded_embd, llama_pos n_past, llama_seq_id seq_id, int32_t n_batch,
++        llama_pos * new_n_past, mtmd_helper_post_decode_callback callback, void * user_data) {
++    return mtmd_helper_decode_image_chunk_with_decoder(ctx, lctx, chunk, encoded_embd,
++            n_past, seq_id, n_batch, new_n_past, callback, user_data, nullptr);
+ }
+ 
+ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
+--- a/tools/mtmd/mtmd-helper.h
++++ b/tools/mtmd/mtmd-helper.h
+@@ -133,6 +133,14 @@
+                                                 mtmd_helper_post_decode_callback callback,
+                                                 void * user_data);
+ 
++// Alternate decode dispatch; preserves native batching, positions and attention setup.
++typedef int32_t (*mtmd_helper_decode_callback)(struct llama_context * lctx, struct llama_batch batch, void * user_data);
++MTMD_API int32_t mtmd_helper_decode_image_chunk_with_decoder(
++        mtmd_context * ctx, struct llama_context * lctx, const mtmd_input_chunk * chunk,
++        float * encoded_embd, llama_pos n_past, llama_seq_id seq_id, int32_t n_batch,
++        llama_pos * new_n_past, mtmd_helper_post_decode_callback callback,
++        void * user_data, mtmd_helper_decode_callback decoder);
++
+ //
+ // video input helpers (requires ffmpeg/ffprobe installed on the system)
+ // the notion of video only exists at the helper level, it is not visible to the core mtmd library
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1129,6 +1129,90 @@
+     }
+ }
+ 
++void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
++                                 std::vector<raw_buffer> & out_files) {
++    // get input files
++    if (!body.contains("messages")) {
++        throw std::invalid_argument("'messages' is required");
++    }
++    json & messages = body.at("messages");
++    if (!messages.is_array()) {
++        throw std::invalid_argument("Expected 'messages' to be an array");
++    }
++    for (auto & msg : messages) {
++        std::string role = json_value(msg, "role", std::string());
++        if (role != "assistant" && !msg.contains("content")) {
++            throw std::invalid_argument("All non-assistant messages must contain 'content'");
++        }
++        if (role == "assistant") {
++            if (!msg.contains("content") && !msg.contains("tool_calls")) {
++                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
++            }
++            if (!msg.contains("content")) {
++                continue; // avoid errors with no content
++            }
++        }
++        json & content = msg.at("content");
++        if (content.is_string() || content.is_null()) {
++            continue;
++        }
++
++        if (!content.is_array()) {
++            throw std::invalid_argument("Expected 'content' to be a string or an array");
++        }
++
++        for (auto & p : content) {
++            std::string type = json_value(p, "type", std::string());
++            if (type == "image_url") {
++                if (!opt.allow_image) {
++                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
++                }
++
++                json image_url = json_value(p, "image_url", json::object());
++                std::string url = json_value(image_url, "url", std::string());
++                handle_media(out_files, url, opt.media_path, true);
++
++                p["type"] = "media_marker";
++                p["text"] = get_media_marker();
++                p.erase("image_url");
++
++            } else if (type == "input_audio") {
++                if (!opt.allow_audio) {
++                    throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
++                }
++
++                // note: don't need to validate "format", it's redundant
++                json input_audio = json_value(p, "input_audio", json::object());
++                std::string url  = json_value(input_audio, "data",
++                                        json_value(input_audio, "url", std::string()));
++                handle_media(out_files, url, opt.media_path, false);
++
++                p["type"] = "media_marker";
++                p["text"] = get_media_marker();
++                p.erase("input_audio");
++
++            } else if (type == "input_video") {
++                if (!opt.allow_video) {
++                    throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
++                }
++
++                json input_video = json_value(p, "input_video", json::object());
++                std::string url  = json_value(input_video, "data",
++                                        json_value(input_video, "url", std::string()));
++                handle_media(out_files, url, opt.media_path, false);
++
++                p["type"] = "media_marker";
++                p["text"] = get_media_marker();
++                p.erase("input_video");
++
++            } else if (type != "text") {
++                throw std::invalid_argument("unsupported content[].type");
++            }
++        }
++    }
++
++}
++
+ // used by /chat/completions endpoint
+ json oaicompat_chat_params_parse(
+     json & body, /* openai api json semantics */
+@@ -1180,85 +1264,8 @@
+         }
+     }
+ 
+-    // get input files
+-    if (!body.contains("messages")) {
+-        throw std::invalid_argument("'messages' is required");
+-    }
++    oaicompat_chat_process_media(body, opt, out_files);
+     json & messages = body.at("messages");
+-    if (!messages.is_array()) {
+-        throw std::invalid_argument("Expected 'messages' to be an array");
+-    }
+-    for (auto & msg : messages) {
+-        std::string role = json_value(msg, "role", std::string());
+-        if (role != "assistant" && !msg.contains("content")) {
+-            throw std::invalid_argument("All non-assistant messages must contain 'content'");
+-        }
+-        if (role == "assistant") {
+-            if (!msg.contains("content") && !msg.contains("tool_calls")) {
+-                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
+-            }
+-            if (!msg.contains("content")) {
+-                continue; // avoid errors with no content
+-            }
+-        }
+-        json & content = msg.at("content");
+-        if (content.is_string() || content.is_null()) {
+-            continue;
+-        }
+-
+-        if (!content.is_array()) {
+-            throw std::invalid_argument("Expected 'content' to be a string or an array");
+-        }
+-
+-        for (auto & p : content) {
+-            std::string type = json_value(p, "type", std::string());
+-            if (type == "image_url") {
+-                if (!opt.allow_image) {
+-                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+-                }
+-
+-                json image_url = json_value(p, "image_url", json::object());
+-                std::string url = json_value(image_url, "url", std::string());
+-                handle_media(out_files, url, opt.media_path, true);
+-
+-                p["type"] = "media_marker";
+-                p["text"] = get_media_marker();
+-                p.erase("image_url");
+-
+-            } else if (type == "input_audio") {
+-                if (!opt.allow_audio) {
+-                    throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+-                }
+-
+-                // note: don't need to validate "format", it's redundant
+-                json input_audio = json_value(p, "input_audio", json::object());
+-                std::string url  = json_value(input_audio, "data",
+-                                        json_value(input_audio, "url", std::string()));
+-                handle_media(out_files, url, opt.media_path, false);
+-
+-                p["type"] = "media_marker";
+-                p["text"] = get_media_marker();
+-                p.erase("input_audio");
+-
+-            } else if (type == "input_video") {
+-                if (!opt.allow_video) {
+-                    throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+-                }
+-
+-                json input_video = json_value(p, "input_video", json::object());
+-                std::string url  = json_value(input_video, "data",
+-                                        json_value(input_video, "url", std::string()));
+-                handle_media(out_files, url, opt.media_path, false);
+-
+-                p["type"] = "media_marker";
+-                p["text"] = get_media_marker();
+-                p.erase("input_video");
+-
+-            } else if (type != "text") {
+-                throw std::invalid_argument("unsupported content[].type");
+-            }
+-        }
+-    }
+ 
+     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
+ 
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -323,6 +323,9 @@
+ json oaicompat_completion_params_parse(const json & body);
+ 
+ // used by /chat/completions endpoint
++void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
++                                 std::vector<raw_buffer> & out_files);
++
+ json oaicompat_chat_params_parse(
+     json & body, /* openai api json semantics */
+     const server_chat_params & opt,
+diff --git a/src/llama-kvmem-factory.h b/src/llama-kvmem-factory.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-kvmem-factory.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++// Thin hook used by llama_model::create_memory when LLAMA_KVMEM is enabled.
++// Implementation lives out-of-tree in src/adapter/.
++
++struct llama_memory_i;
++struct llama_model;
++struct llama_memory_params;
++struct llama_cparams;
++
++#if defined(LLAMA_KVMEM)
++llama_memory_i * llama_memory_kvmem_maybe_create(
++        const llama_model & model,
++        const llama_memory_params & params,
++        const llama_cparams & cparams);
++#endif

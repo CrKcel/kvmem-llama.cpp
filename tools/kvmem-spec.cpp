@@ -217,7 +217,8 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         int n_predict,
         common_params_sampling sparams,
         kvmem_spec_on_token on_token,
-        const std::function<bool()> & abort) {
+        const std::function<bool()> & abort,
+        llama_pos position_offset) {
     kvmem_spec_gen_stats st;
     if (!sess.ok || !sess.spec || prompt.empty() || n_predict <= 0) {
         st.failed = true;
@@ -252,6 +253,9 @@ kvmem_spec_gen_stats kvmem_spec_generate(
     int n_past = (int) prompt.size() - 1;
     llama_batch batch_tgt = llama_batch_init((int) llama_n_batch(ctx_tgt), 0, 1);
     llama_tokens draft;
+    std::vector<llama_pos> logical_positions(llama_n_batch(ctx_tgt));
+    batch_tgt.logical_pos = logical_positions.data();
+    std::vector<uint8_t> driver_ckpt;
     common_prompt_checkpoint ckpt;
     bool has_eos = false;
 
@@ -261,6 +265,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             break;
         }
         if (draft.empty()) {
+            common_speculative_get_state(spec, seq_id, driver_ckpt);
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             ckpt.update_pos(
                     (int64_t) prompt_tgt.size(),
@@ -278,10 +283,11 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             common_speculative_get_draft_params(spec, seq_id) = {
                 /* .drafting   = */ true,
                 /* .n_max      = */ n_draft_max,
-                /* .n_past     = */ n_past,
+                /* .n_past     = */ n_past + position_offset,
                 /* .id_last    = */ id_last,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft,
+                /* .n_past_logical = */ n_past,
             };
             common_speculative_draft(spec);
 
@@ -297,15 +303,17 @@ kvmem_spec_gen_stats kvmem_spec_generate(
                 }
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 if (mem_dft) {
-                    llama_memory_seq_rm(mem_dft, seq_id, ckpt.pos_max + 1, -1);
+                    llama_kvmem_remove_logical(ctx_dft, (llama_pos) ckpt.n_tokens, -1);
                 }
             }
         }
 
         common_batch_clear(batch_tgt);
-        common_batch_add(batch_tgt, id_last, n_past++, { seq_id }, true);
+        logical_positions[0] = n_past;
+        common_batch_add(batch_tgt, id_last, n_past++ + position_offset, { seq_id }, true);
         for (size_t i = 0; i < draft.size(); ++i) {
-            common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { seq_id }, true);
+            logical_positions[batch_tgt.n_tokens] = n_past + (llama_pos) i;
+            common_batch_add(batch_tgt, draft[i], n_past + position_offset + (llama_pos) i, { seq_id }, true);
         }
 
         const int rc = llama_decode(ctx_tgt, batch_tgt);
@@ -330,6 +338,13 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         }
 
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        ids.resize(std::min(ids.size(), (size_t) (n_predict - st.n_gen)));
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (llama_vocab_is_eog(vocab, ids[i])) {
+                ids.resize(i + 1);
+                break;
+            }
+        }
         const bool restore = host_ckpt && ids.size() - 1 < n_draft;
         fprintf(stderr,
                 "KVMEM_TRACE spec_verify n_draft=%zu n_accept=%zu restore=%d pos=%d ckpt_bytes=%zu n_rs=%u\n",
@@ -343,18 +358,20 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             if (mem_tgt) {
-                llama_memory_seq_rm(mem_tgt, seq_id, ckpt.pos_max + 1, -1);
+                llama_kvmem_remove_logical(ctx_tgt, (llama_pos) ckpt.n_tokens, -1);
             }
             if (ctx_dft) {
                 ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 if (mem_dft) {
-                    llama_memory_seq_rm(mem_dft, seq_id, ckpt.pos_max + 1, -1);
+                    llama_kvmem_remove_logical(ctx_dft, (llama_pos) ckpt.n_tokens, -1);
                 }
             }
             prompt_tgt.resize((size_t) ckpt.n_tokens);
             smpl = std::move(smpl_save);
             n_past = (int) prompt_tgt.size();
+            llama_kvmem_truncate_cached(n_past);
+            if (!driver_ckpt.empty()) common_speculative_set_state(spec, seq_id, driver_ckpt);
             continue;
         }
 
@@ -385,15 +402,16 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         {
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             if (mem_tgt) {
-                llama_memory_seq_rm(mem_tgt, seq_id, n_past, -1);
+                llama_kvmem_remove_logical(ctx_tgt, n_past, -1);
             }
             if (ctx_dft) {
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 if (mem_dft) {
-                    llama_memory_seq_rm(mem_dft, seq_id, n_past, -1);
+                    llama_kvmem_remove_logical(ctx_dft, n_past, -1);
                 }
             }
         }
+        llama_kvmem_truncate_cached(n_past);
     }
 
     fprintf(stderr,
@@ -404,6 +422,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
     llama_kvmem_decode_mean_discard();
     common_speculative_print_stats(spec);
 
+    st.n_past = n_past;
     llama_batch_free(batch_tgt);
     return st;
 }

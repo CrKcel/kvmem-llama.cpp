@@ -2,6 +2,7 @@
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
+#include "kvmem-vision.h"
 
 #include "chat.h"
 #include "common.h"
@@ -36,6 +37,11 @@ static void print_usage(const char * argv0) {
             "  Independent single-slot OpenAI-compatible server. Does not patch llama-server.\n"
             "\n"
             "  -m, --model PATH           GGUF path\n"
+            "  --mmproj PATH              vision projector GGUF\n"
+            "  --mmproj-offload           place vision encoder on GPU (default)\n"
+            "  --no-mmproj-offload        place vision encoder on CPU\n"
+            "  --image-min-tokens N       native minimum image token count\n"
+            "  --image-max-tokens N       native maximum image token count\n"
             "  --host HOST                bind address (default 127.0.0.1)\n"
             "  --port N                   port (default 8080)\n"
             "  -c, --ctx-size N           context size (default 2048)\n"
@@ -109,6 +115,7 @@ static int force_pos_from_substr(const llama_vocab * vocab, const std::vector<ll
     }
     std::string acc;
     for (int i = 0; i < (int) toks.size(); ++i) {
+        if (toks[(size_t) i] == LLAMA_TOKEN_NULL) continue;
         acc += token_piece(vocab, toks[(size_t) i]);
         if (acc.find(needle) != std::string::npos) {
             return i;
@@ -116,6 +123,14 @@ static int force_pos_from_substr(const llama_vocab * vocab, const std::vector<ll
     }
     return -1;
 }
+
+struct MultimodalCheckpoint {
+    int row = 0;
+    bool media_boundary = false;
+    std::vector<uint8_t> recurrent;
+    std::vector<uint8_t> draft_carry;
+    std::vector<float> tail_mean;
+};
 
 struct ServerState {
     std::mutex mu;
@@ -141,8 +156,25 @@ struct ServerState {
     int reasoning_budget_default = -1;
     std::string reasoning_budget_message;
     std::vector<llama_token> cached_tokens;
+    std::unique_ptr<kvmem_vision> vision;
+    std::shared_ptr<kvmem_prompt> active_prompt;
+    std::shared_ptr<kvmem_prompt> cached_prompt;
+    std::vector<MultimodalCheckpoint> mm_checkpoints;
+    std::shared_ptr<MultimodalCheckpoint> mm_rollback;
+    std::shared_ptr<kvmem_prompt> mm_rollback_prompt;
+    int mm_live_row = 0;
+    bool mm_committed = true;
+    uint32_t mm_new_text = 0;
+    uint32_t mm_new_image = 0;
+    uint32_t mm_replayed = 0;
+    uint32_t mm_tail_replayed = 0;
+    int mm_lcp = 0;
+    std::string mm_error;
+    int mm_error_status = 500;
+    bool mm_reset_requested = false;
     int perf_p_eval = 0;
     std::vector<uint8_t> gdn_ckpt;
+    std::vector<uint8_t> gdn_carry, gdn_query_carry;
     int gdn_ckpt_pos = -1; // gen-start (eval_end-1); next-turn suffix rewind
     std::vector<uint8_t> gdn_ckpt_query;
     int gdn_ckpt_query_pos = -1; // last query-begin; fallback if LCP < gen-start
@@ -207,6 +239,7 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
                        const char * what, StreamIo * io = nullptr);
 static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, int pos0, int pos1,
                                   const char * what, StreamIo * io = nullptr);
+static void multimodal_commit(ServerState & st, const std::vector<llama_token> & gen);
 
 static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & prompt, int n_past,
                         StreamIo * io = nullptr) {
@@ -215,13 +248,18 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
     }
     const llama_pos want = n_past - 1;
     llama_pos rmax = llama_kvmem_recr_pos_max();
-    if (rmax == want) {
-        return true;
+    std::vector<uint8_t> carry;
+    llama_pos draft_rows = n_past;
+    if (st.spec.ok) {
+        common_speculative_get_state(st.spec.spec, 0, carry);
+        if (carry.size() >= sizeof(draft_rows)) std::memcpy(&draft_rows, carry.data(), sizeof(draft_rows));
     }
+    if (rmax == want && draft_rows == n_past) return true;
+    const std::vector<uint8_t> * saved_carry = nullptr;
     const uint8_t * blob = nullptr;
     size_t blob_n = 0;
     int ckpt_pos = -1;
-    auto consider = [&](const std::vector<uint8_t> & buf, int pos) {
+    auto consider = [&](const std::vector<uint8_t> & buf, int pos, const std::vector<uint8_t> & saved) {
         if (buf.empty() || pos < 0 || pos > want) {
             return;
         }
@@ -229,10 +267,11 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
             blob = buf.data();
             blob_n = buf.size();
             ckpt_pos = pos;
+            saved_carry = &saved;
         }
     };
-    consider(st.gdn_ckpt, st.gdn_ckpt_pos);
-    consider(st.gdn_ckpt_query, st.gdn_ckpt_query_pos);
+    consider(st.gdn_ckpt, st.gdn_ckpt_pos, st.gdn_carry);
+    consider(st.gdn_ckpt_query, st.gdn_ckpt_query_pos, st.gdn_query_carry);
     if (blob == nullptr) {
         fprintf(stderr, "KVMEM_TRACE gdn_sync fail rmax=%d want=%d ckpt_pos=%d query_pos=%d\n",
                 (int) rmax, (int) want, st.gdn_ckpt_pos, st.gdn_ckpt_query_pos);
@@ -244,12 +283,14 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
         return false;
     }
     const int from = ckpt_pos + 1;
+    if (st.spec.ok) {
+        if (!saved_carry || saved_carry->empty()) return false;
+        common_speculative_set_state(st.spec.spec, 0, *saved_carry);
+        if (!llama_kvmem_remove_logical(st.spec.ctx_dft, from, -1)) return false;
+    }
     if (from < n_past) {
-        // Trunk only. MTP draft still holds [from, n_past) after seq_rm(n_past,-1);
-        // spec_decode_span would llama_decode(ctx_dft) at Y=from while X=n_past-1
-        // and M-RoPE rejects X < Y.
         llama_kvmem_set_replay(true);
-        const int rc = decode_span(st.ctx, prompt.data(), from, n_past, st.n_batch, "gdn-catchup", io);
+        const int rc = decode_span_maybe_spec(st, prompt.data(), from, n_past, "gdn-catchup", io);
         llama_kvmem_set_replay(false);
         if (rc == KVMEM_DECODE_ABORT) {
             if (io) {
@@ -289,7 +330,18 @@ static void memory_clear_all(ServerState & st) {
         }
     }
     st.cached_tokens.clear();
+    st.cached_prompt.reset();
+    st.mm_checkpoints.clear();
+    st.mm_live_row = 0;
     st.gdn_ckpt.clear();
+    st.gdn_carry.clear();
+    st.gdn_query_carry.clear();
+    if (st.spec.ok) {
+        std::vector<uint8_t> carry;
+        common_speculative_get_state(st.spec.spec, 0, carry);
+        std::fill(carry.begin(), carry.end(), 0);
+        common_speculative_set_state(st.spec.spec, 0, carry);
+    }
     st.gdn_ckpt_pos = -1;
     st.gdn_ckpt_query.clear();
     st.gdn_ckpt_query_pos = -1;
@@ -318,6 +370,7 @@ static void persist_gdn_ckpt_gen_start(ServerState & st, int eval_end) {
         return;
     }
     st.gdn_ckpt.swap(buf);
+    if (st.spec.ok) common_speculative_get_state(st.spec.spec, 0, st.gdn_carry);
     st.gdn_ckpt_pos = eval_end - 1;
     fprintf(stderr,
             "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu ckpt_pos=%d what=gen_start\n",
@@ -329,6 +382,8 @@ static void commit_cached(ServerState & st, const std::vector<llama_token> & pro
     st.cached_tokens = prompt;
     st.cached_tokens.insert(st.cached_tokens.end(), gen.begin(), gen.end());
     st.last_n_gen = (int) gen.size();
+    if (st.vision) multimodal_commit(st, gen);
+    else st.cached_prompt = st.active_prompt->with_generated(gen);
     fprintf(stderr, "KVMEM_TRACE cache_commit n_prompt=%d n_gen=%d n_cached=%d stored=%u\n",
             (int) prompt.size(), (int) gen.size(), (int) st.cached_tokens.size(),
             llama_kvmem_store_n_tokens());
@@ -380,8 +435,11 @@ static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, in
     return decode_span(st.ctx, toks, pos0, pos1, st.n_batch, what, io);
 }
 
+#include "kvmem-multimodal-server.h"
+
 static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt,
                                  StreamIo * io = nullptr, int * n_cache_hit = nullptr) {
+    if (st.vision) return run_prefill_multimodal(st, io, n_cache_hit);
     if (!stream_heartbeat(io)) {
         fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill_start n_prompt=%d\n",
                 (int) prompt.size());
@@ -484,7 +542,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         }
         // Continuation already has GDN at n_past. Catch-up from query would
         // llama_decode at q0 while seq_pos_max is n_past-1 (M-RoPE X < Y).
-        if (!warm_skip && !past_query && !gdn_sync_to(st, prompt, n_past, io)) {
+        if (!warm_skip && !gdn_sync_to(st, prompt, n_past, io)) {
             if (io && io->aborted) {
                 return false;
             }
@@ -662,6 +720,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
             return false;
         }
         st.gdn_ckpt_query = gdn_ckpt;
+        if (st.spec.ok) common_speculative_get_state(st.spec.spec, 0, st.gdn_query_carry);
         st.gdn_ckpt_query_pos = q0 > 0 ? q0 - 1 : -1;
         fprintf(stderr,
                 "KVMEM_TRACE gdn_ckpt_query pos_end=%d bytes=%zu query_begin=%d ckpt_pos=%d\n",
@@ -1356,6 +1415,9 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 
 int main(int argc, char ** argv) {
     std::string model_path;
+    std::string mmproj_path;
+    bool mmproj_gpu = true;
+    int image_min_tokens = -1, image_max_tokens = -1;
     std::string host = "127.0.0.1";
     std::string nvme_dir;
     int port = 8080;
@@ -1385,6 +1447,23 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (eq(arg, "-m") || eq(arg, "--model")) {
             model_path = need(arg);
+        } else if (eq(arg, "--mmproj")) {
+            mmproj_path = need(arg);
+        } else if (eq(arg, "--mmproj-offload")) {
+            mmproj_gpu = true;
+        } else if (eq(arg, "--no-mmproj-offload")) {
+            mmproj_gpu = false;
+        } else if (eq(arg, "--image-min-tokens") || eq(arg, "--image-max-tokens")) {
+            const std::string value = need(arg);
+            try {
+                size_t used = 0;
+                const int n = std::stoi(value, &used);
+                if (used != value.size() || n <= 0) throw std::invalid_argument("positive integer required");
+                (eq(arg, "--image-min-tokens") ? image_min_tokens : image_max_tokens) = n;
+            } catch (...) {
+                fprintf(stderr, "%s requires a positive integer\n", arg);
+                return 1;
+            }
         } else if (eq(arg, "--host")) {
             host = need(arg);
         } else if (eq(arg, "--port")) {
@@ -1590,6 +1669,17 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (!mmproj_path.empty()) {
+        try {
+            if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
+                throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
+            st.vision = std::make_unique<kvmem_vision>(st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "%s\n", e.what());
+            return 1;
+        }
+    }
+
     httplib::Server svr;
     svr.set_read_timeout(1800, 0);
     svr.set_write_timeout(1800, 0);
@@ -1616,8 +1706,9 @@ int main(int argc, char ** argv) {
 
     auto handle_chat = [&](const httplib::Request & req, httplib::Response & res) {
         json body;
+        std::vector<std::vector<uint8_t>> media_files;
         try {
-            body = json::parse(req.body);
+            body = json::parse(kvmem_parse_media_messages(req.body, st.vision != nullptr, media_files));
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
@@ -1634,6 +1725,11 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", err}}.dump(), "application/json");
             return;
         }
+        if (body.contains("cache_reset") && !body["cache_reset"].is_boolean()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"cache_reset must be a boolean\"}", "application/json");
+            return;
+        }
 
         cr.sampling = kvmem_chat_sampling_defaults(cr.enable_thinking);
         if (!kvmem_chat_sampling_override(st.sampling_overrides, cr.sampling, err) ||
@@ -1644,6 +1740,7 @@ int main(int argc, char ** argv) {
         }
 
         auto slot = std::make_shared<std::unique_lock<std::mutex>>(st.mu);
+        st.mm_reset_requested = body.value("cache_reset", false);
 
         common_chat_templates_inputs inputs;
         inputs.messages = cr.msgs;
@@ -1666,7 +1763,18 @@ int main(int argc, char ** argv) {
         }
         const common_chat_params formatted = common_chat_templates_apply(st.tmpls.get(), inputs);
         const std::string & prompt = formatted.prompt;
-        auto toks = tokenize_text(st.vocab, prompt, true);
+        std::shared_ptr<kvmem_prompt> parsed_prompt;
+        try {
+            parsed_prompt = media_files.empty()
+                ? std::make_shared<kvmem_prompt>(tokenize_text(st.vocab, prompt, true))
+                : st.vision->tokenize(prompt, media_files);
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        st.active_prompt = parsed_prompt;
+        auto toks = parsed_prompt->tokens;
         if (toks.empty()) {
             res.status = 400;
             res.set_content("{\"error\":\"empty prompt\"}", "application/json");
@@ -1684,7 +1792,21 @@ int main(int argc, char ** argv) {
         if (qbegin < 0 || qend < 0) {
             derive_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
         }
+        if (parsed_prompt->has_media() && cr.query_begin < 0) {
+            // The final text question follows native visual chunks and their boundaries.
+            int last_media_end = 0;
+            for (const auto & range : parsed_prompt->media_ranges()) last_media_end = range.second;
+            qend = (int) toks.size() - (st.spec.ok ? 1 : 0);
+            qbegin = std::max(last_media_end, qend - st.query_max_tokens);
+        }
         clamp_query_span(st, qbegin, qend);
+        try {
+            multimodal_validate_capacity(st, *parsed_prompt, qbegin, (int) toks.size());
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
         const int force = force_pos_from_substr(st.vocab, toks, cr.force_substr);
         st.kparams.query_begin = qbegin;
         st.kparams.query_end = qend;
@@ -1753,6 +1875,12 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "KVMEM_TRACE spec sampler init failed (%s); greedy fallback\n", e.what());
                 use_spec = false;
             }
+        }
+
+        if (st.vision && st.spec.ok && !use_spec) {
+            res.status = 400;
+            res.set_content("{\"error\":\"MTP sampler could not initialize for this request\"}", "application/json");
+            return;
         }
 
         auto make_emit_gen_wall = [n_prompt = (int) toks.size()](
@@ -1833,9 +1961,10 @@ int main(int argc, char ** argv) {
                     int n_cache_hit = 0;
                     if (!run_prefill_retrieval(st, toks, &io, &n_cache_hit)) {
                         if (!io.aborted) {
-                            send(json{{"error", "prefill/retrieval failed"}}.dump());
-                            sink.write("data: [DONE]\n\n", 15);
+                            send(json{{"error", st.mm_error.empty() ? "prefill/retrieval failed" : st.mm_error}}.dump());
+                            sink.write("data: [DONE]\n\n", 14);
                         }
+                        multimodal_finish_request(st);
                         slot->unlock();
                         sink.done();
                         return true;
@@ -1853,7 +1982,7 @@ int main(int argc, char ** argv) {
                     StreamChatOut sco(formatted, parse_tools);
                     bool aborted = false;
                     if (spec_stream) {
-                        kvmem_spec_generate(st.ctx, st.model, st.spec, toks, max_tokens, sparams,
+                        const auto gst = kvmem_spec_generate(st.ctx, st.model, st.spec, toks, max_tokens, sparams,
                             [&](llama_token id, const std::string & piece, bool) {
                                 gen.push_back(id);
                                 content += piece;
@@ -1861,8 +1990,11 @@ int main(int argc, char ** argv) {
                                     send(stream_choice_chunk(cid, delta, nullptr).dump());
                                 }
                             },
-                            [&]() { return !stream_heartbeat(&io); });
-                        aborted = io.aborted;
+                            [&]() { return !stream_heartbeat(&io); },
+                            st.active_prompt->model_pos(toks.size()) - (llama_pos) toks.size());
+                        aborted = io.aborted || gst.failed;
+                        st.mm_live_row = gst.n_past;
+                        if (gst.failed) send(json{{"error", "speculative decode failed"}}.dump());
                     } else {
                         common_sampler * smpl = nullptr;
                         try {
@@ -1871,14 +2003,16 @@ int main(int argc, char ** argv) {
                         } catch (const std::exception & e) {
                             fprintf(stderr, "sampler init failed: %s\n", e.what());
                             send(json{{"error", std::string("sampler init failed: ") + e.what()}}.dump());
-                            sink.write("data: [DONE]\n\n", 15);
+                            sink.write("data: [DONE]\n\n", 14);
+                            multimodal_finish_request(st);
                             slot->unlock();
                             sink.done();
                             return true;
                         }
                         if (!smpl) {
                             send(json{{"error", "sampler init failed"}}.dump());
-                            sink.write("data: [DONE]\n\n", 15);
+                            sink.write("data: [DONE]\n\n", 14);
+                            multimodal_finish_request(st);
                             slot->unlock();
                             sink.done();
                             return true;
@@ -1897,9 +2031,10 @@ int main(int argc, char ** argv) {
                                 break;
                             }
                             std::string piece = token_piece(vocab, id);
-                            llama_batch batch = llama_batch_get_one(&id, 1);
-                            if (llama_decode(ctx, batch) != 0) {
+                            if (multimodal_decode_generated(st, id, (int) toks.size() + (int) gen.size()) != 0) {
                                 fprintf(stderr, "llama_decode(gen) failed\n");
+                                aborted = true;
+                                send(json{{"error", "decode failed"}}.dump());
                                 break;
                             }
                             content += piece;
@@ -1914,6 +2049,7 @@ int main(int argc, char ** argv) {
                         }
                         common_sampler_free(smpl);
                         if (aborted) {
+                            multimodal_finish_request(st);
                             slot->unlock();
                             sink.done();
                             return true;
@@ -1933,12 +2069,14 @@ int main(int argc, char ** argv) {
                         commit_cached(st, toks, gen);
                         send(stream_choice_chunk(cid, json::object(), finish).dump());
                         send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit).dump());
-                        sink.write("data: [DONE]\n\n", 15);
+                        sink.write("data: [DONE]\n\n", 14);
+                        multimodal_finish_request(st);
                         slot->unlock();
                         sink.done();
                         return true;
                     }
                     if (aborted) {
+                        multimodal_finish_request(st);
                         slot->unlock();
                         sink.done();
                         return true;
@@ -1957,7 +2095,8 @@ int main(int argc, char ** argv) {
                     commit_cached(st, toks, gen);
                     send(stream_choice_chunk(cid, json::object(), finish).dump());
                     send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit).dump());
-                    sink.write("data: [DONE]\n\n", 15);
+                    sink.write("data: [DONE]\n\n", 14);
+                    multimodal_finish_request(st);
                     slot->unlock();
                     sink.done();
                     return true;
@@ -1965,6 +2104,10 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        struct request_guard {
+            ServerState & st;
+            ~request_guard() { multimodal_finish_request(st); }
+        } guard {st};
         StreamIo io;
         io.req = &req;
         const auto t_turn0 = std::chrono::steady_clock::now();
@@ -1974,8 +2117,8 @@ int main(int argc, char ** argv) {
                         (int) toks.size());
                 return;
             }
-            res.status = 500;
-            res.set_content("{\"error\":\"prefill/retrieval failed\"}", "application/json");
+            res.status = st.vision ? st.mm_error_status : 500;
+            res.set_content(json{{"error", st.mm_error.empty() ? "prefill/retrieval failed" : st.mm_error}}.dump(), "application/json");
             return;
         }
         const auto t_pf1 = std::chrono::steady_clock::now();
@@ -1994,12 +2137,15 @@ int main(int argc, char ** argv) {
                     [&](llama_token id, const std::string & piece, bool) {
                         gen.push_back(id);
                         content += piece;
-                    });
+                    }, [&]() { return !stream_heartbeat(&io); },
+                    st.active_prompt->model_pos(toks.size()) - (llama_pos) toks.size());
             if (gst.failed) {
                 res.status = 500;
                 res.set_content("{\"error\":\"speculative decode failed\"}", "application/json");
                 return;
             }
+            st.mm_live_row = gst.n_past;
+            if (io.aborted) return;
             emit_gen_wall((int) gen.size());
             commit_cached(st, toks, gen);
             emit_json(content, (int) gen.size(), (int) gen.size() >= cr.max_tokens);
@@ -2022,7 +2168,8 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        auto gen_one = [ctx, smpl, vocab](std::string & piece, bool & stopped, llama_token & id_out) -> bool {
+        int next_row = (int) toks.size();
+        auto gen_one = [ctx, smpl, vocab, &st, &next_row](std::string & piece, bool & stopped, llama_token & id_out) -> bool {
             llama_token id = common_sampler_sample(smpl, ctx, -1);
             common_sampler_accept(smpl, id, true);
             if (llama_vocab_is_eog(vocab, id)) {
@@ -2031,8 +2178,7 @@ int main(int argc, char ** argv) {
             }
             id_out = id;
             piece = token_piece(vocab, id);
-            llama_batch batch = llama_batch_get_one(&id, 1);
-            if (llama_decode(ctx, batch) != 0) {
+            if (multimodal_decode_generated(st, id, next_row++) != 0) {
                 fprintf(stderr, "llama_decode(gen) failed\n");
                 return false;
             }
@@ -2043,6 +2189,10 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> gen;
         bool stopped = false;
         while ((int) gen.size() < cr.max_tokens && !stopped) {
+            if (!stream_heartbeat(&io)) {
+                common_sampler_free(smpl);
+                return;
+            }
             std::string piece;
             llama_token id = 0;
             if (!gen_one(piece, stopped, id)) {
@@ -2079,6 +2229,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "listen failed\n");
         return 1;
     }
+    st.vision.reset();
     kvmem_spec_stop(st.spec);
     llama_free(st.ctx);
     llama_model_free(st.model);

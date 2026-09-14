@@ -11,8 +11,7 @@ bool kvmem_fill_slot_info(
     if (ubatch.n_tokens == 0 || block_tokens == 0 || !ubatch.pos) {
         return false;
     }
-    // n_pos > 1 is M-RoPE. Dim 0 is the sequential token position (text
-    // tokens broadcast that value across the other dims).
+    // Logical rows stay unique when image patches share M-RoPE positions.
 
     out.s0 = 0;
     out.s1 = 0;
@@ -26,7 +25,7 @@ bool kvmem_fill_slot_info(
             LLAMA_LOG_ERROR("%s: KVMem P1 is single-sequence only\n", __func__);
             return false;
         }
-        const llama_pos pos = ubatch.pos[i];
+        const llama_pos pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
         if (pos < 0) {
             LLAMA_LOG_ERROR("%s: negative pos at token %u\n", __func__, i);
             return false;

@@ -67,6 +67,7 @@ using kvmem_spec_on_token =
         std::function<void(llama_token id, const std::string & piece, bool from_draft)>;
 
 struct kvmem_spec_gen_stats {
+    int n_past = 0;
     int n_gen = 0;
     int n_drafted = 0;
     int n_accept = 0;
@@ -95,4 +96,5 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         int n_predict,
         common_params_sampling sparams,
         kvmem_spec_on_token on_token,
-        const std::function<bool()> & abort = {});
+        const std::function<bool()> & abort = {},
+        llama_pos position_offset = 0);

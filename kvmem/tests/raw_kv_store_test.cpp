@@ -241,5 +241,46 @@ int main() {
     std::vector<float> krowmean(4, 0.0f);
     rawkn.mean_k(0, 0, krowmean.data());
     CHECK(std::fabs(krowmean[0] - 6.0f) < 1e-3f);
+
+    // Replacing a suffix preserves prefix bytes and rejects stale packed rows,
+    // even if the mean-K capture has already extended the logical block.
+    for (bool nvme : {false, true}) {
+        auto tail_cfg = ngcfg;
+        tail_cfg.k_gpu_row_bytes = 6;
+        if (!nvme) tail_cfg.nvme_bytes = 0;
+        kvmem::RawKvStore tail_store(tail_cfg);
+        tail_store.write_layer_mean_k(0, 2, 0, k.data());
+        const auto checkpoint = tail_store.mean_checkpoint(2);
+        tail_store.write_layer_mean_k(2, 2, 0, k2.data());
+        tail_store.write_layer_k_gpu(0, 4, 0, packed4.data());
+        tail_store.write_layer_v_gpu(0, 4, 0, packed4.data());
+        tail_store.truncate_to(2);
+        tail_store.restore_mean_checkpoint(2, checkpoint);
+        CHECK(tail_store.n_tokens(0) == 2);
+        CHECK(!tail_store.copy_k_gpu(0, 0, gout4.data(), 4));
+        CHECK(!tail_store.copy_v_gpu(0, 0, gout4.data(), 4));
+        CHECK(tail_store.copy_k_gpu(0, 0, gout4.data(), 2));
+        CHECK(std::memcmp(gout4.data(), packed4.data(), 12) == 0);
+        std::vector<float> replacement(8, 20.0f);
+        tail_store.write_layer_mean_k(2, 2, 0, replacement.data());
+        CHECK(!tail_store.has_k_gpu(0, 0, 4));
+        CHECK(!tail_store.has_v_gpu(0, 0, 4));
+        tail_store.mean_k(0, 0, mean.data());
+        CHECK(std::fabs(mean[0] - 11.0f) < 1e-3f);
+        std::vector<uint8_t> new_bytes(12, 231);
+        tail_store.write_layer_k_gpu(2, 2, 0, new_bytes.data());
+        tail_store.write_layer_v_gpu(2, 2, 0, new_bytes.data());
+        for (bool is_k : {false, true}) {
+            CHECK(is_k ? tail_store.copy_k_gpu(0, 0, gout4.data(), 4)
+                       : tail_store.copy_v_gpu(0, 0, gout4.data(), 4));
+            CHECK(std::memcmp(gout4.data(), packed4.data(), 12) == 0);
+            CHECK(std::memcmp(gout4.data() + 12, new_bytes.data(), 12) == 0);
+        }
+        tail_store.invalidate_packed_from(3);
+        CHECK(!tail_store.has_k_gpu(0, 0, 4));
+        CHECK(!tail_store.has_v_gpu(0, 0, 4));
+        CHECK(tail_store.copy_k_gpu(0, 0, gout4.data(), 3));
+        CHECK(tail_store.copy_v_gpu(0, 0, gout4.data(), 3));
+    }
     return 0;
 }

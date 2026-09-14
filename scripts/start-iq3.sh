@@ -12,6 +12,17 @@ STDOUT="$ROOT/logs/opencode_kvmem_iq3_256k.stdout.log"
 STDERR="$ROOT/logs/opencode_kvmem_iq3_256k.stderr.log"
 BIN="$ROOT/build/bin/llama-kvmem-server"
 MODEL="$ROOT/models/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
+MMPROJ="${MMPROJ:-$ROOT/models/unsloth/Qwen3.8-27B-GGUF/mmproj-Q8_0.gguf}"
+MMPROJ_DEVICE="${MMPROJ_DEVICE:-gpu}"
+IMAGE_MAX_TOKENS="${IMAGE_MAX_TOKENS:-512}"
+SPEC_KV_DTYPE="${SPEC_KV_DTYPE:-f16}"
+case "$MMPROJ_DEVICE" in
+    gpu) VISION_DEVICE_ARG=--mmproj-offload ;;
+    cpu) VISION_DEVICE_ARG=--no-mmproj-offload ;;
+    *) echo "MMPROJ_DEVICE must be gpu or cpu" >&2; exit 1 ;;
+esac
+[[ "$IMAGE_MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "IMAGE_MAX_TOKENS must be positive" >&2; exit 1; }
+[[ -f "$MODEL" && -f "$MMPROJ" ]] || { echo "model or projector file is missing" >&2; exit 1; }
 PORT=18200
 RESTART=0
 [[ "${1:-}" == "--restart" ]] && RESTART=1
@@ -30,7 +41,7 @@ listener_pid() {
 }
 
 health_ok() {
-    curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
+    curl --noproxy '*' -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1
 }
 
 alive_pid() {
@@ -88,20 +99,21 @@ export LD_LIBRARY_PATH="/home/leye/kvmem_qw3/.cu13-env/lib${LD_LIBRARY_PATH:+:$L
 
 setsid -f "$BIN" \
     -m "$MODEL" \
+    --mmproj "$MMPROJ" "$VISION_DEVICE_ARG" --image-max-tokens "$IMAGE_MAX_TOKENS" \
     --host 127.0.0.1 --port "$PORT" \
     -c 262144 -n 16000 -b 512 -ngl 99 \
     --kvmem --kvmem-method retrieval \
     --kvmem-budget 40000 --kvmem-gen-reserve 16000 \
     --kvmem-block-tokens 128 --kv-dtype q8_0 \
-    --spec-type draft-mtp --spec-draft-n-max 2 \
+    --spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype "$SPEC_KV_DTYPE" \
     --enable-thinking --reasoning-budget 4096 \
     --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
     --presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0 \
     > "$STDOUT" 2> "$STDERR" < /dev/null
 
 ok=0
-for i in $(seq 1 60); do
-    if grep -q 'llama-kvmem-server listening' "$STDERR" 2>/dev/null && health_ok; then
+for i in $(seq 1 180); do
+    if rg -q 'llama-kvmem-server listening' "$STDERR" 2>/dev/null && health_ok; then
         ok=1
         break
     fi
@@ -115,4 +127,4 @@ if [[ "$ok" -ne 1 ]] || ! alive_pid "$pid"; then
 fi
 echo "$pid" > "$PIDFILE"
 ppid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
-echo "started pid=$pid ppid=$ppid http://127.0.0.1:${PORT}/health"
+echo "started pid=$pid ppid=$ppid vision=$MMPROJ_DEVICE image_max_tokens=$IMAGE_MAX_TOKENS mtp_kv=$SPEC_KV_DTYPE http://127.0.0.1:${PORT}/health"

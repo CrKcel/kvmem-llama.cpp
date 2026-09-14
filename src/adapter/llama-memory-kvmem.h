@@ -8,6 +8,7 @@
 #include "kvmem/rope.hpp"
 
 #include <condition_variable>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -102,7 +103,7 @@ public:
     bool query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const;
     void dump_kv_compare(int32_t block_id, bool writeback_test = false);
     void trace_working_set(const char * tag) const;
-    void set_replay(bool replay) { replay_ = replay; }
+    void set_replay(bool replay);
     bool replay() const { return replay_; }
     bool want_prefill_capture() const {
         return prefill_capture_ && !retrieval_pinned_ && !replay_;
@@ -128,6 +129,9 @@ public:
     }
     size_t free_slot_count() const { return free_slots_.size(); }
     void truncate_cached(uint32_t n_past);
+    void occupy_in(llama_kv_cache * cache, uint32_t block_id);
+    llama_pos model_pos(uint32_t logical_pos) const;
+    bool remove_logical(llama_context * ctx, llama_pos begin, llama_pos end);
     uint32_t store_n_tokens() const {
         return runtime_ ? runtime_->store().total_tokens() : 0;
     }
@@ -155,6 +159,7 @@ public:
     kvmem::RawKvStore & raw() { return *raw_; }
 
 private:
+    friend struct kvmem_transfer_test_access;
     struct SlotBackend : public kvmem::KvMemBackend {
         llama_memory_kvmem * owner = nullptr;
         int32_t alloc_gpu_slot() override { return owner->alloc_slot(); }
@@ -316,6 +321,11 @@ private:
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
     std::vector<int32_t> free_slots_;
+    struct RowPosition {
+        std::array<llama_pos, 4> pos{};
+        llama_token token = LLAMA_TOKEN_NULL;
+    };
+    std::vector<RowPosition> row_positions_;
 
     kvmem::RopeConfig rope_{};
     uint32_t n_layer_ = 0;

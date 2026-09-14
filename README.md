@@ -3,7 +3,9 @@
 KVMem as a standalone library, attached to llama.cpp through
 `llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
 
-**Current local milestone: [`v0.12.3`](docs/milestones/v0.12.3.md)** (2026-09-13).
+**Current local milestone: [`v0.13.0`](docs/milestones/v0.13.0.md)** (2026-09-14).
+IQ3 chat completions accept OpenAI `image_url` (base64 or HTTP) with
+`--mmproj`; see [multimodal usage](docs/multimodal-implementation-report-2026-09-14.md).
 GPU KV default **q8_0** (`q5_0` needs `GGML_CUDA_FA_ALL_QUANTS`). Orig-pos
 cells; restore is packed GPU K/V memcpy (no unrotated raw-K on the product
 path). Retrieval uses pre-RoPE mean-K (prefill write + decode running sum
@@ -43,11 +45,12 @@ Phase D `state_write` is not in this tag.
 
 Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
 Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.12.3` is the pin plus patches; run apply-patches
+A fresh checkout of tag `v0.13.0` is the pin plus the cumulative KVMem patch
+(including multimodal). See [patch replay](patches/README.md). Run apply-patches
 before building.
 
 ```bash
-git checkout v0.12.3
+git checkout v0.13.0
 git submodule update --init
 source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh

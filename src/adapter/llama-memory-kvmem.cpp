@@ -13,6 +13,7 @@
 #include "llama-cparams.h"
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
 #include "llama-model.h"
 
 #include "llama.h"
@@ -512,6 +513,7 @@ void llama_memory_kvmem::reset_slots() {
 }
 
 void llama_memory_kvmem::reset_policy() {
+    row_positions_.clear();
     decode_mean_reset();
     reset_query_acc();
     if (raw_) {
@@ -538,12 +540,28 @@ void llama_memory_kvmem::begin_cached_turn(bool reset_query) {
 }
 
 void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
+    if (runtime_ && n_past >= runtime_->store().total_tokens()) return;
+    harvest_flush();
+    harvest_gpu_v_commit();
+    if (row_positions_.size() > n_past) row_positions_.resize(n_past);
+    if (mtp_) mtp_->truncate_cached(n_past);
     if (raw_) {
         raw_->truncate_to(n_past);
     }
     if (runtime_ && n_past < runtime_->store().total_tokens()) {
         runtime_->truncate_to(n_past);
     }
+}
+
+void llama_memory_kvmem::set_replay(bool replay) {
+    if (replay && !replay_) {
+        harvest_flush();
+        harvest_gpu_v_commit();
+        const uint32_t begin = std::max(0, query_begin_);
+        if (raw_) raw_->invalidate_packed_from(begin);
+        if (mtp_) mtp_->invalidate_packed_from(begin);
+    }
+    replay_ = replay;
 }
 
 llama_pos llama_memory_kvmem::recr_pos_max() const {
@@ -672,7 +690,7 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
             }
             const kvmem::KvMemBlock & b = store.blocks()[id];
             if (b.n_tokens > 0) {
-                kv_->seq_rm(0, static_cast<llama_pos>(b.orig_pos_start),
+                kv_->seq_rm_logical(0, static_cast<llama_pos>(b.orig_pos_start),
                             static_cast<llama_pos>(b.orig_pos_end()));
             }
         }
@@ -702,10 +720,10 @@ bool llama_memory_kvmem::gpu_kv_already_resident(uint32_t block_id) const {
     if (idx >= cells.size() || cells.is_empty(idx)) {
         return false;
     }
-    return cells.pos_get(idx) == static_cast<llama_pos>(b.orig_pos_start);
+    return cells.ext_get(idx).logical_pos == static_cast<llama_pos>(b.orig_pos_start);
 }
 
-void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
+void llama_memory_kvmem::occupy_in(llama_kv_cache * cache, uint32_t block_id) {
     auto & store = runtime_->store();
     if (block_id >= store.block_count()) {
         return;
@@ -721,7 +739,7 @@ void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
     sinfo.resize(1);
     sinfo.strm[0] = 0;
     sinfo.idxs[0].resize(nt);
-    std::vector<llama_pos> pos(nt);
+    std::vector<llama_pos> pos(4*nt), logical(nt);
     std::vector<int32_t> n_seq_id(nt, 1);
     std::vector<llama_seq_id> seq_data(nt, 0);
     std::vector<llama_seq_id *> seq_id(nt);
@@ -730,7 +748,13 @@ void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
     llama_seq_id seq0 = 0;
     for (uint32_t t = 0; t < nt; ++t) {
         sinfo.idxs[0][t] = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_ + t;
-        pos[t] = static_cast<llama_pos>(blk.orig_pos_start + t);
+        logical[t] = blk.orig_pos_start + t;
+        if ((size_t) logical[t] >= row_positions_.size()) {
+            throw std::runtime_error("missing cache row position metadata");
+        }
+        const auto & row = row_positions_[logical[t]];
+        for (uint32_t j = 0; j < 4; ++j) pos[j*nt+t] = row.pos[j];
+        tok[t] = row.token;
         seq_id[t] = &seq_data[t];
     }
     llama_ubatch ub{};
@@ -738,7 +762,8 @@ void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
     ub.n_seq_tokens = nt;
     ub.n_seqs = 1;
     ub.n_seqs_unq = 1;
-    ub.n_pos = 1;
+    ub.n_pos = 4;
+    ub.logical_pos = logical.data();
     ub.pos = pos.data();
     ub.n_seq_id = n_seq_id.data();
     ub.seq_id = seq_id.data();
@@ -747,25 +772,37 @@ void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
     ub.token = tok.data();
     {
         const int64_t t0 = ggml_time_us();
-        const llama_kv_cells & cells = kv_->get_cells(0);
-        for (uint32_t t = 0; t < nt; ++t) {
-            const uint32_t idx = sinfo.idxs[0][t];
-            if (idx < cells.size() && !cells.is_empty(idx)) {
-                const llama_pos p = cells.pos_get(idx);
-                kv_->seq_rm(0, p, p + 1);
-            }
-        }
-        if (retr_.enabled) {
-            retr_.seq_rm_us += ggml_time_us() - t0;
-        }
-    }
-    {
-        const int64_t t0 = ggml_time_us();
-        kv_->apply_ubatch(sinfo, ub);
+        cache->apply_ubatch(sinfo, ub);
         if (retr_.enabled) {
             retr_.occupy_us += ggml_time_us() - t0;
         }
     }
+}
+
+void llama_memory_kvmem::occupy_block_cells(uint32_t block_id) {
+    occupy_in(kv_, block_id);
+}
+
+llama_pos llama_memory_kvmem::model_pos(uint32_t logical) const {
+    if (logical < row_positions_.size()) return row_positions_[logical].pos[0];
+    if (row_positions_.empty()) return (llama_pos) logical;
+    const auto & last = row_positions_.back();
+    // Appending text after a media chunk uses the helper's explicit cursor.
+    return last.pos[0] + 1 + (llama_pos) (logical - row_positions_.size());
+}
+
+bool llama_memory_kvmem::remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
+    if (mtp_ && llama_get_memory(ctx) == mtp_) return mtp_->remove_logical(begin, end);
+    // Recurrent rollback is only valid across consecutive text positions.
+    if (recr_ && end < 0 && begin > 0 && (size_t) begin < row_positions_.size()) {
+        const auto p = model_pos(begin);
+        const auto prev = model_pos(begin - 1);
+        const auto rmax = recr_->seq_pos_max(0);
+        if (p == prev + 1 && rmax >= p && rmax - prev <= (llama_pos) recr_->n_rs_seq) {
+            if (!recr_->seq_rm(0, p, -1)) return false;
+        }
+    }
+    return kv_->seq_rm_logical(0, begin, end);
 }
 
 bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
@@ -969,10 +1006,10 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         {
             const int64_t t0 = ggml_time_us();
             for (const auto & it : items) {
-                kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
+                kv_->seq_rm_logical(0, static_cast<llama_pos>(it.orig),
                             static_cast<llama_pos>(it.orig + it.n));
                 if (mtp_) {
-                    mtp_->seq_rm(0, static_cast<llama_pos>(it.orig),
+                    mtp_->remove_logical(static_cast<llama_pos>(it.orig),
                                  static_cast<llama_pos>(it.orig + it.n));
                 }
                 store.set_block_gpu_slot(it.id, -1);
@@ -1033,10 +1070,10 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
     {
         const int64_t t0 = ggml_time_us();
         for (const auto & it : items) {
-            kv_->seq_rm(0, static_cast<llama_pos>(it.orig),
+            kv_->seq_rm_logical(0, static_cast<llama_pos>(it.orig),
                         static_cast<llama_pos>(it.orig + it.n));
             if (mtp_) {
-                mtp_->seq_rm(0, static_cast<llama_pos>(it.orig),
+                mtp_->remove_logical(static_cast<llama_pos>(it.orig),
                              static_cast<llama_pos>(it.orig + it.n));
             }
             store.set_block_gpu_slot(it.id, -1);
@@ -1188,6 +1225,16 @@ bool llama_memory_kvmem::prepare_ubatches(
     if (!prepare_working_set(n_new_tokens)) {
         return false;
     }
+    for (const auto & ub : ubatches) {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const llama_pos logical = ub.logical_pos ? ub.logical_pos[i] : ub.pos[i];
+            if (logical < 0 || (uint32_t) logical >= runtime_->store().total_tokens()) return false;
+            if ((size_t) logical >= row_positions_.size()) row_positions_.resize(logical + 1);
+            auto & row = row_positions_[logical];
+            for (uint32_t j = 0; j < 4; ++j) row.pos[j] = ub.pos[(j < ub.n_pos ? j*ub.n_tokens : 0) + i];
+            row.token = ub.token ? ub.token[i] : LLAMA_TOKEN_NULL;
+        }
+    }
     sinfos.clear();
     sinfos.reserve(ubatches.size());
     for (const auto & ubatch : ubatches) {
@@ -1201,7 +1248,7 @@ bool llama_memory_kvmem::prepare_ubatches(
     for (const auto & ubatch : ubatches) {
         std::vector<llama_pos> p(ubatch.n_tokens);
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-            p[i] = ubatch.pos ? ubatch.pos[i] : static_cast<llama_pos>(i);
+            p[i] = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
         }
         pos_queue_.push_back(std::move(p));
     }
@@ -1251,6 +1298,8 @@ llama_memory_context_ptr llama_memory_kvmem::init_update(llama_context * lctx, b
 }
 
 void llama_memory_kvmem::clear(bool data) {
+    harvest_flush();
+    harvest_gpu_v_commit();
     if (kv_) {
         kv_->clear(data);
     }
@@ -2224,14 +2273,14 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
             continue;
         }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
-        if (kt && krow && !raw_->has_k_gpu(block_id, il)) {
+        if (kt && krow && !raw_->has_k_gpu(block_id, il, nget)) {
             enqueue_or_get(kt, il, nget, true);
             n_ok++;
         } else {
             n_skip++;
         }
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
-        if (vt && !v_trans_ && vrow && !raw_->has_v_gpu(block_id, il)) {
+        if (vt && !v_trans_ && vrow && !raw_->has_v_gpu(block_id, il, nget)) {
             enqueue_or_get(vt, il, nget, false);
             n_ok++;
         } else {
@@ -2268,8 +2317,8 @@ void llama_memory_kvmem::harvest_full_blocks_async() {
             if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
                 continue;
             }
-            if (!raw_->has_k_gpu(b.block_id, il) ||
-                (!v_trans_ && !raw_->has_v_gpu(b.block_id, il))) {
+            if (!raw_->has_k_gpu(b.block_id, il, b.n_tokens) ||
+                (!v_trans_ && !raw_->has_v_gpu(b.block_id, il, b.n_tokens))) {
                 need = true;
                 break;
             }
@@ -3353,4 +3402,52 @@ void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_
         mem->set_query_span(query_begin, query_end);
         mem->set_force_pos(force_pos);
     }
+}
+
+llama_pos llama_kvmem_model_pos(uint32_t logical) {
+    auto * mem = kvmem_capture_active();
+    return mem ? mem->model_pos(logical) : (llama_pos) logical;
+}
+
+bool llama_kvmem_remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
+    auto * mem = kvmem_capture_active();
+    if (mem) return mem->remove_logical(ctx, begin, end);
+    auto * native = llama_get_memory(ctx);
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(native);
+    auto * kv = hybrid ? hybrid->get_mem_attn() : dynamic_cast<llama_kv_cache *>(native);
+    if (!kv) return llama_memory_seq_rm(native, 0, begin, end);
+    if (hybrid && end < 0) {
+        const auto & cells = kv->get_cells(0);
+        llama_pos first = INT32_MAX;
+        llama_pos model_begin = -1;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) continue;
+            const auto row = cells.ext_get(i).logical_pos;
+            if (row >= begin && row < first) { first = row; model_begin = cells.pos_get(i); }
+        }
+        auto * recurrent = hybrid->get_mem_recr();
+        if (model_begin >= 0 && recurrent->seq_pos_max(0) >= model_begin
+                && !recurrent->seq_rm(0, model_begin, -1)) return false;
+    }
+    return kv->seq_rm_logical(0, begin, end);
+}
+
+void llama_kvmem_set_media_ranges(const uint32_t * starts, const uint32_t * ends, size_t count) {
+    if (auto * mem = kvmem_capture_active()) {
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        for (size_t i = 0; i < count; ++i) ranges.emplace_back(starts[i], ends[i]);
+        mem->runtime().store().set_media_ranges(std::move(ranges));
+    }
+}
+
+void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state) {
+    if (auto * mem = kvmem_capture_active()) {
+        mem->harvest_flush();
+        mem->decode_mean_flush();
+        state = mem->raw().mean_checkpoint(row);
+    }
+}
+
+void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state) {
+    if (auto * mem = kvmem_capture_active()) mem->raw().restore_mean_checkpoint(row, state);
 }

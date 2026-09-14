@@ -167,7 +167,7 @@ bool llama_memory_kvmem_mtp::fill_from_target(
             LLAMA_LOG_ERROR("%s: KVMem MTP is single-sequence only\n", __func__);
             return false;
         }
-        const llama_pos pos = ubatch.pos[i];
+        const llama_pos pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
         int32_t slot = -1;
         uint32_t off = 0;
         if (!target_->slot_for_orig_pos(pos, &slot, &off)) {
@@ -246,6 +246,8 @@ llama_memory_context_ptr llama_memory_kvmem_mtp::init_update(llama_context * lct
 
 void llama_memory_kvmem_mtp::clear(bool data) {
     kv_->clear(data);
+    raw_->clear();
+    pos_queue_.clear();
 }
 
 bool llama_memory_kvmem_mtp::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -313,59 +315,7 @@ void llama_memory_kvmem_mtp::harvest_pending(struct ggml_backend_sched * sched) 
 }
 
 void llama_memory_kvmem_mtp::occupy_block(uint32_t block_id) {
-    if (!target_ || !kv_) {
-        return;
-    }
-    const auto & st = target_->store();
-    if (block_id >= st.block_count()) {
-        return;
-    }
-    const kvmem::KvMemBlock & blk = st.blocks()[block_id];
-    if (blk.gpu_slot < 0 || blk.n_tokens == 0) {
-        return;
-    }
-    const uint32_t nt = blk.n_tokens;
-    llama_kv_cache::slot_info sinfo;
-    sinfo.s0 = 0;
-    sinfo.s1 = 0;
-    sinfo.resize(1);
-    sinfo.strm[0] = 0;
-    sinfo.idxs[0].resize(nt);
-    std::vector<llama_pos> pos(nt);
-    std::vector<int32_t> n_seq_id(nt, 1);
-    std::vector<llama_seq_id> seq_data(nt, 0);
-    std::vector<llama_seq_id *> seq_id(nt);
-    std::vector<int8_t> output(nt, 0);
-    std::vector<llama_token> tok(nt, 0);
-    llama_seq_id seq0 = 0;
-    for (uint32_t t = 0; t < nt; ++t) {
-        sinfo.idxs[0][t] = (uint32_t) blk.gpu_slot * block_tokens_ + t;
-        pos[t] = (llama_pos) (blk.orig_pos_start + t);
-        seq_id[t] = &seq_data[t];
-    }
-    llama_ubatch ub{};
-    ub.n_tokens = nt;
-    ub.n_seq_tokens = nt;
-    ub.n_seqs = 1;
-    ub.n_seqs_unq = 1;
-    ub.n_pos = 1;
-    ub.pos = pos.data();
-    ub.n_seq_id = n_seq_id.data();
-    ub.seq_id = seq_id.data();
-    ub.seq_id_unq = &seq0;
-    ub.output = output.data();
-    ub.token = tok.data();
-    {
-        const llama_kv_cells & cells = kv_->get_cells(0);
-        for (uint32_t t = 0; t < nt; ++t) {
-            const uint32_t idx = sinfo.idxs[0][t];
-            if (idx < cells.size() && !cells.is_empty(idx)) {
-                const llama_pos p = cells.pos_get(idx);
-                kv_->seq_rm(0, p, p + 1);
-            }
-        }
-    }
-    kv_->apply_ubatch(sinfo, ub);
+    if (target_ && kv_) target_->occupy_in(kv_.get(), block_id);
 }
 
 void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
@@ -383,10 +333,10 @@ void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
     const llama_kv_cells & cells = kv_->get_cells(0);
     const uint32_t idx0 = (uint32_t) blk.gpu_slot * block_tokens_;
     if (idx0 >= cells.size() || cells.is_empty(idx0)
-            || cells.pos_get(idx0) != (llama_pos) blk.orig_pos_start) {
+            || cells.ext_get(idx0).logical_pos != (llama_pos) blk.orig_pos_start) {
         return;
     }
-    if (raw_->has_k_gpu(block_id, 0)) {
+    if (raw_->has_k_gpu(block_id, 0, blk.n_tokens)) {
         return;
     }
     ggml_tensor * kt = kv_->get_k_storage((int32_t) il_graph_);
@@ -416,10 +366,10 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     const llama_kv_cells & cells = kv_->get_cells(0);
     const uint32_t idx0 = (uint32_t) blk.gpu_slot * block_tokens_;
     if (idx0 >= cells.size() || cells.is_empty(idx0)
-            || cells.pos_get(idx0) != (llama_pos) blk.orig_pos_start) {
+            || cells.ext_get(idx0).logical_pos != (llama_pos) blk.orig_pos_start) {
         return;
     }
-    if (raw_->has_v_gpu(block_id, 0)) {
+    if (raw_->has_v_gpu(block_id, 0, blk.n_tokens)) {
         return;
     }
     const uint32_t nt = blk.n_tokens;
@@ -443,7 +393,7 @@ bool llama_memory_kvmem_mtp::slot_holds(int32_t slot, uint32_t orig_pos) const {
     if (idx >= cells.size() || cells.is_empty(idx)) {
         return false;
     }
-    return cells.pos_get(idx) == (llama_pos) orig_pos;
+    return cells.ext_get(idx).logical_pos == (llama_pos) orig_pos;
 }
 
 bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves) {
@@ -585,7 +535,7 @@ void llama_memory_kvmem_mtp::on_stage_out(uint32_t block_id) {
     }
     const kvmem::KvMemBlock & b = st.blocks()[block_id];
     if (b.n_tokens > 0) {
-        kv_->seq_rm(0, (llama_pos) b.orig_pos_start, (llama_pos) b.orig_pos_end());
+        kv_->seq_rm_logical(0, (llama_pos) b.orig_pos_start, (llama_pos) b.orig_pos_end());
     }
 }
 

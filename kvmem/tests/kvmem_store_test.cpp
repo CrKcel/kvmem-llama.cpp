@@ -1075,7 +1075,35 @@ static void test_round_groups_charge_shared_boundary_once() {
     }
 }
 
+static void test_media_groups_with_shared_boundary() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = cfg.prefill_budget = 6*32;
+    cfg.sink_blocks = 1;
+    KvMemStore store(cfg);
+    store.register_append(12*32);
+    // Two adjacent images share block 6, so blocks 4..8 form one group.
+    store.set_media_ranges({{4*32+3, 6*32+9}, {6*32+10, 9*32}});
+    for (bool prefill : {false, true}) {
+        auto selected = prefill ? store.pick_prefill_pressure_blocks({}) : store.pick_topk_blocks({});
+        CHECK((selected == std::vector<uint32_t>{0, 4, 5, 6, 7, 8}));
+        bool threw = false;
+        try {
+            if (prefill) store.pick_prefill_pressure_blocks({11});
+            else store.pick_topk_blocks({11});
+        } catch (const std::runtime_error &) { threw = true; }
+        CHECK(threw);
+    }
+    // A historical image is either entirely selected or absent.
+    store.set_media_ranges({{2*32+1, 4*32}, {9*32, 11*32}});
+    auto selected = store.pick_topk_blocks({11});
+    CHECK(std::binary_search(selected.begin(), selected.end(), 2) == std::binary_search(selected.begin(), selected.end(), 3));
+    CHECK(std::binary_search(selected.begin(), selected.end(), 9));
+    CHECK(std::binary_search(selected.begin(), selected.end(), 10));
+}
+
 int main() {
+    test_media_groups_with_shared_boundary();
     test_register_append();
     test_selection_diff_and_remap();
     test_immutable_source_selection_uses_bounded_delta_remaps();

@@ -349,11 +349,68 @@ bool KvMemStore::prefill_needs_offload(uint32_t resident_tokens,
     return next > gpu_high_watermark_tokens(pool_tokens);
 }
 
+std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(const std::vector<uint32_t> & mandatory) const {
+    return constrain_media(pick_prefill_ungrouped(mandatory), mandatory, prefill_budget_blocks(), true);
+}
+
+std::vector<uint32_t> KvMemStore::pick_topk_blocks(const std::vector<uint32_t> & mandatory) const {
+    return constrain_media(pick_topk_ungrouped(mandatory), mandatory, budget_blocks(), false);
+}
+
+std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected,
+        const std::vector<uint32_t> & mandatory, uint32_t budget, bool recency) const {
+    const uint32_t n = block_count();
+    if (media_ranges_.empty() || n <= budget || budget == 0) return selected;
+    std::vector<std::pair<uint32_t, uint32_t>> groups;
+    for (const auto & range : media_ranges_) {
+        if (range.first >= total_tokens_ || range.second <= range.first) continue;
+        const uint32_t first = range.first / cfg_.block_tokens;
+        const uint32_t end = std::min(n, (range.second + cfg_.block_tokens - 1) / cfg_.block_tokens);
+        if (!groups.empty() && first < groups.back().second) groups.back().second = std::max(groups.back().second, end);
+        else groups.emplace_back(first, end);
+    }
+    std::vector<uint32_t> lo(n), hi(n);
+    for (uint32_t i = 0; i < n; ++i) { lo[i] = i; hi[i] = i + 1; }
+    for (const auto & group : groups) for (uint32_t i = group.first; i < group.second; ++i) {
+        lo[i] = group.first; hi[i] = group.second;
+    }
+    std::vector<bool> kept(n, false);
+    uint32_t count = 0;
+    auto keep = [&](uint32_t id, bool required) {
+        if (id >= n) return;
+        uint32_t need = 0;
+        for (uint32_t i = lo[id]; i < hi[id]; ++i) need += !kept[i];
+        if (count + need > budget) {
+            if (required) throw std::runtime_error("mandatory image group and query exceed KV selection budget");
+            return;
+        }
+        for (uint32_t i = lo[id]; i < hi[id]; ++i) kept[i] = true;
+        count += need;
+    };
+    for (uint32_t i = 0; i < std::min(n, cfg_.sink_blocks); ++i) keep(i, true);
+    for (auto id : mandatory) keep(id, true);
+    // Keep the latest image as a whole, including its boundary blocks.
+    if (!groups.empty()) keep(groups.back().first, true);
+    auto better = [&](uint32_t a, uint32_t b) {
+        if (!recency && blocks_[a].attn_score != blocks_[b].attn_score) return blocks_[a].attn_score > blocks_[b].attn_score;
+        return a > b;
+    };
+    std::sort(selected.begin(), selected.end(), better);
+    for (auto id : selected) keep(id, false);
+    std::vector<uint32_t> rest;
+    for (uint32_t i = 0; i < n; ++i) if (!kept[i]) rest.push_back(i);
+    std::sort(rest.begin(), rest.end(), better);
+    for (auto id : rest) keep(id, false);
+    selected.clear();
+    for (uint32_t i = 0; i < n; ++i) if (kept[i]) selected.push_back(i);
+    return selected;
+}
+
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
     return pick_prefill_pressure_blocks({});
 }
 
-std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(
+std::vector<uint32_t> KvMemStore::pick_prefill_ungrouped(
         const std::vector<uint32_t> &mandatory_blocks) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
@@ -415,7 +472,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
     return pick_topk_blocks({});
 }
 
-std::vector<uint32_t> KvMemStore::pick_topk_blocks(
+std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
         const std::vector<uint32_t> &mandatory_blocks) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;

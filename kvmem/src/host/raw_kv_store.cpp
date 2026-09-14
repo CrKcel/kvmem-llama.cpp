@@ -198,6 +198,8 @@ void RawKvStore::capture_mean_f16(LayerBlk & lb) const {
             lb.mean[d] += f16_to_f32(src[d]);
         }
     }
+    lb.mean_tokens = nt;
+    lb.k_sum = lb.mean;
     const float inv = 1.0f / static_cast<float>(nt);
     for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
         lb.mean[d] *= inv;
@@ -212,7 +214,7 @@ void RawKvStore::add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take,
     if (lb.k_sum.size() != cfg_.n_embd_k) {
         lb.k_sum.assign(cfg_.n_embd_k, 0.0f);
     }
-    if (off == 0 && lb.n_tokens == 0) {
+    if (off == 0) {
         std::fill(lb.k_sum.begin(), lb.k_sum.end(), 0.0f);
     }
     for (uint32_t t = 0; t < take; ++t) {
@@ -221,7 +223,8 @@ void RawKvStore::add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take,
             lb.k_sum[d] += row[d];
         }
     }
-    const uint32_t nt = std::max(lb.n_tokens, off + take);
+    const uint32_t nt = off == 0 ? take : std::max(lb.mean_tokens, off + take);
+    lb.mean_tokens = nt;
     lb.mean.assign(cfg_.n_embd_k, 0.0f);
     if (nt == 0) {
         return;
@@ -639,6 +642,7 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
             std::memcpy(lb.v_gpu.data() + static_cast<size_t>(off) * row, src, nbytes);
         }
         lb.v_gpu_fmt = true;
+        lb.v_gpu_tokens = std::max(lb.v_gpu_tokens, off + take);
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         maybe_flush_v(bid, il);
         done += take;
@@ -674,6 +678,7 @@ void RawKvStore::write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il,
             std::memcpy(lb.k_gpu.data() + static_cast<size_t>(off) * row, src, nbytes);
         }
         lb.k_gpu_fmt = true;
+        lb.k_gpu_tokens = std::max(lb.k_gpu_tokens, off + take);
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         done += take;
     }
@@ -717,15 +722,16 @@ void RawKvStore::write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il,
     if (lb.k_sum.size() != cfg_.n_embd_k) {
         lb.k_sum.assign(cfg_.n_embd_k, 0.0f);
     }
-    if (off == 0 && lb.n_tokens == 0) {
+    if (off == 0) {
         std::fill(lb.k_sum.begin(), lb.k_sum.end(), 0.0f);
     }
     for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
         lb.k_sum[d] += sum[d];
     }
     lb.n_tokens = std::max(lb.n_tokens, off + take);
+    lb.mean_tokens = off == 0 ? take : std::max(lb.mean_tokens, off + take);
     lb.mean.assign(cfg_.n_embd_k, 0.0f);
-    const float inv = 1.0f / static_cast<float>(lb.n_tokens);
+    const float inv = 1.0f / static_cast<float>(lb.mean_tokens);
     for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
         lb.mean[d] = lb.k_sum[d] * inv;
     }
@@ -755,13 +761,13 @@ bool RawKvStore::has_k(uint32_t block_id, uint32_t il) const {
     return !lb.k.empty() || lb.k_on_nvme || lb.k_flushing;
 }
 
-bool RawKvStore::has_k_gpu(uint32_t block_id, uint32_t il) const {
+bool RawKvStore::has_k_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
     std::lock_guard<std::mutex> lk(mu_);
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    return lb.k_gpu_fmt && !lb.k_gpu.empty();
+    return lb.k_gpu_fmt && !lb.k_gpu.empty() && lb.k_gpu_tokens >= n;
 }
 
 bool RawKvStore::has_v(uint32_t block_id, uint32_t il) const {
@@ -773,13 +779,13 @@ bool RawKvStore::has_v(uint32_t block_id, uint32_t il) const {
     return !lb.v.empty() || !lb.v_gpu.empty() || lb.v_on_nvme || lb.v_flushing;
 }
 
-bool RawKvStore::has_v_gpu(uint32_t block_id, uint32_t il) const {
+bool RawKvStore::has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
     std::lock_guard<std::mutex> lk(mu_);
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    return lb.v_gpu_fmt;
+    return lb.v_gpu_fmt && lb.v_gpu_tokens >= n;
 }
 
 uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
@@ -938,11 +944,11 @@ bool RawKvStore::copy_k_gpu(uint32_t block_id, uint32_t il, uint8_t * out,
         return false;
     }
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (!lb.k_gpu_fmt || lb.k_gpu.empty()) {
+    if (!lb.k_gpu_fmt || lb.k_gpu.empty() || lb.k_gpu_tokens < n) {
         return false;
     }
     const uint64_t row = cfg_.k_gpu_row_bytes;
-    const uint32_t nt = std::min(n, lb.n_tokens);
+    const uint32_t nt = n;
     if (lb.k_gpu.size() < static_cast<size_t>(nt) * static_cast<size_t>(row)) {
         return false;
     }
@@ -964,11 +970,11 @@ bool RawKvStore::copy_v_gpu(uint32_t block_id, uint32_t il, uint8_t * out,
         return !x.v_flushing;
     });
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (!lb.v_gpu_fmt && lb.v_gpu.empty()) {
+    if (!lb.v_gpu_fmt || lb.v_gpu_tokens < n) {
         return false;
     }
     const uint64_t row = cfg_.v_gpu_row_bytes;
-    const uint32_t nt = std::min(n, lb.n_tokens);
+    const uint32_t nt = n;
     const uint8_t * src = nullptr;
     if (!lb.v_gpu.empty()) {
         src = lb.v_gpu.data();
@@ -1048,6 +1054,7 @@ size_t RawKvStore::bytes_k() const {
             n += lb.k.size();
             n += lb.k_gpu.size();
             n += lb.mean.size() * sizeof(float);
+            n += lb.k_sum.size() * sizeof(float);
         }
     }
     return n;
@@ -1090,6 +1097,73 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
     const uint32_t keep = (token_pos + cfg_.block_tokens - 1) / cfg_.block_tokens;
     if (blocks_.size() > keep) {
         blocks_.resize(keep);
+    }
+    const uint32_t tail = token_pos % cfg_.block_tokens;
+    if (tail && blocks_.size() == keep) {
+        for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+            auto & lb = blocks_.back().layers[il];
+            lb.n_tokens = std::min(lb.n_tokens, tail);
+            lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, tail);
+            lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, tail);
+            if (lb.mean_tokens > tail) {
+                lb.mean.clear();
+                lb.k_sum.clear();
+                lb.mean_tokens = 0;
+                if (k_is_f16()) {
+                    if (lb.k.empty() && lb.k_on_nvme) {
+                        lb.k.resize(k_slot_bytes());
+                        if (!load_k_nvme(keep - 1, il, lb.k.data())) lb.k.clear();
+                        lb.k_on_nvme = false;
+                    }
+                    capture_mean_f16(lb);
+                }
+            }
+        }
+    }
+}
+
+void RawKvStore::invalidate_packed_from(uint32_t token_pos) {
+    wait_writes();
+    std::lock_guard<std::mutex> lk(mu_);
+    for (uint32_t bid = token_pos / cfg_.block_tokens; bid < blocks_.size(); ++bid) {
+        const uint32_t keep = bid == token_pos / cfg_.block_tokens ? token_pos % cfg_.block_tokens : 0;
+        for (auto & lb : blocks_[bid].layers) {
+            lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, keep);
+            lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, keep);
+        }
+    }
+}
+
+std::vector<float> RawKvStore::mean_checkpoint(uint32_t token_pos) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const uint32_t bid = token_pos / cfg_.block_tokens;
+    if (token_pos % cfg_.block_tokens == 0) return {};
+    const size_t stride = 1 + 2 * cfg_.n_embd_k;
+    std::vector<float> state(cfg_.n_layer * stride, 0);
+    if (bid >= blocks_.size()) return state;
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+        const auto & lb = blocks_[bid].layers[il];
+        float * dst = state.data() + il * stride;
+        dst[0] = lb.mean_tokens;
+        if (!lb.mean.empty()) std::copy(lb.mean.begin(), lb.mean.end(), dst + 1);
+        if (!lb.k_sum.empty()) std::copy(lb.k_sum.begin(), lb.k_sum.end(), dst + 1 + cfg_.n_embd_k);
+    }
+    return state;
+}
+
+void RawKvStore::restore_mean_checkpoint(uint32_t token_pos, const std::vector<float> & state) {
+    if (state.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    const size_t stride = 1 + 2 * cfg_.n_embd_k;
+    if (state.size() != cfg_.n_layer * stride) throw std::runtime_error("invalid mean-K checkpoint");
+    const uint32_t bid = token_pos / cfg_.block_tokens;
+    ensure_blocks(bid + 1);
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+        auto & lb = blocks_[bid].layers[il];
+        const float * src = state.data() + il * stride;
+        lb.mean_tokens = (uint32_t) src[0];
+        lb.mean.assign(src + 1, src + 1 + cfg_.n_embd_k);
+        lb.k_sum.assign(src + 1 + cfg_.n_embd_k, src + stride);
     }
 }
 

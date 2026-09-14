@@ -44,14 +44,17 @@ if (KVMEM_BUILD_LLAMA)
     target_link_libraries(llama-kvmem-cli PRIVATE llama llama-common)
     target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
 
-    add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp tools/kvmem-spec.cpp)
+    add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp tools/kvmem-spec.cpp
+        tools/kvmem-vision.cpp llama.cpp/tools/server/server-common.cpp)
     target_include_directories(llama-kvmem-server PRIVATE
         src/adapter
         llama.cpp/include
         llama.cpp/common
+        llama.cpp/tools/server
+        llama.cpp/tools/mtmd
         llama.cpp/vendor
         llama.cpp/vendor/cpp-httplib)
-    target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib)
+    target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib mtmd)
     target_compile_features(llama-kvmem-server PRIVATE cxx_std_17)
 
     # Run manually with an MTP GGUF path; no model is downloaded by CTest.

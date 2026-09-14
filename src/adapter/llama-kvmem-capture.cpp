@@ -91,12 +91,12 @@ static bool ubatch_overlaps_query(uint32_t n_tokens, uint32_t n_pos, const llama
     }
     const int32_t qb = kp->query_begin;
     const int32_t qe = kp->query_end > 0 ? kp->query_end : (1 << 30);
-    const uint32_t stride = n_pos > 0 ? n_pos : 1u;
+    (void) n_pos;
     if (!pos) {
         return true;
     }
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        const llama_pos p = pos[i * stride];
+        const llama_pos p = pos[i];
         if (p >= qb && p < qe) {
             return true;
         }

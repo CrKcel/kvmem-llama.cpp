@@ -83,6 +83,10 @@ LLAMA_API void llama_kvmem_keep_selected(void);
 LLAMA_API void llama_kvmem_pin_working_set(void);
 LLAMA_API uint32_t llama_kvmem_free_slots(void);
 LLAMA_API void llama_kvmem_truncate_cached(uint32_t n_past);
+// Row-based removal, with native recurrent positions preserved.
+LLAMA_API bool llama_kvmem_remove_logical(struct llama_context * ctx, llama_pos begin, llama_pos end);
+LLAMA_API llama_pos llama_kvmem_model_pos(uint32_t logical_pos);
+LLAMA_API void llama_kvmem_set_media_ranges(const uint32_t * starts, const uint32_t * ends, size_t count);
 LLAMA_API uint32_t llama_kvmem_store_n_tokens(void);
 LLAMA_API llama_pos llama_kvmem_recr_pos_max(void);
 // After MTP verify: keep the first n_keep batch tokens in the running mean (0 = discard).
@@ -108,4 +112,8 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 
 #ifdef __cplusplus
 }
+
+#include <vector>
+LLAMA_API void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state);
+LLAMA_API void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state);
 #endif
