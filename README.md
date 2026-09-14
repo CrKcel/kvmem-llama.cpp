@@ -252,3 +252,21 @@ models/           Local GGUFs (gitignored)
 ## License
 
 Checkpoints are distributed separately and may use different terms. llama.cpp remains under its upstream license. KVMem-qw3 source is Apache-2.0; this port should be treated the same unless a `LICENSE` file is added to this tree.
+
+## Paper and citation
+
+[KVMem: Virtualizing Million-Token Agent Workspaces on a Consumer GPU](https://arxiv.org/abs/2609.04852)
+
+Copy the BibTeX entry below and cite it with `\cite{chai2026kvmem}`.
+
+```bibtex
+@misc{chai2026kvmem,
+  title         = {{KVMem}: Virtualizing Million-Token Agent Workspaces on a Consumer {GPU}},
+  author        = {Di Chai and Leye Wang and Zeshen Su and Zhiguo Xia and Zhihang Yu},
+  year          = {2026},
+  eprint        = {2609.04852},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2609.04852}
+}
+```
