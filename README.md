@@ -12,6 +12,8 @@ KVMem’s logical workspace (`-c`) is **not** capped by the model’s native con
 
 The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to 256K, keeping only a **32K GPU-resident active context** is essentially lossless versus the **full 256K** history: **LongMemEval-S** 85.6% vs 86.6% accuracy, **AgentLongBench** 60.9% vs 59.5% task success.
 
+**Speed vs paging the full KV.** [Adaptive KV cache streaming](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9) also fits Qwen3.8-27B at 256K on 16 GiB, but it still **attends over the entire history** and streams KV from host RAM on every layer. Decode therefore falls as context grows (their RTX 5070 Ti figures: ~50 tok/s at 8K, ~20 tok/s at 176K, ~10 tok/s at 256K). KVMem instead **retrieves a bounded GPU window** (~32–50K). Attention and decode cost stay that of the window, not of the full 256K: on a 5060 Ti 16 GiB we stay around **30–40 tok/s** decode and **~500 tok/s** prefill, including 61K cache-miss prompts. That is the speed tradeoff: streaming keeps exact full-context attention; KVMem keeps near-lossless quality at roughly constant speed.
+
 Paper: [https://arxiv.org/abs/2609.04852](https://arxiv.org/abs/2609.04852)
 
 Current milestone: [`v0.13.0`](docs/milestones/v0.13.0.md).
