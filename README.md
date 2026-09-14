@@ -4,7 +4,7 @@ llama.cpp inference with tiered KV memory for long-running agents.
 
 This repository attaches **KVMem** to a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) tree. llama.cpp remains the inference engine: GGUF loading, graphs, quantization, Flash Attention, hybrid GDN, sampling, and optional MTP. KVMem turns previously computed attention KV into reusable agent memory: a bounded GPU working set, colder blocks on host RAM (optional NVMe later), and query-conditioned retrieval of historical blocks.
 
-The sibling project [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native Qwen runtime with the same KVMem idea. This repo is the llama.cpp port: any GGUF llama.cpp can run, not a Qwen-only engine.
+The sibling project [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native Qwen runtime with the same KVMem idea. That stack is built around **Qwen3.8-27B Q8** and was primarily tested on an **RTX PRO 6000**. This llama.cpp port runs **Qwen3.8-27B in many GGUF quants** (IQ3, IQ4, and denser formats llama.cpp already supports). Hardware coverage is whatever this llama.cpp CUDA build can use: still **NVIDIA only**, **Ampere or newer** (RTX 30 / A100 and later). Ada and Blackwell (including 16 GiB 5060 Ti) work with the recipes below; CUDA 12.8+ is required for SM120.
 
 KVMem’s logical workspace (`-c`) is **not** capped by the model’s native context window. History that does not fit on the GPU is stored as KV on the host (NVMe later). If RAM is large enough, `-c` can go past 256K. Whether quality still holds at those extra lengths has **not** been fully tested in this llama.cpp port, so a larger `-c` is experimental — try it if you want.
 
@@ -60,8 +60,8 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 ## Requirements
 
 - Linux, x86-64 (current development).
-- NVIDIA GPU, Ampere or newer, and a matching CUDA toolkit. 16 GiB is enough for the 27B recipes below.
-- CMake 3.18+, C++17, CUDA 12.8+ for SM120.
+- NVIDIA GPU, Ampere or newer (RTX 30 / A100 and later). 16 GiB is enough for the 27B recipes below.
+- CMake 3.18+, C++17; CUDA 12.8+ for Blackwell / SM120.
 - Extra host RAM for spilled KV.
 
 Generation is CUDA-only. AMD/ROCm and Metal are not wired here.
