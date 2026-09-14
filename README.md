@@ -1,5 +1,7 @@
 # KVMem + llama.cpp
 
+Near-lossless **Qwen3.8-27B** at a full **256K** workspace on a **16 GiB** GPU.
+
 llama.cpp inference with tiered KV memory for long-running agents.
 
 This repository attaches **KVMem** to a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) tree. llama.cpp remains the inference engine: GGUF loading, graphs, quantization, Flash Attention, hybrid GDN, sampling, and optional MTP. KVMem turns previously computed attention KV into reusable agent memory: a bounded GPU working set, colder blocks on host RAM, and query-conditioned retrieval of historical blocks. **NVMe offload is not implemented in this llama.cpp port.**
