@@ -1,190 +1,209 @@
-# kvmem_llamacpp
+# KVMem + llama.cpp
 
-KVMem as a standalone library, attached to llama.cpp through
-`llama_memory_i`. See [docs/modification-plan.md](docs/modification-plan.md).
+llama.cpp inference with tiered KV memory for long-running agents.
 
-**Current local milestone: [`v0.13.0`](docs/milestones/v0.13.0.md)** (2026-09-14).
-IQ3 chat completions accept OpenAI `image_url` (base64 or HTTP) with
-`--mmproj`; see [multimodal usage](docs/multimodal-implementation-report-2026-09-14.md).
-GPU KV default **q8_0** (`q5_0` needs `GGML_CUDA_FA_ALL_QUANTS`). Orig-pos
-cells; restore is packed GPU K/V memcpy (no unrotated raw-K on the product
-path). Retrieval uses pre-RoPE mean-K (prefill write + decode running sum
-after pin). Full blocks copy packed K/V to host asynchronously during
-prefill. `llama-kvmem-server` reuses the GPU prefix across requests; same
-last-user tool rounds **skip** retrieval/query-replay and only prefill
-`n_new`. Compact/rewrite that leaves LCP far short of the previous cache
-**drops reuse** and does a full retrieval. If the post-query tail is longer
-than gen-reserve, prefill that tail with offload then retrieve. Query span
-is the last ChatML user role block matching last-user text. Persistent GDN
-snapshot is at **prefill end / gen-start**, not last query. MTP KV follows
-`--kv-dtype` unless `--spec-kv-dtype` overrides. Stream `usage` includes
-DeepSeek `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`. Chat
-sampling follows the Qwen3.8-27B card (thinking vs non-thinking). Decode/tool
-tokens after the query are **recency** (`--kvmem-recent-tokens`, default 0),
-not GPU-mandatory. `--kvmem` is retrieval + query-last 64. MTP remains
-optional (default **none**). 0.8B `server_smoke` T1–T5 GO. P6 is not started.
-Phase D `state_write` is not in this tag.
+This repository attaches **KVMem** to a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) tree. llama.cpp remains the inference engine: GGUF loading, graphs, quantization, Flash Attention, hybrid GDN, sampling, and optional MTP. KVMem turns previously computed attention KV into reusable agent memory: a bounded GPU working set, colder blocks on host RAM (optional NVMe later), and query-conditioned retrieval of historical blocks.
 
-## Layout
+The sibling project [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native Qwen runtime with the same KVMem idea. This repo is the llama.cpp port: any GGUF llama.cpp can run, not a Qwen-only engine.
 
-- `kvmem/` — host library (selection, CPU/NVMe tiers, runtime). No llama.cpp.
-- `src/adapter/` — `llama_memory_i` wrapper (dense slot-pool + hybrid + MTP follower).
-- `tools/` — `llama-kvmem-cli`, `llama-kvmem-server`.
-- `scripts/` — ModelScope downloads and GPU device helpers.
-- `models/` — Unsloth GGUFs (gitignored).
+KVMem’s logical workspace (`-c`) is **not** capped by the model’s native context window. History that does not fit on the GPU is stored as KV on the host (NVMe later). If RAM is large enough, `-c` can go past 256K. Whether quality still holds at those extra lengths has **not** been fully tested in this llama.cpp port, so a larger `-c` is experimental — try it if you want.
 
-## Build (P0 host tests)
+The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that keeping only a **32K GPU-resident active context** is essentially lossless versus attending to the **full 256K** history on **LongMemEval-S** (85.6% vs 86.6% accuracy) and **AgentLongBench** (histories ≤256K: 60.9% vs 59.5% task success). The paper also reports **MemoryAgentBench** and longer AgentLongBench splits (512K / 1M), where a full-context baseline is no longer possible.
 
-```bash
-.venv/bin/cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DKVMEM_BUILD_LLAMA=OFF
-.venv/bin/cmake --build build -j
-.venv/bin/ctest --test-dir build --output-on-failure
+Paper: [https://arxiv.org/abs/2609.04852](https://arxiv.org/abs/2609.04852)
+
+Current milestone: [`v0.13.0`](docs/milestones/v0.13.0.md).
+
+## Why this repo?
+
+- **llama.cpp as the engine:** model load, CUDA kernels, FA, GDN, MTP, and chat templates stay upstream.
+- **KV memory for agents:** keep contextualized KV blocks across GPU and host, then retrieve a bounded working set for the current query.
+- **Thin, replayable patches:** llama.cpp is a submodule pin plus `patches/`. Upgrade is bump pin + replay, not a diverged fork.
+- **Out-of-tree server:** `llama-kvmem-server` is OpenAI-compatible (`/v1/chat/completions`) and does not patch `llama-server`.
+- **Optional vision:** `--mmproj` loads a GGUF projector; `image_url` is base64 or HTTP.
+
+## How KVMem works
+
+KVMem treats an agent’s accumulated KV cache as virtual memory. When the workspace exceeds GPU capacity, it stores completed KV blocks in host memory instead of discarding or summarizing them. At each agent step, KVMem uses the current query to select relevant historical blocks and materializes them, in chronological order, into a bounded GPU-resident execution view. By reusing previously computed KV states and loading only the blocks needed for the current step, KVMem supports large persistent workspaces while keeping GPU memory usage bounded.
+
+[High-level flow (same diagram as kvmem-qw3)](https://github.com/kvmem/kvmem-qw3/blob/main/docs/assets/kvmem-flow.svg)
+
+Core flags:
+
+| Flag | Meaning |
+|---|---|
+| `-c` | Logical workspace, including history stored off GPU. 256K is the tested default; larger is experimental. |
+| `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
+| `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. |
+| `--kv-dtype` | Quantization of the **main** attention KV (e.g. q8_0, q5_0). |
+| `--spec-kv-dtype` | Quantization of the **MTP draft** KV (often F16). |
+| `--spec-type draft-mtp` | Enable multi-token prediction (`--spec-draft-n-max` is draft length). |
+| `--mmproj` | Vision projector GGUF. Omit for text-only. |
+
+GPU KV size is `budget + gen_reserve` (aligned to `--kvmem-block-tokens`). When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
+
+## How KVMem attaches to llama.cpp
+
+```
+kvmem/            engine-agnostic library (selection, host store, plans)
+                  no #include of llama.cpp headers
+src/adapter/      llama_memory_i implementation (slot pool, hybrid, MTP follower)
+tools/            llama-kvmem-cli, llama-kvmem-server
+llama.cpp/        git submodule, pinned commit
+patches/          diffs against that pin (hooks + multimodal)
 ```
 
-## Build (P1 llama.cpp + CUDA)
+llama.cpp still owns attention. KVMem does **not** patch Flash Attention kernels or repack the window to `[0..W)`. GPU cache is a **bounded slot pool**. Reselect is a plan diff: skip resident blocks, stage in/out only what changed.
 
-Pinned llama.cpp: `b81c99b` (`ggml: avoid KleidiAI buffer type init on dispatch`).
-Patches live in `patches/` and are replayed with `scripts/apply-patches.sh`.
-A fresh checkout of tag `v0.13.0` is the pin plus the cumulative KVMem patch
-(including multimodal). See [patch replay](patches/README.md). Run apply-patches
-before building.
+Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the pin; `scripts/apply-patches.sh` replays `patches/`.
+
+## Requirements
+
+- Linux, x86-64 (current development).
+- NVIDIA GPU, Ampere or newer, and a matching CUDA toolkit. 16 GiB is enough for the 27B recipes below.
+- CMake 3.18+, C++17, CUDA 12.8+ for SM120.
+- Extra host RAM for spilled KV.
+
+Generation is CUDA-only. AMD/ROCm and Metal are not wired here.
+
+## Clone, patch, build
 
 ```bash
+git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
+cd kvmem-llama.cpp
 git checkout v0.13.0
 git submodule update --init
-source scripts/gpu.sh small          # RTX 5050; never use GPU 1 for <27B
 scripts/apply-patches.sh
-scripts/build-cuda.sh                # nvcc from ~/.cu13-env, sm_120, FA_ALL_QUANTS
-.venv/bin/ctest --test-dir build --output-on-failure
-python3 scripts/identity_canary.py \
-  -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
-python3 scripts/mtp_canary.py --gpu small   # needs 0.8B-MTP-GGUF (has nextn)
-python3 scripts/server_smoke.py      # greedy/stream/retrieval/tools T1–T5
+scripts/build-cuda.sh
 ```
 
-`scripts/build-cuda.sh` passes **`-DGGML_CUDA_FA_ALL_QUANTS=ON`**. Without it,
-llama.cpp only builds FlashAttention vec kernels for F16 / Q4_0 / Q8_0 / BF16;
-`--kv-dtype q5_0` (also q4_1 / q5_1) falls off the native FA path and Qwen3.8
-hybrid prefill collapses (tens of tok/s, GPU util stuck low). q8_0 KV does not
-need this flag. Reconfigure+rebuild ggml-cuda after flipping it.
+The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
 
-`llama-kvmem-cli` and `llama-kvmem-server` land in `build/bin/`. This
-llama.cpp revision gates `llama-cli` on `LLAMA_BUILD_SERVER`; the upstream
-greedy binary is `llama-completion` (`-no-cnv --temp 0`). P1 identity
-compares `llama-kvmem-cli` with and without `--kvmem`.
+`scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 
-Independent OpenAI-compatible server (P5, single slot, does not patch
-`llama-server`):
+## Recommended settings (16 GiB)
 
-```bash
-source scripts/gpu.sh small
-build/bin/llama-kvmem-server -m models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
-  --port 8080 -c 2048 --kvmem --kvmem-budget 256 -ngl 99
-# POST /v1/chat/completions  (sampling + stream + tools; temperature=0 for greedy)
-# last user message becomes the retrieval query span; optional body.kvmem.pin / force_substr
-python3 scripts/server_smoke.py
-```
+Measured on RTX 5060 Ti (16 GiB). Logical `-c` is 256K; only the KVMem pool sits in VRAM. Sampling follows the Qwen3.8-27B card; requests can override. `temperature=0` is greedy.
 
-Default IQ4 server on the RTX 5060 Ti (bound by GPU UUID):
-
-```bash
-scripts/start-iq4.sh             # http://127.0.0.1:18200
-scripts/start-iq4.sh --restart   # restart the server on this port
-```
-
-Uses `Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf`: IQ4_XS main weights,
-Q4_0 MTP weights, Q5_0 target KV, F16 MTP KV, and MTP draft length 2.
-Defaults: context 262144, batch 512, retrieval budget 32000, generation
-reserve 12000 (11904 after 128-token block alignment), maximum output
-16000, thinking enabled with a 4096-token reasoning budget. Logs are
-`logs/opencode_kvmem_iq4_256k.{stdout,stderr}.log`; PID is in
-`logs/iq4_18200.pid`.
-
-CLI/server accept `--spec-kv-dtype f16` (also `q8_0`, `q5_0`, `q4_0`, `f32`)
-to set MTP K/V independently of the target cache. Without this option, MTP
-inherits the target K/V types. For example, `--kv-dtype q5_0 --spec-kv-dtype f16`
-uses Q5 target KV and F16 MTP KV, as configured in the default IQ4 startup script.
-The [controlled experiment](docs/mtp-kv-controlled-experiment-2026-09-13.md)
-measured a 42 MiB lower whole-GPU sampled peak with F16 MTP KV than with Q5 MTP KV.
-
-Chat sampling defaults follow the [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices):
-
-| Parameter | Thinking (default IQ4 mode) | Non-thinking |
+| | Thinking (these recipes) | Non-thinking |
 |---|---:|---:|
-| `temperature` | 1.0 | 0.7 |
-| `top_p` | 0.95 | 0.80 |
-| `top_k` | 20 | 20 |
-| `min_p` | 0.0 | 0.0 |
-| `presence_penalty` | 0.0 | 1.5 |
-| `repetition_penalty` | 1.0 | 1.0 |
-| `frequency_penalty` | 0.0 | 0.0 |
-
-`/v1/chat/completions` accepts these fields plus `seed` (uint32; `4294967295`
-means random). `repeat_penalty` is an alias for `repetition_penalty`; conflicting
-aliases return HTTP 400. Omitted or null fields inherit defaults. Non-numeric,
-non-finite, or out-of-range values return HTTP 400: temperature [0,2], top_p/min_p
-[0,1], top_k integer >= 0, presence/frequency penalties [-2,2], repetition penalty > 0.
-Penalties use llama.cpp's 64-token history window. Explicit `temperature=0`
-uses greedy decoding, disables top-k/top-p/min-p filtering, and retains penalties.
-To reproduce the previous unpenalized greedy behavior in non-thinking mode,
-also send `presence_penalty=0`.
-
-Server flags `--temp`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`,
-`--frequency-penalty`, `--repeat-penalty`, and `--seed` override defaults for both
-modes. Priority: request fields > explicit server flags > mode defaults. The IQ4
-script uses mode defaults, so disabling thinking per request also selects the
-non-thinking sampling defaults. `KVMEM_TRACE sampling` logs effective parameters
-for every request; both normal generation and MTP use this configuration.
-`scripts/start-iq3.sh` explicitly sets the Thinking sampling values as process
-defaults; requests can override them, including when disabling thinking.
-The 4096 reasoning budget and 16000 output limit remain deployment settings;
-this aligns sampling parameters, not the model card's full output/context budgets.
-Run `python3 scripts/chat_sampling_canary.py` to verify defaults, overrides,
-HTTP validation, and ordinary/MTP generation on the RTX 5050 with the local
-0.8B MTP model. This starts isolated test servers and leaves IQ4 running.
-
-Example request fields for an explicit Thinking configuration:
-
-```json
-{
-  "messages": [{"role": "user", "content": "Write a Python LRU cache."}],
-  "enable_thinking": true,
-  "temperature": 1.0,
-  "top_p": 0.95,
-  "top_k": 20,
-  "min_p": 0.0,
-  "presence_penalty": 0.0,
-  "repetition_penalty": 1.0,
-  "seed": 42,
-  "max_tokens": 1024
-}
-```
-
-## GPUs on this machine
-
-| nvidia-smi index | Card | VRAM | Use |
-|---|---|---|---|
-| 0 | RTX 5050 Laptop | 8 GiB | every model **below 27B** |
-| 1 | RTX 5090 Laptop (24 GiB) or RTX 5060 Ti (16 GiB) | **27B only** |
-
-CUDA's default device order is FASTEST_FIRST unless `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
-`scripts/gpu.sh` binds by UUID. Never put 27B on the 5050.
+| temperature | 1.0 | 0.7 |
+| top_p | 0.95 | 0.80 |
+| top_k | 20 | 20 |
+| min_p | 0.0 | 0.0 |
+| presence_penalty | 0.0 | 1.5 |
+| frequency_penalty | 0.0 | 0.0 |
+| repetition_penalty | 1.0 | 1.0 |
 
 ```bash
-source scripts/gpu.sh small   # 5050
-source scripts/gpu.sh 27b     # 5090 if present, else 5060 Ti
+scripts/start-iq3.sh    # text + GPU vision + MTP, :18200
+scripts/start-iq4.sh    # text + CPU vision + MTP, :18200
 ```
 
-## Test models (Unsloth, ModelScope only)
+### IQ3 27B — text + vision, with MTP
 
-```bash
-# venv with modelscope (already created if you used uv)
-uv venv .venv
-uv pip install --python .venv/bin/python modelscope cmake
+`scripts/start-iq3.sh`. ISTA GGUF **as published** (MTP head not requantized). **Main KV q8_0**, MTP KV F16.
 
-scripts/download-test-models.sh ci    # 0.6B + 0.8B
-scripts/download-test-models.sh all   # plus 1.7B/4B/27B
+- Text: [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) → `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (use the `-mtp` file)
+- Vision: [unsloth/Qwen3.8-27B-GGUF](https://www.modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) `mmproj-BF16.gguf`, locally quantized to `mmproj-Q8_0.gguf` (`llama-quantize`; most weights Q8_0, 27 `ffn_down` tensors stay F16)
+
+```text
+-m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+--mmproj mmproj-Q8_0.gguf --mmproj-offload --image-max-tokens 512
+-c 262144 -n 16384 -b 512 -ngl 99
+--kvmem --kvmem-method retrieval
+--kvmem-budget 36864 --kvmem-gen-reserve 16384
+--kvmem-block-tokens 128 --kv-dtype q8_0
+--spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16
+--enable-thinking --reasoning-budget 4096
+--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
+--presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
 ```
 
-Daily canaries use Qwen3-0.6B Q8_0 and Qwen3.5-0.8B Q8_0 on GPU 0.
-Qwen3.8-27B-UD-Q4_K_M is GPU 1 only.
+If GPU vision does not fit, `MMPROJ_DEVICE=cpu`.
+
+### IQ4 27B — text + vision on CPU, with MTP
+
+`scripts/start-iq4.sh`. Projector is **on CPU** by default (`--no-mmproj-offload`) so 16 GiB VRAM stays for the language model. Override with `MMPROJ_DEVICE=gpu` if you have spare VRAM.
+
+Download Unsloth `Qwen3.8-27B-UD-IQ4_XS.gguf` and `mmproj-BF16.gguf` ([ModelScope](https://www.modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) / [Hugging Face](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)). Upstream MTP head is Q6_K / Q8_0.
+
+The language GGUF this recipe runs, `Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf`, is **not** an Unsloth release: only MTP (`blk.64`) matmul weights were requantized to **Q4_0**. Vision uses the official **BF16** `mmproj-BF16.gguf` on CPU.
+
+```text
+-m Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf
+--mmproj mmproj-BF16.gguf --no-mmproj-offload --image-max-tokens 512
+-c 262144 -n 12288 -b 512 -ngl 99
+--kvmem --kvmem-method retrieval
+--kvmem-budget 32768 --kvmem-gen-reserve 12288
+--kvmem-block-tokens 128 --kv-dtype q5_0
+--spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16
+--enable-thinking --reasoning-budget 4096
+--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
+--presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
+```
+
+Main weights IQ4_XS, MTP head Q4_0. **Main KV q5_0**, MTP KV F16. Max output 12K.
+
+### 5060 Ti results
+
+Same flow for both recipes: ~12K text, then one image, then a short follow-up. Thinking on. Full numbers: [recommended-config-performance.md](docs/recommended-config-performance.md).
+
+| | IQ3 (GPU vision) | IQ4 (CPU vision) |
+|---|---:|---:|
+| 12K text prefill | 22.0 s | 22.0 s |
+| Image encode | **0.30 s** | **9.75 s** |
+| Image request (incl. encode) | 4.2 s | 13.9 s |
+| Image decode | 37 tok/s | 39 tok/s |
+| Follow-up prefill | 0.50 s | 0.57 s |
+| Follow-up decode | 38 tok/s | 40 tok/s |
+| GPU peak | **15.3 GiB** | **15.2 GiB** |
+| Host RSS peak | 11.7 GiB | 13.6 GiB |
+
+### Which one to run
+
+| | IQ3 | IQ4 |
+|---|---|---|
+| Images | GPU encode **0.3 s** | CPU encode **~10 s** |
+| Decode | ~38 tok/s | ~40 tok/s |
+| GPU KV window | 36K retrieve / 16K generate | 32K / 12K |
+| Main KV | q8_0 | q5_0 |
+| MTP weights | Official ISTA `-mtp` | Local Q4_0 requant of Unsloth |
+| Host RAM | ~12 GiB RSS | ~14 GiB RSS (BF16 projector on CPU) |
+
+**Recommendation:** **IQ3** if you use images or want the published MTP file and a larger KV window. **IQ4** if the work is mostly text and a ~10 s image encode is acceptable. On this 16 GiB 5060 Ti, default is **IQ3** (`scripts/start-iq3.sh`).
+
+## APIs
+
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/chat/completions` (sampling, stream, tools, optional images)
+
+No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+
+## Documentation
+
+- [v0.13.0 milestone](docs/milestones/v0.13.0.md)
+- [Modification plan](docs/modification-plan.md)
+- [Architecture](docs/architecture.md)
+- [Patch replay](patches/README.md)
+- [Recommended 16 GiB performance](docs/recommended-config-performance.md)
+- [Multimodal usage](docs/multimodal-implementation-report-2026-09-14.md)
+- Native Qwen engine: [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)
+
+## Project layout
+
+```
+kvmem/            Host KVMem library (no llama.cpp includes)
+src/adapter/      llama_memory_i wrapper
+tools/            llama-kvmem-cli, llama-kvmem-server, vision helpers
+scripts/          apply-patches, CUDA build, GPU bind, start helpers
+patches/          Diffs against the llama.cpp pin
+docs/             Architecture, milestones, multimodal
+llama.cpp/        Submodule (pin only; apply patches after clone)
+models/           Local GGUFs (gitignored)
+```
+
+## License
+
+Checkpoints are distributed separately and may use different terms. llama.cpp remains under its upstream license. KVMem-qw3 source is Apache-2.0; this port should be treated the same unless a `LICENSE` file is added to this tree.
