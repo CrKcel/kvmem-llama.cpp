@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-## Near-lossless Qwen3.8-27B at a full 256K workspace on a 16 GiB GPU — decode stays ~30–40 tok/s
+## Near-lossless Qwen3.8-27B at a full 256K workspace on RTX 5060 Ti 16 GiB — decode stays ~30–40 tok/s
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
