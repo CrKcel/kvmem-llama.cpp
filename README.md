@@ -26,7 +26,7 @@ Current milestone: [`v0.13.0`](docs/milestones/v0.13.0.md).
 
 KVMem treats an agent’s accumulated KV cache as virtual memory. When the workspace exceeds GPU capacity, it stores completed KV blocks in host memory instead of discarding or summarizing them. At each agent step, KVMem uses the current query to select relevant historical blocks and materializes them, in chronological order, into a bounded GPU-resident execution view. By reusing previously computed KV states and loading only the blocks needed for the current step, KVMem supports large persistent workspaces while keeping GPU memory usage bounded.
 
-[High-level flow (same diagram as kvmem-qw3)](https://github.com/kvmem/kvmem-qw3/blob/main/docs/assets/kvmem-flow.svg)
+![High-level KVMem flow](docs/assets/kvmem-flow.svg)
 
 Core flags:
 
