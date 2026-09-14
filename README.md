@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-## Near-lossless Qwen3.8-27B at a full 256K workspace on a 16 GiB GPU
+## Near-lossless Qwen3.8-27B at a full 256K workspace on a 16 GiB GPU — decode stays ~30–40 tok/s
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
@@ -21,7 +21,7 @@ Current milestone: [`v0.13.0`](docs/milestones/v0.13.0.md).
 ## Why this repo?
 
 - **llama.cpp as the engine:** model load, CUDA kernels, FA, GDN, MTP, and chat templates stay upstream.
-- **KV memory for agents:** keep contextualized KV blocks across GPU and host, then retrieve a bounded working set for the current query.
+- **KV memory for agents:** keep contextualized KV blocks across GPU and host, then retrieve a bounded working set for the current query. Decode stays in the 30–40 tok/s band on 16 GiB instead of slowing as the full 256K is paged through VRAM.
 - **Thin, replayable patches:** llama.cpp is a submodule pin plus `patches/`. Upgrade is bump pin + replay, not a diverged fork.
 - **Out-of-tree server:** `llama-kvmem-server` is OpenAI-compatible (`/v1/chat/completions`) and does not patch `llama-server`.
 - **Optional vision:** `--mmproj` loads a GGUF projector; `image_url` is base64 or HTTP.
