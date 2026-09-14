@@ -101,6 +101,9 @@ def stop_owned(info, binary):
             signal.pidfd_send_signal(fd, signal.SIGKILL)
             if not select.select([fd], [], [], 10)[0]:
                 raise RuntimeError(f"process {info['pid']} did not exit")
+    except ProcessLookupError:
+        # The inspected process may exit before either signal is sent.
+        return
     finally:
         os.close(fd)
 
@@ -119,6 +122,45 @@ def healthy(port):
             return response.status == 200
     except OSError:
         return False
+
+
+def stop_server(binary, port):
+    logs = ROOT / 'logs'
+    logs.mkdir(exist_ok=True)
+    # Use the launcher's port lock so stopping cannot race startup/restart.
+    with (logs / f'kvmem_{port}.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(f'another launcher is working on port {port}; retry after it finishes')
+        busy, pids = listener(port)
+        targets = {}
+        if busy:
+            if len(pids) != 1:
+                raise ValueError(f'port {port} is busy; cannot identify one owned service, leaving it running')
+            info = process_info(next(iter(pids)))
+            if not owned(info, binary):
+                raise ValueError(f'port {port} belongs to another service; leaving it running')
+            targets[info['pid']] = info
+        # An interrupted launcher may leave a server loading without a listener.
+        # A PID file alone is not sufficient proof of ownership.
+        pidfiles = [logs / f'{recipe}_{port}.pid' for recipe in ('iq3', 'iq4')]
+        for path in pidfiles:
+            try:
+                info = process_info(int(path.read_text().strip()))
+            except (FileNotFoundError, ValueError):
+                continue
+            if owned(info, binary) and '--port' in info['argv']:
+                index = info['argv'].index('--port')
+                if info['argv'][index + 1:index + 2] == [str(port)]:
+                    targets[info['pid']] = info
+        for info in targets.values():
+            stop_owned(info, binary)
+        if listener(port)[0]:
+            raise ValueError(f'port {port} is still busy; leaving PID files for inspection')
+        for path in pidfiles:
+            path.unlink(missing_ok=True)
+        print(f'stopped server on port {port}' if targets else f'no owned server running on port {port}')
 
 
 def same_config(info, argv, env):
@@ -223,12 +265,20 @@ def main():
     ap.add_argument('--budget', type=int, required=True)
     ap.add_argument('--reserve', type=int, required=True)
     ap.add_argument('--explicit-sampling', action='store_true')
-    ap.add_argument('--restart', action='store_true')
-    ap.add_argument('--dry-run', action='store_true', help='print resolved argv/environment without starting or stopping anything')
+    action = ap.add_mutually_exclusive_group()
+    action.add_argument('--restart', action='store_true')
+    action.add_argument('--stop', action='store_true', help="stop this project's server on PORT, without loading models")
+    action.add_argument('--dry-run', action='store_true', help='print resolved argv/environment without starting or stopping anything')
     ap.add_argument('--startup-timeout', type=float, default=180)
     args = ap.parse_args()
     env = os.environ.copy()
     binary = (Path(env.get('BUILD_DIR', str(ROOT / 'build'))) / 'bin/llama-kvmem-server').resolve()
+    port = int(env.get('PORT', '18200'))
+    if not 1 <= port <= 65535:
+        raise ValueError('invalid PORT')
+    if args.stop:
+        stop_server(binary, port)
+        return
     model = Path(env.get('MODEL', args.default_model)).resolve()
     mmproj = Path(env.get('MMPROJ', args.default_mmproj)).resolve()
     for path in (binary, model, mmproj):
@@ -244,7 +294,7 @@ def main():
         raise ValueError('invalid MMPROJ_DEVICE, KVMEM_QUERY_REPLAY or KVMEM_QUERY_POLICY')
     if draft_kv not in ('f16', 'q8_0', 'q5_0', 'q4_0'):
         raise ValueError('SPEC_KV_DTYPE must be f16, q8_0, q5_0 or q4_0')
-    port, image_tokens = int(env.get('PORT', '18200')), int(env.get('IMAGE_MAX_TOKENS', '512'))
+    image_tokens = int(env.get('IMAGE_MAX_TOKENS', '512'))
     if not 1 <= port <= 65535 or image_tokens <= 0 or not 0 < args.startup_timeout <= 3600:
         raise ValueError('invalid PORT, IMAGE_MAX_TOKENS or startup timeout')
     env['CUDA_VISIBLE_DEVICES'] = choose_gpu(env)

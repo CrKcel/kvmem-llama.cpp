@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location('launcher', SCRIPTS / 'start-server.py')
@@ -52,7 +53,7 @@ class LauncherTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / 'scripts').mkdir()
         (self.root / 'build/bin').mkdir(parents=True)
-        for name in ('start-iq3.sh', 'start-iq4.sh', 'start-server.py'):
+        for name in ('start-iq3.sh', 'start-iq4.sh', 'stop-iq3.sh', 'start-server.py'):
             shutil.copy2(SCRIPTS / name, self.root / 'scripts' / name)
         source = self.root / 'server.c'
         source.write_text(STUB)
@@ -106,6 +107,109 @@ class LauncherTests(unittest.TestCase):
         pid = int((self.root / 'logs' / f'{recipe}_{self.port}.pid').read_text())
         self.pids.add(pid)
         return pid
+
+    def run_stop(self, overrides=None, success=True):
+        result = subprocess.run(['bash', str(self.root / 'scripts/stop-iq3.sh')],
+                                env=self.env | (overrides or {}), capture_output=True,
+                                text=True, timeout=25)
+        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+        return result
+
+    def test_stop_owned_without_model_or_gpu_preflight(self):
+        self.run_recipe()
+        pid = self.pid()
+        self.model.unlink()
+        self.mmproj.unlink()
+        self.run_stop(overrides={'CUDA_VISIBLE_DEVICES': '-1', 'TEST_BAD_HELP': '1'})
+        self.assertIsNone(LAUNCHER.process_info(pid))
+        self.assertFalse(LAUNCHER.listener(self.port)[0])
+        self.assertFalse((self.root / 'logs' / f'iq3_{self.port}.pid').exists())
+        self.run_stop()
+
+    def test_stop_refuses_foreign_listener_and_ignores_stale_pid(self):
+        other = self.root / 'unrelated-server'
+        shutil.copy2(self.binary, other)
+        proc = subprocess.Popen([str(other), '--port', str(self.port)], stderr=subprocess.DEVNULL)
+        self.foreign.append(proc)
+        for _ in range(50):
+            if LAUNCHER.healthy(self.port):
+                break
+            time.sleep(.02)
+        self.assertTrue(LAUNCHER.healthy(self.port))
+        logs = self.root / 'logs'
+        logs.mkdir()
+        pidfile = logs / f'iq3_{self.port}.pid'
+        pidfile.write_text(str(proc.pid))
+        self.assertIn('another service', self.run_stop(success=False).stderr)
+        self.assertIsNone(proc.poll())
+        self.assertTrue(pidfile.exists())
+        proc.terminate()
+        proc.wait(timeout=5)
+        sleeper = subprocess.Popen(['sleep', '30'])
+        self.foreign.append(sleeper)
+        pidfile.write_text(str(sleeper.pid))
+        self.run_stop()
+        self.assertIsNone(sleeper.poll())
+        self.assertFalse(pidfile.exists())
+        pidfile.write_text('invalid PID')
+        self.run_stop()
+        self.assertFalse(pidfile.exists())
+
+    def test_stop_respects_build_dir(self):
+        self.run_recipe()
+        pid = self.pid()
+        self.run_stop(overrides={'BUILD_DIR': str(self.root / 'another-build')}, success=False)
+        self.assertIsNotNone(LAUNCHER.process_info(pid))
+        self.run_stop(overrides={'BUILD_DIR': str(self.root / 'build')})
+        self.assertIsNone(LAUNCHER.process_info(pid))
+
+    def test_stop_ignores_pid_for_another_port(self):
+        self.run_recipe()
+        pid = self.pid()
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            other_port = sock.getsockname()[1]
+        stale = self.root / 'logs' / f'iq3_{other_port}.pid'
+        stale.write_text(str(pid))
+        self.run_stop(overrides={'PORT': str(other_port)})
+        self.assertIsNotNone(LAUNCHER.process_info(pid))
+        self.assertFalse(stale.exists())
+
+    def test_stop_loading_server_and_respects_launcher_lock(self):
+        runner = subprocess.Popen(['bash', str(self.root / 'scripts/start-iq3.sh')],
+                                  env=self.env | {'TEST_DELAY': '1'}, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        self.foreign.append(runner)
+        pidfile = self.root / 'logs' / f'iq3_{self.port}.pid'
+        for _ in range(100):
+            if pidfile.exists():
+                break
+            time.sleep(.02)
+        child = self.pid()
+        self.assertIn('another launcher', self.run_stop(success=False).stderr)
+        self.assertIsNotNone(LAUNCHER.process_info(child))
+        runner.terminate()
+        runner.wait(timeout=5)
+        self.assertFalse(LAUNCHER.listener(self.port)[0])
+        self.run_stop()
+        self.assertIsNone(LAUNCHER.process_info(child))
+        self.assertFalse(pidfile.exists())
+
+    def test_stop_pid_reuse_and_exit_races(self):
+        info = dict(pid=123, start='1', uid=os.getuid(), exe=str(self.binary))
+        with mock.patch.object(LAUNCHER.os, 'pidfd_open', return_value=99), \
+                mock.patch.object(LAUNCHER.os, 'close') as close, \
+                mock.patch.object(LAUNCHER, 'process_info', return_value=info | {'start': '2'}), \
+                mock.patch.object(LAUNCHER.signal, 'pidfd_send_signal') as send:
+            LAUNCHER.stop_owned(info, self.binary)
+            send.assert_not_called()
+            close.assert_called_once_with(99)
+        with mock.patch.object(LAUNCHER.os, 'pidfd_open', return_value=99), \
+                mock.patch.object(LAUNCHER.os, 'close') as close, \
+                mock.patch.object(LAUNCHER, 'process_info', return_value=info), \
+                mock.patch.object(LAUNCHER.signal, 'pidfd_send_signal', side_effect=ProcessLookupError):
+            LAUNCHER.stop_owned(info, self.binary)
+            close.assert_called_once_with(99)
 
     def test_selection_overrides_and_quoting(self):
         data = json.loads(self.run_recipe('iq3', '--dry-run').stdout)
