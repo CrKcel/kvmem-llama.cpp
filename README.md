@@ -49,7 +49,7 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 ## Requirements
 
 - Linux, x86-64 (current development).
-- NVIDIA GPU, Ampere or newer (RTX 30 / A100 and later). 16 GiB is enough for the 27B recipes below.
+- NVIDIA GPU. The 27B recipes below are tested on an RTX 5060 Ti with 16 GiB VRAM.
 - CMake 3.18+, C++17; CUDA 12.8+ for Blackwell / SM120.
 - Python 3.10+ and `ss` (iproute2) for the startup scripts.
 - Extra host RAM for spilled KV.
