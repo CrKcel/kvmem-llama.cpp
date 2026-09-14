@@ -4,31 +4,23 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-This repository attaches **KVMem** to a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) tree. llama.cpp remains the inference engine: GGUF loading, graphs, quantization, Flash Attention, hybrid GDN, sampling, and optional MTP. KVMem turns previously computed attention KV into reusable agent memory: a bounded GPU working set, colder blocks on host RAM, and query-conditioned retrieval of historical blocks. **NVMe offload is not implemented in this llama.cpp port.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
 
-The sibling project [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native Qwen runtime with the same KVMem idea. That stack is built around **Qwen3.8-27B Q8** and was primarily tested on an **RTX PRO 6000**. This llama.cpp port runs **Qwen3.8-27B in many GGUF quants** (IQ3, IQ4, and denser formats llama.cpp already supports). Hardware coverage is whatever this llama.cpp CUDA build can use: still **NVIDIA only**, **Ampere or newer** (RTX 30 / A100 and later). Ada and Blackwell (including 16 GiB 5060 Ti) work with the recipes below; CUDA 12.8+ is required for SM120.
+This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
-KVMem’s logical workspace (`-c`) is **not** capped by the model’s native context window. History that does not fit on the GPU is stored as KV on the host. If RAM is large enough, `-c` can go past 256K. Whether quality still holds at those extra lengths has **not** been fully tested in this llama.cpp port, so a larger `-c` is experimental — try it if you want.
+The logical workspace (`-c`) can extend beyond 256K using host RAM; quality at those lengths remains experimental.
 
 The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to 256K, keeping only a **32K GPU-resident active context** is essentially lossless versus the **full 256K** history: **LongMemEval-S** 85.6% vs 86.6% accuracy, **AgentLongBench** 60.9% vs 59.5% task success.
 
-**Speed vs paging the full KV.** [Adaptive KV cache streaming](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9) also fits Qwen3.8-27B at 256K on 16 GiB, but it still **attends over the entire history** and streams KV from host RAM on every layer. Decode therefore falls as context grows (their RTX 5070 Ti figures: ~50 tok/s at 8K, ~20 tok/s at 176K, ~10 tok/s at 256K). KVMem instead **retrieves a bounded GPU window** (~32–50K). Attention and decode cost stay that of the window, not of the full 256K: on a 5060 Ti 16 GiB we stay around **30–40 tok/s** decode and **~500 tok/s** prefill, including 61K cache-miss prompts. That is the speed tradeoff: streaming keeps exact full-context attention; KVMem keeps near-lossless quality at roughly constant speed.
+**KV streaming vs. KVMem.** Both methods support a full 256K context on a 16 GiB GPU by storing part of the KV cache in host RAM. [Raymond Huang’s adaptive KV-cache streaming](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9) keeps part of the KV cache in VRAM and stores the rest in host RAM. During decoding, it prefetches the offloaded KV layer by layer through reusable GPU buffers, overlapping transfers with computation. This preserves attention over the entire history, but longer contexts increase both attention work and PCIe traffic, eventually slowing decode.
 
-Paper: [https://arxiv.org/abs/2609.04852](https://arxiv.org/abs/2609.04852)
+KVMem retrieves relevant historical blocks into a bounded GPU window, limiting the KV used for attention. On RTX 5060 Ti, the current 256K tool benchmark achieves **30–33 token/s decode**, **437–466 token/s prefill for initial computation** and **243–255 token/s overall prefill**, including input reprocessing and cache management.
 
 Current milestone: [`v0.13.0`](docs/milestones/v0.13.0.md).
 
-## Why this repo?
-
-- **llama.cpp as the engine:** model load, CUDA kernels, FA, GDN, MTP, and chat templates stay upstream.
-- **KV memory for agents:** keep contextualized KV blocks across GPU and host, then retrieve a bounded working set for the current query. Decode stays in the 30–40 tok/s band on 16 GiB instead of slowing as the full 256K is paged through VRAM.
-- **Thin, replayable patches:** llama.cpp is a submodule pin plus `patches/`. Upgrade is bump pin + replay, not a diverged fork.
-- **Out-of-tree server:** `llama-kvmem-server` is OpenAI-compatible (`/v1/chat/completions`) and does not patch `llama-server`.
-- **Optional vision:** `--mmproj` loads a GGUF projector; `image_url` is base64 or HTTP.
-
 ## How KVMem works
 
-KVMem treats an agent’s accumulated KV cache as virtual memory. When the workspace exceeds GPU capacity, it stores completed KV blocks in host memory instead of discarding or summarizing them. At each agent step, KVMem uses the current query to select relevant historical blocks and materializes them, in chronological order, into a bounded GPU-resident execution view. By reusing previously computed KV states and loading only the blocks needed for the current step, KVMem supports large persistent workspaces while keeping GPU memory usage bounded.
+Completed KV blocks are stored in host RAM. For each agent step, KVMem retrieves relevant blocks using the current query and places them in chronological order in a bounded GPU working set. Previously computed KV is reused across turns.
 
 ![High-level KVMem flow](docs/assets/kvmem-flow.svg)
 
@@ -48,16 +40,7 @@ GPU KV size is `budget + gen_reserve` (aligned to `--kvmem-block-tokens`). When 
 
 ## How KVMem attaches to llama.cpp
 
-```
-kvmem/            engine-agnostic library (selection, host store, plans)
-                  no #include of llama.cpp headers
-src/adapter/      llama_memory_i implementation (slot pool, hybrid, MTP follower)
-tools/            llama-kvmem-cli, llama-kvmem-server
-llama.cpp/        git submodule, pinned commit
-patches/          diffs against that pin (hooks + multimodal)
-```
-
-llama.cpp still owns attention. KVMem does **not** patch Flash Attention kernels or repack the window to `[0..W)`. GPU cache is a **bounded slot pool**. Reselect is a plan diff: skip resident blocks, stage in/out only what changed.
+`kvmem/` holds the host store and retrieval logic; `src/adapter/` connects it through llama.cpp’s memory interface. Attention kernels and original positions stay unchanged. Reselection transfers only blocks that changed.
 
 Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the pin; `scripts/apply-patches.sh` replays `patches/`.
 
@@ -66,6 +49,7 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 - Linux, x86-64 (current development).
 - NVIDIA GPU, Ampere or newer (RTX 30 / A100 and later). 16 GiB is enough for the 27B recipes below.
 - CMake 3.18+, C++17; CUDA 12.8+ for Blackwell / SM120.
+- Python 3.10+ and `ss` (iproute2) for the startup scripts.
 - Extra host RAM for spilled KV.
 
 Generation is CUDA-only. AMD/ROCm and Metal are not wired here.
@@ -87,7 +71,7 @@ The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh`
 
 ## Recommended settings (16 GiB)
 
-Measured on RTX 5060 Ti (16 GiB). Logical `-c` is 256K; only the KVMem pool sits in VRAM. Sampling follows the Qwen3.8-27B card; requests can override. `temperature=0` is greedy.
+Both recipes use a 256K workspace and a bounded GPU KV working set. Sampling follows the Qwen3.8-27B card and can be overridden per request; `temperature=0` is greedy.
 
 | | Thinking (these recipes) | Non-thinking |
 |---|---:|---:|
@@ -100,9 +84,19 @@ Measured on RTX 5060 Ti (16 GiB). Logical `-c` is 256K; only the KVMem pool sits
 | repetition_penalty | 1.0 | 1.0 |
 
 ```bash
+# Choose one recipe; both default to port 18200.
 scripts/start-iq3.sh    # text + GPU vision + MTP, :18200
 scripts/start-iq4.sh    # text + CPU vision + MTP, :18200
+
+# Switch an existing KVMem service to IQ4.
+scripts/start-iq4.sh --restart
+
+# Override GPU and model, or preview the resolved configuration.
+CUDA_VISIBLE_DEVICES=0 MODEL=/path/model.gguf scripts/start-iq4.sh
+scripts/start-iq4.sh --dry-run
 ```
+
+GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
 
 ### IQ3 27B — text + vision, with MTP
 
@@ -111,11 +105,22 @@ scripts/start-iq4.sh    # text + CPU vision + MTP, :18200
 - Text: [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) → `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (use the `-mtp` file)
 - Vision: [unsloth/Qwen3.8-27B-GGUF](https://www.modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) `mmproj-BF16.gguf`, locally quantized to `mmproj-Q8_0.gguf` (`llama-quantize`; most weights Q8_0, 27 `ffn_down` tensors stay F16)
 
+After downloading the BF16 projector, run from the repository root:
+
+```bash
+model_dir=models/unsloth/Qwen3.8-27B-GGUF
+build/bin/llama-quantize --max-buffer-size 256 \
+  "$model_dir/mmproj-BF16.gguf" "$model_dir/mmproj-Q8_0.gguf" Q8_0
+```
+
+The quantizer automatically falls back to F16 for the 27 incompatible `ffn_down` tensors.
+
 ```text
 -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 --mmproj mmproj-Q8_0.gguf --mmproj-offload --image-max-tokens 512
 -c 262144 -n 16384 -b 512 -ngl 99
 --kvmem --kvmem-method retrieval
+--kvmem-query-replay auto --kvmem-query-policy user
 --kvmem-budget 36864 --kvmem-gen-reserve 16384
 --kvmem-block-tokens 128 --kv-dtype q8_0
 --spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16
@@ -134,11 +139,25 @@ Download Unsloth `Qwen3.8-27B-UD-IQ4_XS.gguf` and `mmproj-BF16.gguf` ([ModelScop
 
 The language GGUF this recipe runs, `Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf`, is **not** an Unsloth release: only MTP (`blk.64`) matmul weights were requantized to **Q4_0**. Vision uses the official **BF16** `mmproj-BF16.gguf` on CPU.
 
+Download [imatrix_unsloth.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/imatrix_unsloth.gguf) into the same model directory, then run from the repository root:
+
+```bash
+model_dir=models/unsloth/Qwen3.8-27B-GGUF
+build/bin/llama-quantize --allow-requantize --max-buffer-size 256 \
+  --imatrix "$model_dir/imatrix_unsloth.gguf" \
+  --tensor-type-file scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types \
+  "$model_dir/Qwen3.8-27B-UD-IQ4_XS.gguf" \
+  "$model_dir/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf" IQ4_XS
+```
+
+The supplied [tensor map](scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types) preserves the original model's mixed quantization and changes only eight MTP matrices. The current quantizer requires the imatrix file to accept the existing low-bit tensors.
+
 ```text
 -m Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf
 --mmproj mmproj-BF16.gguf --no-mmproj-offload --image-max-tokens 512
 -c 262144 -n 12288 -b 512 -ngl 99
 --kvmem --kvmem-method retrieval
+--kvmem-query-replay auto --kvmem-query-policy user
 --kvmem-budget 32768 --kvmem-gen-reserve 12288
 --kvmem-block-tokens 128 --kv-dtype q5_0
 --spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16
@@ -147,35 +166,53 @@ The language GGUF this recipe runs, `Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf`, is **
 --presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
 ```
 
-Main weights IQ4_XS, MTP head Q4_0. **Main KV q5_0**, MTP KV F16. Max output 12K.
-
 ### 5060 Ti results
 
-Same flow for both recipes: ~12K text, then one image, then a short follow-up. Thinking on. Full numbers: [recommended-config-performance.md](docs/recommended-config-performance.md).
+**Test hardware:** RTX 5060 Ti 16 GiB, Intel Core Ultra 7 255H, 32 GiB RAM. Ubuntu 22.04.5 on WSL2 exposes 16 logical CPUs and 19.53 GiB RAM.
 
-| | IQ3 (GPU vision) | IQ4 (CPU vision) |
+Both tasks use thinking with a 128-token budget and at most 512 output tokens per request. IQ3 uses GPU Q8_0 vision; IQ4 uses CPU BF16 vision. RAM is runtime process RSS, excluding loading; VRAM is whole-GPU usage.
+
+Task 1: ~12K text, then one image, then code generation.
+
+| Metric | IQ3 | IQ4 |
 |---|---:|---:|
-| 12K text prefill | 22.0 s | 22.0 s |
+| Prefill — initial computation | 549.50 token/s | 557.93 token/s |
+| Prefill — overall | 517.99 token/s | 366.81 token/s |
 | Image encode | **0.30 s** | **9.75 s** |
-| Image request (incl. encode) | 4.2 s | 13.9 s |
-| Image decode | 37 tok/s | 39 tok/s |
-| Follow-up prefill | 0.50 s | 0.57 s |
-| Follow-up decode | 38 tok/s | 40 tok/s |
-| GPU peak | **15.3 GiB** | **15.2 GiB** |
-| Host RSS peak | 11.7 GiB | 13.6 GiB |
+| Image decode | 37.35 token/s | 39.47 token/s |
+| Code decode (512 tokens) | 38.28 token/s | 40.21 token/s |
+| Runtime host RAM peak | **3012.52 MiB** | **3771.98 MiB** |
+| VRAM peak | **15639.10 MiB** | **15539.10 MiB** |
+| Minimum free VRAM | 412.90 MiB | 512.90 MiB |
+
+Task 2: 32 tool-result rounds plus a base request, reaching **262058 / 262144 tokens** including generation. Both recipes receive identical requests; projectors stay loaded, but no images are sent.
+
+| Metric | IQ3 | IQ4 |
+|---|---:|---:|
+| Prefill — initial computation | 436.72 token/s | 465.61 token/s |
+| Prefill — overall | 243.16 token/s | 254.91 token/s |
+| Aggregate tool-round decode | 29.96 token/s | 32.71 token/s |
+| Code decode (512 tokens) | 29.33 token/s | 35.30 token/s |
+| Runtime host RAM peak | **13444.70 MiB** | **11249.84 MiB** |
+| VRAM peak | **15873.10 MiB** | **15931.10 MiB** |
+| Minimum free VRAM | 178.90 MiB | 120.90 MiB |
+
+Initial computation measures the first processing of new input. Overall includes any repeated processing, cache management and image encoding. Both rates use **total new input divided by the corresponding total time across the task**, counting visual rows as input positions. Decode includes thinking tokens. Code decode refers to the final request.
+
+[Full results](docs/recommended-config-performance.md) · [Benchmark commands](docs/long-context-benchmark-2026-09-14.md). Summarize saved logs with `python3 scripts/summarize_canary.py <artifact-directory>`.
 
 ### Which one to run
 
 | | IQ3 | IQ4 |
 |---|---|---|
 | Images | GPU encode **0.3 s** | CPU encode **~10 s** |
-| Decode | ~38 tok/s | ~40 tok/s |
+| Decode (image / long-context task) | ~38 / ~30 token/s | ~40 / ~33 token/s |
 | GPU KV window | 36K retrieve / 16K generate | 32K / 12K |
 | Main KV | q8_0 | q5_0 |
 | MTP weights | Official ISTA `-mtp` | Local Q4_0 requant of Unsloth |
-| Host RAM | ~12 GiB RSS | ~14 GiB RSS (BF16 projector on CPU) |
+| Runtime host RAM (image / 256K tool task) | 3012.52 / 13444.70 MiB RSS | 3771.98 / 11249.84 MiB RSS |
 
-**Recommendation:** **IQ3** if you use images or want the published MTP file and a larger KV window. **IQ4** if the work is mostly text and a ~10 s image encode is acceptable. On this 16 GiB 5060 Ti, default is **IQ3** (`scripts/start-iq3.sh`).
+**Default: IQ3** for fast image encoding and a larger KV window. **IQ4** suits mostly text workloads with lower long-context RAM use, if ~10 s CPU image encoding is acceptable.
 
 ## APIs
 
@@ -192,6 +229,7 @@ No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_toke
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)
 - [Recommended 16 GiB performance](docs/recommended-config-performance.md)
+- [256K tool benchmark](docs/long-context-benchmark-2026-09-14.md)
 - [Multimodal usage](docs/multimodal-implementation-report-2026-09-14.md)
 - Native Qwen engine: [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)
 
