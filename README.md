@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-Near-lossless **Qwen3.8-27B** at a full **256K** workspace on a **16 GiB** GPU.
+## Near-lossless Qwen3.8-27B at a full 256K workspace on a 16 GiB GPU
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
