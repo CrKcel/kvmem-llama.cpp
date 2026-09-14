@@ -8,7 +8,7 @@ The sibling project [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a C
 
 KVMem’s logical workspace (`-c`) is **not** capped by the model’s native context window. History that does not fit on the GPU is stored as KV on the host. If RAM is large enough, `-c` can go past 256K. Whether quality still holds at those extra lengths has **not** been fully tested in this llama.cpp port, so a larger `-c` is experimental — try it if you want.
 
-The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that keeping only a **32K GPU-resident active context** is essentially lossless versus attending to the **full 256K** history on **LongMemEval-S** (85.6% vs 86.6% accuracy) and **AgentLongBench** (histories ≤256K: 60.9% vs 59.5% task success). The paper also reports **MemoryAgentBench** and longer AgentLongBench splits (512K / 1M), where a full-context baseline is no longer possible.
+The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to 256K, keeping only a **32K GPU-resident active context** is essentially lossless versus the **full 256K** history: **LongMemEval-S** 85.6% vs 86.6% accuracy, **AgentLongBench** 60.9% vs 59.5% task success.
 
 Paper: [https://arxiv.org/abs/2609.04852](https://arxiv.org/abs/2609.04852)
 
