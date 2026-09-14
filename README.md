@@ -2,11 +2,11 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-This repository attaches **KVMem** to a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) tree. llama.cpp remains the inference engine: GGUF loading, graphs, quantization, Flash Attention, hybrid GDN, sampling, and optional MTP. KVMem turns previously computed attention KV into reusable agent memory: a bounded GPU working set, colder blocks on host RAM (optional NVMe later), and query-conditioned retrieval of historical blocks.
+This repository attaches **KVMem** to a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) tree. llama.cpp remains the inference engine: GGUF loading, graphs, quantization, Flash Attention, hybrid GDN, sampling, and optional MTP. KVMem turns previously computed attention KV into reusable agent memory: a bounded GPU working set, colder blocks on host RAM, and query-conditioned retrieval of historical blocks. **NVMe offload is not implemented in this llama.cpp port.**
 
 The sibling project [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native Qwen runtime with the same KVMem idea. That stack is built around **Qwen3.8-27B Q8** and was primarily tested on an **RTX PRO 6000**. This llama.cpp port runs **Qwen3.8-27B in many GGUF quants** (IQ3, IQ4, and denser formats llama.cpp already supports). Hardware coverage is whatever this llama.cpp CUDA build can use: still **NVIDIA only**, **Ampere or newer** (RTX 30 / A100 and later). Ada and Blackwell (including 16 GiB 5060 Ti) work with the recipes below; CUDA 12.8+ is required for SM120.
 
-KVMem’s logical workspace (`-c`) is **not** capped by the model’s native context window. History that does not fit on the GPU is stored as KV on the host (NVMe later). If RAM is large enough, `-c` can go past 256K. Whether quality still holds at those extra lengths has **not** been fully tested in this llama.cpp port, so a larger `-c` is experimental — try it if you want.
+KVMem’s logical workspace (`-c`) is **not** capped by the model’s native context window. History that does not fit on the GPU is stored as KV on the host. If RAM is large enough, `-c` can go past 256K. Whether quality still holds at those extra lengths has **not** been fully tested in this llama.cpp port, so a larger `-c` is experimental — try it if you want.
 
 The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that keeping only a **32K GPU-resident active context** is essentially lossless versus attending to the **full 256K** history on **LongMemEval-S** (85.6% vs 86.6% accuracy) and **AgentLongBench** (histories ≤256K: 60.9% vs 59.5% task success). The paper also reports **MemoryAgentBench** and longer AgentLongBench splits (512K / 1M), where a full-context baseline is no longer possible.
 
