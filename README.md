@@ -16,7 +16,7 @@ The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to
 
 KVMem retrieves relevant historical blocks into a bounded GPU window, limiting the KV used for attention. On RTX 5060 Ti, the current 256K tool benchmark achieves **30–33 token/s decode**, **437–466 token/s prefill for initial computation** and **243–255 token/s overall prefill**, including input reprocessing and cache management.
 
-Current milestone: [`v0.13.0`](docs/milestones/v0.13.0.md).
+Current milestone: [`v0.14.0`](docs/milestones/v0.14.0.md).
 
 ## How KVMem works
 
@@ -31,6 +31,8 @@ Core flags:
 | `-c` | Logical workspace, including history stored off GPU. 256K is the tested default; larger is experimental. |
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. |
+| `--kvmem-query-replay` | `auto` skips a second prefill when the GPU history view did not change; `legacy` always replays. |
+| `--kvmem-query-policy` | `user` retrieves from the last real user question and reuses it on tool turns; `legacy` uses the older suffix policy. Recipes use `auto` + `user`. |
 | `--kv-dtype` | Quantization of the **main** attention KV (e.g. q8_0, q5_0). |
 | `--spec-kv-dtype` | Quantization of the **MTP draft** KV (often F16). |
 | `--spec-type draft-mtp` | Enable multi-token prediction (`--spec-draft-n-max` is draft length). |
@@ -59,7 +61,7 @@ Generation is CUDA-only. AMD/ROCm and Metal are not wired here.
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.13.0
+git checkout v0.14.0
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
@@ -170,18 +172,18 @@ The supplied [tensor map](scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types
 
 **Test hardware:** RTX 5060 Ti 16 GiB, Intel Core Ultra 7 255H, 32 GiB RAM. Ubuntu 22.04.5 on WSL2 exposes 16 logical CPUs and 19.53 GiB RAM.
 
-Both tasks use thinking with a 128-token budget and at most 512 output tokens per request. IQ3 uses GPU Q8_0 vision; IQ4 uses CPU BF16 vision. RAM is runtime process RSS, excluding loading; VRAM is whole-GPU usage.
+Both tasks use thinking with a 128-token budget and at most 512 output tokens per request. That is the speed-test setting; the start scripts default to `--reasoning-budget 4096`. IQ3 uses GPU Q8_0 vision; IQ4 uses CPU BF16 vision. RAM is runtime process RSS, excluding loading; VRAM is whole-GPU usage.
 
 Task 1: ~12K text, then one image, then code generation.
 
 | Metric | IQ3 | IQ4 |
 |---|---:|---:|
-| Prefill — initial computation | 549.50 token/s | 557.93 token/s |
-| Prefill — overall | 517.99 token/s | 366.81 token/s |
-| Image encode | **0.30 s** | **9.75 s** |
-| Image decode | 37.35 token/s | 39.47 token/s |
-| Code decode (512 tokens) | 38.28 token/s | 40.21 token/s |
-| Runtime host RAM peak | **3012.52 MiB** | **3771.98 MiB** |
+| Prefill — initial computation | 549.50 token/s | 582.34 token/s |
+| Prefill — overall | 517.99 token/s | 378.67 token/s |
+| Image encode | **0.30 s** | **10.70 s** |
+| Image decode | 37.35 token/s | 41.25 token/s |
+| Code decode (512 tokens) | 38.28 token/s | 41.04 token/s |
+| Runtime host RAM peak | **3012.52 MiB** | **3674.52 MiB** |
 | VRAM peak | **15639.10 MiB** | **15539.10 MiB** |
 | Minimum free VRAM | 412.90 MiB | 512.90 MiB |
 
@@ -205,14 +207,14 @@ Initial computation measures the first processing of new input. Overall includes
 
 | | IQ3 | IQ4 |
 |---|---|---|
-| Images | GPU encode **0.3 s** | CPU encode **~10 s** |
-| Decode (image / long-context task) | ~38 / ~30 token/s | ~40 / ~33 token/s |
+| Images | GPU encode **0.3 s** | CPU encode **10.7 s** |
+| Decode (image / long-context task) | ~38 / ~30 token/s | ~41 / ~33 token/s |
 | GPU KV window | 36K retrieve / 16K generate | 32K / 12K |
 | Main KV | q8_0 | q5_0 |
 | MTP weights | Official ISTA `-mtp` | Local Q4_0 requant of Unsloth |
-| Runtime host RAM (image / 256K tool task) | 3012.52 / 13444.70 MiB RSS | 3771.98 / 11249.84 MiB RSS |
+| Runtime host RAM (image / 256K tool task) | 3012.52 / 13444.70 MiB RSS | 3674.52 / 11249.84 MiB RSS |
 
-**Default: IQ3** for fast image encoding and a larger KV window. **IQ4** suits mostly text workloads with lower long-context RAM use, if ~10 s CPU image encoding is acceptable.
+**Default: IQ3** for fast image encoding and a larger KV window. **IQ4** suits mostly text workloads with lower long-context RAM use, if ~11 s CPU image encoding is acceptable.
 
 ## APIs
 
@@ -224,12 +226,13 @@ No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_toke
 
 ## Documentation
 
-- [v0.13.0 milestone](docs/milestones/v0.13.0.md)
+- [v0.14.0 milestone](docs/milestones/v0.14.0.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)
 - [Recommended 16 GiB performance](docs/recommended-config-performance.md)
 - [256K tool benchmark](docs/long-context-benchmark-2026-09-14.md)
+- [Query replay](docs/query-replay-implementation-report-2026-09-14.md)
 - [Multimodal usage](docs/multimodal-implementation-report-2026-09-14.md)
 - Native Qwen engine: [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)
 
