@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-## Near-lossless Qwen3.8-27B at a full 256K workspace on RTX 5060 Ti 16 GiB — decode stays ~30–40 tok/s
+## Near-lossless Qwen3.8-27B at a full 256K workspace on 16 GiB VRAM
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
@@ -15,6 +15,8 @@ The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to
 **KV streaming vs. KVMem.** Both methods support a full 256K context on a 16 GiB GPU by storing part of the KV cache in host RAM. [Raymond Huang’s adaptive KV-cache streaming](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9) keeps part of the KV cache in VRAM and stores the rest in host RAM. During decoding, it prefetches the offloaded KV layer by layer through reusable GPU buffers, overlapping transfers with computation. This preserves attention over the entire history, but longer contexts increase both attention work and PCIe traffic, eventually slowing decode.
 
 KVMem retrieves relevant historical blocks into a bounded GPU window, limiting the KV used for attention. On RTX 5060 Ti, the current 256K tool benchmark achieves **30–33 token/s decode**, **437–466 token/s prefill for initial computation** and **243–255 token/s overall prefill**, including input reprocessing and cache management.
+
+**Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
 Current milestone: [`v0.14.0`](docs/milestones/v0.14.0.md).
 
@@ -52,7 +54,7 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 - RTX 5060 Ti with 16 GiB VRAM; Intel Core Ultra 7 255H and 32 GiB RAM (19.53 GiB visible to WSL2).
 - CMake 4.4.3 and CUDA 13.2.86.
 
-Compatibility on other platforms remains to be tested. Reports of successful runs, issues and porting contributions are welcome. The current integration uses CUDA; AMD/ROCm and Metal backends would need integration work.
+The project builds on llama.cpp's CUDA backend, with the platform above used for our measurements. Reports of successful runs, benchmarks and issues on other NVIDIA GPUs and systems are welcome. AMD/ROCm and Metal backends would need integration work.
 
 ## Clone, patch, build
 
