@@ -50,7 +50,7 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 
 - Linux, x86-64 (current development).
 - NVIDIA GPU. The 27B recipes below are tested on an RTX 5060 Ti with 16 GiB VRAM.
-- CMake 3.18+, C++17; CUDA 12.8+ for Blackwell / SM120.
+- C++17 compiler, CMake and CUDA toolkit. Tested with CMake 4.4.3 and CUDA 13.2.86.
 - Python 3.10+ and `ss` (iproute2) for the startup scripts.
 - Extra host RAM for spilled KV.
 
@@ -70,6 +70,8 @@ scripts/build-cuda.sh
 The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
 
 `scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
+
+The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested RTX 5060 Ti. For another GPU, set `CMAKE_CUDA_ARCHITECTURES` to its appropriate target when running the script; other GPU targets have not been tested here.
 
 ## Recommended settings (16 GiB)
 
