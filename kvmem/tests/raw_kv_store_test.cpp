@@ -1,6 +1,8 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/rope.hpp"
 
+#include <algorithm>
+#include <utility>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +18,81 @@
         }                                                                      \
     } while (0)
 
+// Compare lazy normalization with the previous ordered FP32 sum + cached mean.
+// Cancellation and non-power-of-two tails catch mean-to-sum reconstruction.
+static void test_sum_only(uint32_t block_tokens) {
+    kvmem::RawKvStoreConfig cfg;
+    cfg.n_layer = 3; // The other two layers model uncaptured recurrent layers.
+    cfg.n_embd_k = 1024;
+    cfg.n_embd_v = 1024;
+    cfg.block_tokens = block_tokens;
+    cfg.k_row_bytes = 1088; // Quantized product path has no raw-K fallback.
+    kvmem::RawKvStore raw(cfg);
+    const uint32_t count = 2 * block_tokens + 7;
+    std::vector<float> input(count * cfg.n_embd_k);
+    const float values[] = {1e7f, .125f, -1e7f, .3f, -7.1f, .001f, 9.7f};
+    for (uint32_t t = 0; t < count; ++t) {
+        for (uint32_t d = 0; d < cfg.n_embd_k; ++d) {
+            input[t * cfg.n_embd_k + d] = values[(t + d) % 7];
+        }
+    }
+    const auto verify = [&](uint32_t end) {
+        const uint32_t blocks = (end + block_tokens - 1) / block_tokens;
+        // Exactly one F32 vector per populated block/layer, with no lazy cache.
+        CHECK(raw.bytes_k() == size_t(blocks) * cfg.n_embd_k * sizeof(float));
+        for (uint32_t b = 0; b < blocks; ++b) {
+            CHECK(raw.has_block(b));
+            const uint32_t start = b * block_tokens;
+            const uint32_t n = std::min(block_tokens, end - start);
+            std::vector<float> expected(cfg.n_embd_k, 0.0f), got(cfg.n_embd_k);
+            for (uint32_t t = start; t < start + n; ++t) {
+                for (uint32_t d = 0; d < cfg.n_embd_k; ++d) {
+                    expected[d] += input[t * cfg.n_embd_k + d];
+                }
+            }
+            const float inv = 1.0f / static_cast<float>(n);
+            for (auto & x : expected) x *= inv;
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                raw.mean_k(b, 1, got.data());
+                CHECK(std::memcmp(got.data(), expected.data(), got.size() * sizeof(float)) == 0);
+            }
+        }
+        CHECK(raw.bytes_k() == size_t(blocks) * cfg.n_embd_k * sizeof(float));
+    };
+    raw.write_layer_mean_k(0, 5, 1, input.data());
+    verify(5);
+    const auto checkpoint = raw.mean_checkpoint(5);
+    CHECK(checkpoint.size() == cfg.n_layer * (1 + cfg.n_embd_k));
+    CHECK(checkpoint[0] == 0 && checkpoint[1 + cfg.n_embd_k] == 5);
+    CHECK(raw.mean_checkpoint(block_tokens).empty());
+    // Continue in uneven batches across block boundaries.
+    for (uint32_t pos = 5; pos < count;) {
+        const uint32_t n = std::min(11u, count - pos);
+        raw.write_layer_mean_k(pos, n, 1, input.data() + pos * cfg.n_embd_k);
+        pos += n;
+        verify(pos);
+    }
+    raw.truncate_to(5);
+    std::vector<float> missing(cfg.n_embd_k, 123.0f);
+    raw.mean_k(0, 1, missing.data());
+    for (float x : missing) CHECK(x == 0.0f);
+    raw.restore_mean_checkpoint(5, checkpoint);
+    verify(5);
+    // Reads/rollback must not round-trip a mean back into an approximate sum.
+    raw.write_layer_mean_k(5, count - 5, 1, input.data() + 5 * cfg.n_embd_k);
+    verify(count);
+    for (const auto & where : {std::pair<uint32_t, uint32_t>{0, 0}, {99, 1}, {0, 99}}) {
+        std::fill(missing.begin(), missing.end(), 123.0f);
+        raw.mean_k(where.first, where.second, missing.data());
+        for (float x : missing) CHECK(x == 0.0f);
+    }
+    raw.truncate_to(0);
+    CHECK(raw.bytes_k() == 0 && !raw.has_block(0));
+}
+
 int main() {
+    test_sum_only(32);
+    test_sum_only(128);
     kvmem::RawKvStoreConfig cfg;
     cfg.n_layer = 2;
     cfg.n_embd_k = 4;
@@ -33,7 +109,7 @@ int main() {
     CHECK(raw.n_tokens(0) == 2);
     CHECK(raw.has_k(0, 0));
     CHECK(!raw.has_v(0, 0));
-    // Mean-K is captured at write so RAM scoring does not copy_k.
+    // The K sum is captured at write so RAM scoring does not copy_k.
     std::vector<float> got(8, -1.0f);
     CHECK(raw.copy_k(0, 0, got.data()));
     CHECK(got[0] == 0.0f);
@@ -171,7 +247,9 @@ int main() {
     std::vector<float> ms(4, 0.0f);
     raws.mean_k(0, 0, ms.data());
     CHECK(std::fabs(ms[0] - 2.0f) < 1e-3f);
-    kvmem::RawKvStore rawsum(cfg);
+    auto sumcfg = cfg;
+    sumcfg.k_gpu_row_bytes = 6;
+    kvmem::RawKvStore rawsum(sumcfg);
     std::vector<float> ksum(4, 0.0f);
     for (int d = 0; d < 4; ++d) {
         ksum[static_cast<size_t>(d)] = k[static_cast<size_t>(d)] + k[static_cast<size_t>(d + 4)];
@@ -180,6 +258,14 @@ int main() {
     std::vector<float> msum(4, 0.0f);
     rawsum.mean_k(0, 0, msum.data());
     CHECK(std::fabs(msum[0] - 2.0f) < 1e-3f);
+    // Packed rows can run ahead of captured statistics: normalize by mean_tokens.
+    const std::vector<uint8_t> sum_packed(24, 0);
+    rawsum.write_layer_k_gpu(0, 4, 0, sum_packed.data());
+    rawsum.mean_k(0, 0, msum.data());
+    CHECK(msum[0] == 2.0f);
+    rawsum.write_layer_mean_sum(2, 1, 0, k2.data());
+    rawsum.mean_k(0, 0, msum.data());
+    CHECK(msum[0] == (ksum[0] + k2[0]) * (1.0f / 3.0f));
     std::vector<uint8_t> gout(12, 0);
     CHECK(rawg.copy_v_gpu(0, 0, gout.data(), 2));
     CHECK(gout[0] == 1);

@@ -2,7 +2,8 @@
 
 // Host spill for attention KV, indexed by logical block then layer.
 //
-// Product path: mean-K (F32) at first write; packed GPU-format K/V (q8_0 etc)
+// Product path: ordered K sum (F32) at first write, mean-K computed on read;
+// packed GPU-format K/V (q8_0 etc)
 // copied at stage-out. Restore is memcpy; orig pos does not need unrotated K.
 // `write_layer_k_rows` (unrotated token-major K) remains for tests only.
 
@@ -74,6 +75,7 @@ public:
     bool copy_k_gpu(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
     bool copy_v_gpu(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
 
+    // Normalize the stored sum by mean_tokens; absent statistics return zeros.
     void mean_k(uint32_t block_id, uint32_t il, float * out) const;
 
     size_t bytes_k() const;
@@ -88,6 +90,7 @@ public:
     // Preserve only the valid prefix, including a partial last block.
     void truncate_to(uint32_t token_pos);
     void invalidate_packed_from(uint32_t token_pos);
+    // In-process tail checkpoint: per layer, valid count followed by the F32 sum.
     std::vector<float> mean_checkpoint(uint32_t token_pos) const;
     void restore_mean_checkpoint(uint32_t token_pos, const std::vector<float> & state);
 
@@ -101,7 +104,6 @@ private:
         std::vector<uint16_t> v;
         std::vector<uint8_t> k_gpu;
         std::vector<uint8_t> v_gpu;
-        std::vector<float> mean;
         std::vector<float> k_sum;
         bool k_on_nvme = false;
         bool v_on_nvme = false;

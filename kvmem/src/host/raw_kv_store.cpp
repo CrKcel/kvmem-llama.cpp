@@ -190,20 +190,15 @@ void RawKvStore::capture_mean_f16(LayerBlk & lb) const {
         return;
     }
     const uint64_t row = k_row_bytes();
-    lb.mean.assign(cfg_.n_embd_k, 0.0f);
+    lb.k_sum.assign(cfg_.n_embd_k, 0.0f);
     for (uint32_t t = 0; t < nt; ++t) {
         const auto * src = reinterpret_cast<const uint16_t *>(
                 lb.k.data() + static_cast<size_t>(t) * static_cast<size_t>(row));
         for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-            lb.mean[d] += f16_to_f32(src[d]);
+            lb.k_sum[d] += f16_to_f32(src[d]);
         }
     }
     lb.mean_tokens = nt;
-    lb.k_sum = lb.mean;
-    const float inv = 1.0f / static_cast<float>(nt);
-    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-        lb.mean[d] *= inv;
-    }
 }
 
 void RawKvStore::add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take,
@@ -225,14 +220,6 @@ void RawKvStore::add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take,
     }
     const uint32_t nt = off == 0 ? take : std::max(lb.mean_tokens, off + take);
     lb.mean_tokens = nt;
-    lb.mean.assign(cfg_.n_embd_k, 0.0f);
-    if (nt == 0) {
-        return;
-    }
-    const float inv = 1.0f / static_cast<float>(nt);
-    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-        lb.mean[d] = lb.k_sum[d] * inv;
-    }
 }
 
 void RawKvStore::enqueue_flush(uint32_t key, std::vector<uint8_t> && data,
@@ -262,7 +249,7 @@ void RawKvStore::maybe_flush_k(uint32_t block_id, uint32_t il) {
     if (lb.k.size() < nbytes) {
         return;
     }
-    if (k_is_f16() && lb.mean.size() != cfg_.n_embd_k) {
+    if (k_is_f16() && lb.k_sum.size() != cfg_.n_embd_k) {
         capture_mean_f16(lb);
     }
     if (io_sync_inline() || !io_thread_.joinable()) {
@@ -730,11 +717,6 @@ void RawKvStore::write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il,
     }
     lb.n_tokens = std::max(lb.n_tokens, off + take);
     lb.mean_tokens = off == 0 ? take : std::max(lb.mean_tokens, off + take);
-    lb.mean.assign(cfg_.n_embd_k, 0.0f);
-    const float inv = 1.0f / static_cast<float>(lb.mean_tokens);
-    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-        lb.mean[d] = lb.k_sum[d] * inv;
-    }
 }
 
 bool RawKvStore::has_block(uint32_t block_id) const {
@@ -745,7 +727,7 @@ bool RawKvStore::has_block(uint32_t block_id) const {
     for (const auto & lb : blocks_[block_id].layers) {
         if (lb.n_tokens > 0 &&
             (!lb.k.empty() || lb.k_on_nvme || lb.k_flushing || lb.k_gpu_fmt ||
-             !lb.mean.empty())) {
+             (lb.mean_tokens > 0 && !lb.k_sum.empty()))) {
             return true;
         }
     }
@@ -997,22 +979,36 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
     }
     std::unique_lock<std::mutex> lk(mu_);
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
+        std::fill_n(out, cfg_.n_embd_k, 0.0f);
         return;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (lb.mean.size() == cfg_.n_embd_k) {
-        std::memcpy(out, lb.mean.data(), cfg_.n_embd_k * sizeof(float));
+    const auto normalize = [&](const LayerBlk & lb) {
+        if (lb.mean_tokens == 0 || lb.k_sum.size() != cfg_.n_embd_k) {
+            return false;
+        }
+        // Keep the same FP32 reciprocal and multiplication as the write path
+        // used for its cached mean. Never normalize the accumulator in place.
+        const float inv = 1.0f / static_cast<float>(lb.mean_tokens);
+        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
+            out[d] = lb.k_sum[d] * inv;
+        }
+        return true;
+    };
+    if (normalize(blocks_[block_id].layers[il])) {
         return;
     }
+    std::fill_n(out, cfg_.n_embd_k, 0.0f);
     if (!k_is_f16()) {
         return;
     }
     cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
-        return !x.k_flushing;
+        return block_id >= blocks_.size() || !blocks_[block_id].layers[il].k_flushing;
     });
-    if (lb.mean.size() == cfg_.n_embd_k) {
-        std::memcpy(out, lb.mean.data(), cfg_.n_embd_k * sizeof(float));
+    if (block_id >= blocks_.size()) {
+        return;
+    }
+    const LayerBlk & lb = blocks_[block_id].layers[il];
+    if (normalize(lb)) {
         return;
     }
     const uint32_t nt = lb.n_tokens;
@@ -1053,7 +1049,6 @@ size_t RawKvStore::bytes_k() const {
         for (const auto & lb : b.layers) {
             n += lb.k.size();
             n += lb.k_gpu.size();
-            n += lb.mean.size() * sizeof(float);
             n += lb.k_sum.size() * sizeof(float);
         }
     }
@@ -1106,7 +1101,6 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
             lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, tail);
             lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, tail);
             if (lb.mean_tokens > tail) {
-                lb.mean.clear();
                 lb.k_sum.clear();
                 lb.mean_tokens = 0;
                 if (k_is_f16()) {
@@ -1138,15 +1132,14 @@ std::vector<float> RawKvStore::mean_checkpoint(uint32_t token_pos) const {
     std::lock_guard<std::mutex> lk(mu_);
     const uint32_t bid = token_pos / cfg_.block_tokens;
     if (token_pos % cfg_.block_tokens == 0) return {};
-    const size_t stride = 1 + 2 * cfg_.n_embd_k;
+    const size_t stride = 1 + cfg_.n_embd_k;
     std::vector<float> state(cfg_.n_layer * stride, 0);
     if (bid >= blocks_.size()) return state;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const auto & lb = blocks_[bid].layers[il];
         float * dst = state.data() + il * stride;
         dst[0] = lb.mean_tokens;
-        if (!lb.mean.empty()) std::copy(lb.mean.begin(), lb.mean.end(), dst + 1);
-        if (!lb.k_sum.empty()) std::copy(lb.k_sum.begin(), lb.k_sum.end(), dst + 1 + cfg_.n_embd_k);
+        if (!lb.k_sum.empty()) std::copy(lb.k_sum.begin(), lb.k_sum.end(), dst + 1);
     }
     return state;
 }
@@ -1154,7 +1147,7 @@ std::vector<float> RawKvStore::mean_checkpoint(uint32_t token_pos) const {
 void RawKvStore::restore_mean_checkpoint(uint32_t token_pos, const std::vector<float> & state) {
     if (state.empty()) return;
     std::lock_guard<std::mutex> lk(mu_);
-    const size_t stride = 1 + 2 * cfg_.n_embd_k;
+    const size_t stride = 1 + cfg_.n_embd_k;
     if (state.size() != cfg_.n_layer * stride) throw std::runtime_error("invalid mean-K checkpoint");
     const uint32_t bid = token_pos / cfg_.block_tokens;
     ensure_blocks(bid + 1);
@@ -1162,8 +1155,11 @@ void RawKvStore::restore_mean_checkpoint(uint32_t token_pos, const std::vector<f
         auto & lb = blocks_[bid].layers[il];
         const float * src = state.data() + il * stride;
         lb.mean_tokens = (uint32_t) src[0];
-        lb.mean.assign(src + 1, src + 1 + cfg_.n_embd_k);
-        lb.k_sum.assign(src + 1 + cfg_.n_embd_k, src + stride);
+        if (lb.mean_tokens > 0) {
+            lb.k_sum.assign(src + 1, src + stride);
+        } else {
+            lb.k_sum.clear();
+        }
     }
 }
 
