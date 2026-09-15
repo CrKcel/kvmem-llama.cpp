@@ -46,17 +46,17 @@ GPU KV size is `budget + gen_reserve` (aligned to `--kvmem-block-tokens`). When 
 
 Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the pin; `scripts/apply-patches.sh` replays `patches/`.
 
-## Requirements
+## Tested platform
 
-- Linux, x86-64 (current development).
-- NVIDIA GPU. The 27B recipes below are tested on an RTX 5060 Ti with 16 GiB VRAM.
-- C++17 compiler, CMake and CUDA toolkit. Tested with CMake 4.4.3 and CUDA 13.2.86.
-- Python 3.10+ and `ss` (iproute2) for the startup scripts.
-- Extra host RAM for spilled KV.
+- Ubuntu 22.04.5 on WSL2, x86-64.
+- RTX 5060 Ti with 16 GiB VRAM; Intel Core Ultra 7 255H and 32 GiB RAM (19.53 GiB visible to WSL2).
+- CMake 4.4.3 and CUDA 13.2.86.
 
-Generation is CUDA-only. AMD/ROCm and Metal are not wired here.
+Compatibility on other platforms remains to be tested. Reports of successful runs, issues and porting contributions are welcome. The current integration uses CUDA; AMD/ROCm and Metal backends would need integration work.
 
 ## Clone, patch, build
+
+Building uses a C++17 compiler, CMake and the CUDA toolkit. The startup scripts use Python 3.10+ and `ss` (iproute2).
 
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
