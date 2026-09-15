@@ -18,7 +18,7 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 **Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
-Current milestone: [`v0.14.0`](docs/milestones/v0.14.0.md).
+Current milestone: [`v0.15.0`](docs/milestones/v0.15.0.md).
 
 **Limitation:** one generation cannot exceed `--kvmem-gen-reserve` (16384 tokens on the IQ3 recipe, 12288 on IQ4), including thinking. Retrieval pins the GPU window; new tokens only use those reserved slots. We are working on fixing this. For agent use, add a line to the system prompt such as: *Keep each turn's output, including thinking, within 16384 tokens* (use 12288 on IQ4). That makes oversized single-turn replies much less likely.
 
@@ -65,7 +65,7 @@ Building uses a C++17 compiler, CMake and the CUDA toolkit. The startup scripts 
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.14.0
+git checkout v0.15.0
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
@@ -237,7 +237,7 @@ No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_toke
 
 ## Documentation
 
-- [v0.14.0 milestone](docs/milestones/v0.14.0.md)
+- [v0.15.0 milestone](docs/milestones/v0.15.0.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)
