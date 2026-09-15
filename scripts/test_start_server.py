@@ -71,7 +71,8 @@ class LauncherTests(unittest.TestCase):
             self.port = sock.getsockname()[1]
         self.env = os.environ.copy()
         for key in ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'MODEL', 'MMPROJ', 'MMPROJ_DEVICE',
-                    'BUILD_DIR', 'SPEC_KV_DTYPE', 'KVMEM_QUERY_REPLAY', 'KVMEM_QUERY_POLICY',
+                    'BUILD_DIR', 'SPEC_KV_DTYPE', 'SPEC_DRAFT_N_MAX', 'KVMEM_MTP_STATE',
+                    'KVMEM_QUERY_REPLAY', 'KVMEM_QUERY_POLICY',
                     'IMAGE_MAX_TOKENS', 'TEST_EXIT', 'TEST_DELAY', 'TEST_BAD_HELP'):
             self.env.pop(key, None)
         self.env.update(MODEL=str(self.model), MMPROJ=str(self.mmproj), PORT=str(self.port),
@@ -216,13 +217,20 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], 'GPU-big')
         self.assertIn(str(self.model), data['argv'])
         self.assertIn('--mmproj-offload', data['argv'])
+        self.assertEqual(data['argv'][data['argv'].index('--spec-draft-n-max')+1], '3')
+        self.assertEqual(data['argv'][data['argv'].index('--kvmem-mtp-state')+1], 'replay')
         self.assertFalse((self.root / 'BAD').exists())
         self.assertFalse((self.root / 'logs').exists())
         data = json.loads(self.run_recipe('iq4', '--dry-run', overrides={
-            'CUDA_VISIBLE_DEVICES': '3,1', 'MMPROJ_DEVICE': 'gpu', 'SPEC_KV_DTYPE': 'q4_0'}).stdout)
+            'CUDA_VISIBLE_DEVICES': '3,1', 'MMPROJ_DEVICE': 'gpu', 'SPEC_KV_DTYPE': 'q4_0',
+            'SPEC_DRAFT_N_MAX': '4', 'KVMEM_MTP_STATE': 'snapshots'}).stdout)
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], '3,1')
         self.assertIn('--mmproj-offload', data['argv'])
         self.assertEqual(data['argv'][data['argv'].index('--spec-kv-dtype')+1], 'q4_0')
+        self.assertEqual(data['argv'][data['argv'].index('--spec-draft-n-max')+1], '4')
+        self.assertEqual(data['argv'][data['argv'].index('--kvmem-mtp-state')+1], 'snapshots')
+        self.run_recipe('iq3', '--dry-run', overrides={'SPEC_DRAFT_N_MAX': '6'}, success=False)
+        self.run_recipe('iq3', '--dry-run', overrides={'KVMEM_MTP_STATE': 'invalid'}, success=False)
         data = json.loads(self.run_recipe('iq3', '--dry-run', overrides={'TEST_GPUS': 'GPU-only, Any NVIDIA'}).stdout)
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], 'GPU-only')
         self.run_recipe('iq3', '--dry-run', overrides={'TEST_GPUS': 'GPU-a, GPU A\nGPU-b, GPU B'}, success=False)

@@ -7,6 +7,19 @@
 #include <stdexcept>
 #include <utility>
 
+struct gdn_replay_transaction {
+    llama_context * ctx;
+    bool active = false;
+    ~gdn_replay_transaction() {
+        if (active) llama_kvmem_gdn_replay_commit(ctx, 0);
+    }
+    bool commit(uint32_t keep) {
+        const bool ok = llama_kvmem_gdn_replay_commit(ctx, keep);
+        active = false;
+        return ok;
+    }
+};
+
 ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
     if (ok) {
         *ok = true;
@@ -103,8 +116,12 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     // draft is longer than n_rs_seq. Do not probe can_seq_rm on live KVMem:
     // hybrid seq_rm skips GDN on query-replay holes, which would look like PART.
     sess.n_rs_tgt = llama_n_rs_seq(ctx_tgt);
+    sess.use_gdn_replay = llama_kvmem_gdn_replay_enabled();
     sess.use_ckpt_dft = false;
-    if (sess.n_rs_tgt > 0) {
+    if (sess.use_gdn_replay) {
+        sess.use_ckpt_tgt = false;
+        fprintf(stderr, "KVMEM_TRACE spec_ckpt tgt=REPLAY (FP32 GDN records)\n");
+    } else if (sess.n_rs_tgt > 0) {
         sess.use_ckpt_tgt = false;
         fprintf(stderr,
                 "KVMEM_TRACE spec_ckpt tgt=RS n_rs_seq=%u (GPU GDN planes; host ckpt if draft > n_rs)\n",
@@ -258,6 +275,8 @@ kvmem_spec_gen_stats kvmem_spec_generate(
     std::vector<uint8_t> driver_ckpt;
     common_prompt_checkpoint ckpt;
     bool has_eos = false;
+    int64_t verify_us = 0, fold_us = 0;
+    uint64_t verify_calls = 0, committed_rows = 0;
 
     while (st.n_gen < n_predict && !has_eos) {
         if (abort && abort()) {
@@ -316,6 +335,16 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             common_batch_add(batch_tgt, draft[i], n_past + position_offset + (llama_pos) i, { seq_id }, true);
         }
 
+        gdn_replay_transaction transaction{ctx_tgt};
+        if (sess.use_gdn_replay) {
+            transaction.active = llama_kvmem_gdn_replay_begin(batch_tgt.pos[0], batch_tgt.n_tokens);
+            if (!transaction.active) {
+                fprintf(stderr, "GDN replay begin failed at pos=%d width=%d\n", batch_tgt.pos[0], batch_tgt.n_tokens);
+                st.failed = true;
+                break;
+            }
+        }
+        const auto verify_start = ggml_time_us();
         const int rc = llama_decode(ctx_tgt, batch_tgt);
         if (rc != 0) {
             fprintf(stderr, "llama_decode(spec verify) failed rc=%d n_draft=%zu\n",
@@ -338,6 +367,8 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         }
 
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        verify_us += ggml_time_us() - verify_start;
+        ++verify_calls;
         ids.resize(std::min(ids.size(), (size_t) (n_predict - st.n_gen)));
         for (size_t i = 0; i < ids.size(); ++i) {
             if (llama_vocab_is_eog(vocab, ids[i])) {
@@ -345,7 +376,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
                 break;
             }
         }
-        const bool restore = host_ckpt && ids.size() - 1 < n_draft;
+        const bool restore = host_ckpt && !ids.empty() && ids.size() - 1 < n_draft;
         fprintf(stderr,
                 "KVMEM_TRACE spec_verify n_draft=%zu n_accept=%zu restore=%d pos=%d ckpt_bytes=%zu n_rs=%u\n",
                 n_draft, ids.size() > 0 ? ids.size() - 1 : 0, (int) restore, n_past - 1,
@@ -375,12 +406,43 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             continue;
         }
 
+        if (ids.empty() || (sess.use_gdn_replay && abort && abort())) {
+            if (sess.use_gdn_replay) {
+                if (!transaction.commit(0)) st.failed = true;
+                n_past = logical_positions[0];
+                if (!llama_kvmem_remove_logical(ctx_tgt, n_past, -1) ||
+                        (ctx_dft && !llama_kvmem_remove_logical(ctx_dft, n_past, -1))) st.failed = true;
+                llama_kvmem_truncate_cached(n_past);
+                if (!driver_ckpt.empty()) common_speculative_set_state(spec, seq_id, driver_ckpt);
+            }
+            llama_kvmem_decode_mean_discard();
+            break;
+        }
+        if (sess.use_gdn_replay) {
+            const auto fold_start = ggml_time_us();
+            const bool ok = transaction.commit((uint32_t) ids.size());
+            fold_us += ggml_time_us() - fold_start;
+            if (!ok) {
+                fprintf(stderr, "GDN replay commit failed\n");
+                st.failed = true;
+                break;
+            }
+        }
+        committed_rows += ids.size();
         llama_kvmem_decode_mean_commit((uint32_t) ids.size());
         common_speculative_accept(spec, seq_id, (uint16_t) (ids.size() - 1));
         n_past += (int) ids.size() - 1;
         st.n_drafted += (int) n_draft;
         st.n_accept += (int) ids.size() - 1;
 
+        if (sess.use_gdn_replay) {
+            if (!llama_kvmem_remove_logical(ctx_tgt, n_past, -1) ||
+                    (ctx_dft && !llama_kvmem_remove_logical(ctx_dft, n_past, -1))) {
+                st.failed = true;
+                break;
+            }
+            llama_kvmem_truncate_cached(n_past);
+        }
         for (size_t i = 0; i < ids.size(); ++i) {
             prompt_tgt.push_back(id_last);
             id_last = ids[i];
@@ -399,7 +461,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         }
 
         draft.clear();
-        {
+        if (!sess.use_gdn_replay) {
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             if (mem_tgt) {
                 llama_kvmem_remove_logical(ctx_tgt, n_past, -1);
@@ -411,13 +473,16 @@ kvmem_spec_gen_stats kvmem_spec_generate(
                 }
             }
         }
-        llama_kvmem_truncate_cached(n_past);
+        if (!sess.use_gdn_replay) llama_kvmem_truncate_cached(n_past);
     }
 
     fprintf(stderr,
             "KVMEM_TRACE spec_stats n_gen=%d n_drafted=%d n_accept=%d n_restore=%d accept_pct=%.1f\n",
             st.n_gen, st.n_drafted, st.n_accept, st.n_restore,
             st.n_drafted > 0 ? 100.0 * st.n_accept / st.n_drafted : 0.0);
+    fprintf(stderr, "KVMEM_GDN_PERF mode=%s verify_calls=%llu committed_rows=%llu verify_ms=%.3f fold_ms=%.3f\n",
+            sess.use_gdn_replay ? "replay" : "snapshots", (unsigned long long) verify_calls,
+            (unsigned long long) committed_rows, verify_us / 1000.0, fold_us / 1000.0);
     llama_kvmem_decode_mean_flush();
     llama_kvmem_decode_mean_discard();
     common_speculative_print_stats(spec);

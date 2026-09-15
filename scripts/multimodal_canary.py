@@ -55,6 +55,8 @@ def main():
     ap.add_argument('--no-projector', action='store_true')
     ap.add_argument('--query-replay', choices=['legacy', 'auto'])
     ap.add_argument('--query-policy', choices=['legacy', 'user'])
+    ap.add_argument('--mtp-state', choices=['snapshots', 'auto', 'replay'])
+    ap.add_argument('--mtp', type=int, default=2, help='Maximum MTP draft length')
     ap.add_argument('--device', choices=['gpu', 'cpu'], default='gpu')
     ap.add_argument('--spec', choices=['none', 'draft-mtp'], default='draft-mtp')
     ap.add_argument('--kv', default='q8_0')
@@ -70,6 +72,8 @@ def main():
     ap.add_argument('--keep-server', action='store_true')
     ap.add_argument('--quick', action='store_true')
     ap.add_argument('--performance', action='store_true')
+    ap.add_argument('--performance-runs', type=int, default=1)
+    ap.add_argument('--warmup-runs', type=int, default=0)
     ap.add_argument('--thinking-budget', type=int, default=None,
                     help='Enable thinking with this budget for default test requests')
     ap.add_argument('--query-benchmark', action='store_true')
@@ -83,10 +87,20 @@ def main():
     ap.add_argument('--query-quality', action='store_true')
     ap.add_argument('--no-kvmem', action='store_true')
     ap.add_argument('--trace', action='store_true')
+    ap.add_argument('--startup-timeout', type=float, default=240,
+                    help='Model loading deadline in seconds (excluded from runtime metrics)')
     ap.add_argument('--expect-capacity-error', action='store_true')
     args = ap.parse_args()
     if args.thinking_budget is not None and args.thinking_budget < 0:
         ap.error('--thinking-budget must be nonnegative')
+    if args.mtp < 1:
+        ap.error('--mtp must be positive; use --spec none to disable MTP')
+    if args.startup_timeout <= 0:
+        ap.error('--startup-timeout must be positive')
+    if args.performance_runs < 1 or args.warmup_runs < 0:
+        ap.error('performance runs must be positive and warmup runs nonnegative')
+    if (args.performance_runs != 1 or args.warmup_runs) and not (args.performance and args.quick):
+        ap.error('repeated performance runs require --performance --quick')
     if args.long_context_benchmark and (args.query_benchmark or args.query_quality):
         ap.error('--long-context-benchmark cannot be combined with another query benchmark')
     if args.long_chunk_tokens < 512:
@@ -117,7 +131,7 @@ def main():
            '-c', str(args.ctx), '-b', str(args.batch), '-ngl', '99', '--kvmem', '--kvmem-method', 'retrieval',
            '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
            '--kvmem-block-tokens', '128', '--kv-dtype', args.kv,
-           '--spec-type', args.spec, '--spec-draft-n-max', '2', '--enable-thinking',
+           '--spec-type', args.spec, '--spec-draft-n-max', str(args.mtp), '--enable-thinking',
            '--reasoning-budget', str(args.thinking_budget if args.thinking_budget is not None else 0)]
     if not args.no_projector:
         cmd += ['--mmproj', str(args.mmproj.resolve()),
@@ -128,6 +142,8 @@ def main():
         cmd += ['--kvmem-query-replay', args.query_replay]
     if args.query_policy:
         cmd += ['--kvmem-query-policy', args.query_policy]
+    if args.mtp_state:
+        cmd += ['--kvmem-mtp-state', args.mtp_state]
     if args.no_kvmem:
         cmd += ['--no-kvmem']
     (folder / 'argv.json').write_text(json.dumps(cmd, indent=2))
@@ -264,7 +280,7 @@ def main():
         return message, data, raw
 
     try:
-        deadline = time.monotonic() + 240
+        deadline = time.monotonic() + args.startup_timeout
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise RuntimeError((folder / 'server.stderr.log').read_text()[-3000:])
@@ -381,6 +397,29 @@ def main():
                         {'role': 'user', 'content': 'What was the access code of alpha.txt? Reply with its digits only.'}]
             post('quality-new-user', history, ['7391'], extra=extra)
             return
+        if args.performance and args.quick and not args.expect_capacity_error:
+            for run in range(-args.warmup_runs, args.performance_runs):
+                prefix = f'warmup{-run}-' if run < 0 else (f'run{run+1}-' if args.performance_runs > 1 else '')
+                history = []
+                if args.long_words:
+                    history = [{'role': 'user', 'content': 'Remember this background and respond OK.\n' + ' apple' * args.long_words}]
+                    answer, long_data, _ = post(prefix + 'long-text', history, extra={'cache_reset': True})
+                    history.append(answer)
+                history.append({'role': 'user', 'content': [part, {'type': 'text', 'text':
+                    'Name the color and shape of each of the three objects. Be concise.'}]})
+                answer, data, _ = post(prefix + 'image', history, ['red', 'blue', 'green'],
+                                       extra={'cache_reset': True} if not args.long_words else None)
+                if args.long_words:
+                    assert data['usage']['prompt_cache_hit_tokens'] >= long_data['usage']['prompt_tokens'] - 1, data['usage']
+                perf_history = history + [answer, {'role': 'user', 'content':
+                    'Write a self-contained HTML page that draws the three colored shapes in the image using SVG. '
+                    'Include accessible labels and a button that changes the square color. Return the full code.'}]
+                post(prefix + 'code-thinking', perf_history, extra={'temperature': 1.0, 'top_p': .95, 'top_k': 20,
+                     'min_p': 0, 'presence_penalty': 0, 'frequency_penalty': 0, 'repetition_penalty': 1,
+                     'enable_thinking': True,
+                     'reasoning_budget_tokens': args.thinking_budget if args.thinking_budget is not None else 128,
+                     'max_tokens': max(512, (args.thinking_budget or 0) + 128)})
+            return
         history = []
         if args.long_words:
             history = [{'role': 'user', 'content': 'Remember this background and respond OK.\n' + ' apple' * args.long_words}]
@@ -394,15 +433,6 @@ def main():
         answer, data, _ = post('image', history, ['red', 'blue', 'green'])
         if args.long_words:
             assert data['usage']['prompt_cache_hit_tokens'] >= long_data['usage']['prompt_tokens'] - 1, data['usage']
-        if args.performance and args.quick:
-            perf_history = history + [answer, {'role': 'user', 'content':
-                'Write a self-contained HTML page that draws the three colored shapes in the image using SVG. '
-                'Include accessible labels and a button that changes the square color. Return the full code.'}]
-            post('code-thinking', perf_history, extra={'temperature': 1.0, 'top_p': .95, 'top_k': 20,
-                 'min_p': 0, 'presence_penalty': 0, 'frequency_penalty': 0, 'repetition_penalty': 1,
-                 'enable_thinking': True,
-                 'reasoning_budget_tokens': args.thinking_budget if args.thinking_budget is not None else 128,
-                 'max_tokens': max(512, (args.thinking_budget or 0) + 128)})
         if args.quick:
             return
         history.append(answer)

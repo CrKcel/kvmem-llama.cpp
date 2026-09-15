@@ -256,7 +256,8 @@ def launch(args, binary, argv, env, port):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, epilog=
         'Overrides: MODEL, MMPROJ, MMPROJ_DEVICE, CUDA_VISIBLE_DEVICES, PORT, BUILD_DIR, '
-        'IMAGE_MAX_TOKENS, SPEC_KV_DTYPE, KVMEM_QUERY_REPLAY, KVMEM_QUERY_POLICY, CUDA_HOME, LD_LIBRARY_PATH.')
+        'IMAGE_MAX_TOKENS, SPEC_KV_DTYPE, SPEC_DRAFT_N_MAX, KVMEM_MTP_STATE, '
+        'KVMEM_QUERY_REPLAY, KVMEM_QUERY_POLICY, CUDA_HOME, LD_LIBRARY_PATH.')
     ap.add_argument('--recipe', choices=('iq3', 'iq4'), required=True)
     ap.add_argument('--default-model', required=True)
     ap.add_argument('--default-mmproj', required=True)
@@ -290,10 +291,16 @@ def main():
     replay = env.get('KVMEM_QUERY_REPLAY', 'auto')
     policy = env.get('KVMEM_QUERY_POLICY', 'user')
     draft_kv = env.get('SPEC_KV_DTYPE', 'f16')
+    draft_max = int(env.get('SPEC_DRAFT_N_MAX', '3'))
+    mtp_state = env.get('KVMEM_MTP_STATE', 'replay')
     if vision not in ('cpu', 'gpu') or replay not in ('auto', 'legacy') or policy not in ('user', 'legacy'):
         raise ValueError('invalid MMPROJ_DEVICE, KVMEM_QUERY_REPLAY or KVMEM_QUERY_POLICY')
     if draft_kv not in ('f16', 'q8_0', 'q5_0', 'q4_0'):
         raise ValueError('SPEC_KV_DTYPE must be f16, q8_0, q5_0 or q4_0')
+    if draft_max < 1 or mtp_state not in ('snapshots', 'auto', 'replay'):
+        raise ValueError('invalid SPEC_DRAFT_N_MAX or KVMEM_MTP_STATE')
+    if mtp_state == 'replay' and draft_max > 5:
+        raise ValueError('ReplaySSM supports SPEC_DRAFT_N_MAX from 1 to 5')
     image_tokens = int(env.get('IMAGE_MAX_TOKENS', '512'))
     if not 1 <= port <= 65535 or image_tokens <= 0 or not 0 < args.startup_timeout <= 3600:
         raise ValueError('invalid PORT, IMAGE_MAX_TOKENS or startup timeout')
@@ -309,7 +316,8 @@ def main():
             '--kvmem-query-replay', replay, '--kvmem-query-policy', policy,
             '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
             '--kvmem-block-tokens', '128', '--kv-dtype', args.kv,
-            '--spec-type', 'draft-mtp', '--spec-draft-n-max', '2', '--spec-kv-dtype', draft_kv,
+            '--spec-type', 'draft-mtp', '--spec-draft-n-max', str(draft_max), '--spec-kv-dtype', draft_kv,
+            '--kvmem-mtp-state', mtp_state,
             '--enable-thinking', '--reasoning-budget', '4096']
     if args.explicit_sampling:
         argv += ['--temp', '1.0', '--top-p', '0.95', '--top-k', '20', '--min-p', '0.0',

@@ -35,6 +35,7 @@ struct llama_kvmem_params {
     const char * nvme_dir;         // directory for the ephemeral NVMe file
     bool     raw_k_nvme;           // put raw-K/V authority on NVMe (qw3-style)
     bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
+    int32_t  mtp_state;            // 0 snapshots, 1 auto, 2 replay
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults
@@ -104,6 +105,9 @@ LLAMA_API void llama_kvmem_set_replay(bool replay);
 LLAMA_API void llama_kvmem_trace_cells(struct llama_context * ctx, const char * tag);
 // True when the active KVMem memory is hybrid (attn slot-pool + stock GDN).
 LLAMA_API bool llama_kvmem_has_recurrent(void);
+LLAMA_API bool llama_kvmem_gdn_replay_enabled(void);
+LLAMA_API bool llama_kvmem_gdn_replay_begin(llama_pos start, uint32_t width);
+LLAMA_API bool llama_kvmem_gdn_replay_commit(struct llama_context * ctx, uint32_t n_keep);
 // Update query span / force_pos on the live memory (after llama_init_from_model).
 LLAMA_API void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos);
 // Compare never-evicted GPU KV vs host-rebuild from raw-K. block_id -1 = force_pos block.

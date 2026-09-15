@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IQ4_XS + CPU BF16 vision; Q5 main KV, F16 MTP KV, 32K / 12K budgets.
+# IQ4_XS + CPU BF16 vision; Q5 main KV, F16 MTP KV, ReplaySSM MTP3, 32K / 12K budgets.
 # Sampling uses the server's Qwen3.8 defaults, as in the measured configuration.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IQ3_S + GPU Q8_0 vision; Q8 main KV, F16 MTP KV, 36K / 16K budgets.
+# IQ3_S + GPU Q8_0 vision; Q8 main KV, F16 MTP KV, ReplaySSM MTP3, 36K / 16K budgets.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec python3 "$ROOT/scripts/start-server.py" \

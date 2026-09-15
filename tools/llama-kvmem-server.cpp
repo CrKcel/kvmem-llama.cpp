@@ -70,6 +70,7 @@ static void print_usage(const char * argv0) {
             "                            from the end of the span (default 512; qw3-style)\n"
             "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
             "  --kvmem-query-policy MODE  legacy or user (default legacy)\n"
+            "  --kvmem-mtp-state MODE     snapshots, auto or replay (default snapshots)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -1607,6 +1608,13 @@ int main(int argc, char ** argv) {
             const std::string mode = need(arg);
             if (mode != "legacy" && mode != "user") { fprintf(stderr, "invalid query policy\n"); return 1; }
             st.query_policy_user = mode == "user";
+        } else if (eq(arg, "--kvmem-mtp-state")) {
+            const std::string mode = need(arg);
+            if (mode != "snapshots" && mode != "auto" && mode != "replay") {
+                fprintf(stderr, "invalid MTP state mode\n");
+                return 1;
+            }
+            st.kparams.mtp_state = mode == "replay" ? 2 : mode == "auto" ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = std::atoi(need(arg));
             if (st.query_max_tokens <= 0) {

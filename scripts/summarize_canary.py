@@ -18,6 +18,8 @@ def summarize(folder):
     previous_prompt = 0
     for request in requests:
         label = request['label']
+        if label.startswith('warmup'):
+            continue
         trace = (folder / (label + '.trace.log')).read_text()
         gen = re.search(r'KVMEM_GEN_WALL n=(\d+) ms=([\d.]+) toks=([\d.]+)', trace)
         if not gen:
@@ -30,6 +32,10 @@ def summarize(folder):
         fields = dict(re.findall(r'(\w+)=(\S+)', request['trace'][-1]))
         decision = dict(re.findall(r'(\w+)=(\S+)', request['decision'][-1])) if request['decision'] else {}
         perf = dict(re.findall(r'(\w+)=(\S+)', request['perf'][-1])) if request.get('perf') else {}
+        speculative = re.findall(r'KVMEM_TRACE spec_stats (.*)', trace)
+        spec = dict(re.findall(r'(\w+)=(\S+)', speculative[-1])) if speculative else {}
+        gdn = re.findall(r'KVMEM_GDN_PERF (.*)', trace)
+        gdn = dict(re.findall(r'(\w+)=(\S+)', gdn[-1])) if gdn else {}
         prompt = usage.get('prompt_tokens', 0)
         prefill_s = request['prefill_ms'][0] / 1000
         phase_rss = [float(x['rss_mib']) for x in rss if x['phase'] == label]
@@ -44,6 +50,10 @@ def summarize(folder):
                    replay_s=float(perf.get('replay_ms', 0))/1000,
                    retrieval_s=float(perf.get('retrieval_ms', 0))/1000,
                    path=decision.get('path'), encoder_s=float(fields['encoder_ms'])/1000,
+                   mtp_drafted=int(spec.get('n_drafted', 0)),
+                   mtp_accepted=int(spec.get('n_accept', 0)),
+                   mtp_verify_calls=len(re.findall(r'KVMEM_TRACE spec_verify ', trace)),
+                   gdn_fold_s=float(gdn['fold_ms'])/1000 if 'fold_ms' in gdn else None,
                    runtime_rss_peak_mib=max(phase_rss, default=None),
                    vram_peak_mib=max(phase_vram, default=None))
         # Count only newly evaluated input, excluding cached history and output
@@ -62,6 +72,8 @@ def summarize(folder):
         writer.writerows(rows)
     tools = [r for r in rows if r['label'].startswith('long-tool-')]
     measured = tools or rows
+    drafted = sum(r['mtp_drafted'] for r in measured)
+    accepted = sum(r['mtp_accepted'] for r in measured)
     prefill_s = sum(r['prefill_s'] for r in measured)
     first_pass_s = sum(r['first_s'] for r in measured)
     new_input_rows = sum(r['new_input_rows'] for r in measured)
@@ -85,6 +97,8 @@ def summarize(folder):
                   # Sum input and time before dividing; never average row rates.
                   task_prefill=task_prefill,
                   aggregate_decode_tps=sum(r['generated_tokens'] for r in measured)/decode_s,
+                  mtp_drafted=drafted, mtp_accepted=accepted,
+                  mtp_accept_pct=100*accepted/drafted if drafted else None,
                   total_request_wall_s=sum(r['wall_s'] for r in rows),
                   replay_rounds=sum(r['replay_rows']>0 for r in measured),
                   total_replay_rows=sum(r['replay_rows'] for r in measured),
