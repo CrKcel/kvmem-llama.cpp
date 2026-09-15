@@ -20,7 +20,7 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 **Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
-Current milestone: [`v0.14.0`](docs/milestones/v0.14.0.md). Maintainer: [wangleye](https://github.com/wangleye).
+Current milestone: [`v0.14.0`](docs/milestones/v0.14.0.md).
 
 ## How KVMem works
 
@@ -254,10 +254,6 @@ docs/             Architecture, milestones, multimodal
 llama.cpp/        Submodule (pin only; apply patches after clone)
 models/           Local GGUFs (gitignored)
 ```
-
-## Maintainers
-
-- [wangleye](https://github.com/wangleye)
 
 ## License
 
