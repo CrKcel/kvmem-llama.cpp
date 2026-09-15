@@ -14,7 +14,7 @@ The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to
 
 **KV streaming vs. KVMem.** Both methods support a full 256K context on a 16 GiB GPU by storing part of the KV cache in host RAM. [Raymond Huang’s adaptive KV-cache streaming](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9) keeps part of the KV cache in VRAM and stores the rest in host RAM. During decoding, it prefetches the offloaded KV layer by layer through reusable GPU buffers, overlapping transfers with computation. This preserves attention over the entire history, but longer contexts increase both attention work and PCIe traffic, eventually slowing decode.
 
-KVMem retrieves relevant historical blocks into a bounded GPU window, limiting the KV used for attention. On RTX 5060 Ti, the current 256K tool benchmark achieves **30–33 token/s decode**, **437–466 token/s prefill for initial computation** and **243–255 token/s overall prefill**, including input reprocessing and cache management.
+KVMem retrieves relevant historical blocks into a bounded GPU window, limiting the KV used for attention. On RTX 5060 Ti, the current MTP3 256K tool benchmark achieves **32–33 token/s decode**, **437–463 token/s prefill for initial computation** and **242–253 token/s overall prefill**, including input reprocessing and cache management.
 
 **Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
@@ -104,7 +104,7 @@ CUDA_VISIBLE_DEVICES=0 MODEL=/path/model.gguf scripts/start-iq4.sh
 scripts/start-iq4.sh --dry-run
 ```
 
-GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
+GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. Both recipes use MTP3 with ReplaySSM; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE`. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
 
 ### IQ3 27B — text + vision, with MTP
 
@@ -131,7 +131,8 @@ The quantizer automatically falls back to F16 for the 27 incompatible `ffn_down`
 --kvmem-query-replay auto --kvmem-query-policy user
 --kvmem-budget 36864 --kvmem-gen-reserve 16384
 --kvmem-block-tokens 128 --kv-dtype q8_0
---spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16
+--spec-type draft-mtp --spec-draft-n-max 3 --spec-kv-dtype f16
+--kvmem-mtp-state replay
 --enable-thinking --reasoning-budget 4096
 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
 --presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
@@ -168,7 +169,8 @@ The supplied [tensor map](scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types
 --kvmem-query-replay auto --kvmem-query-policy user
 --kvmem-budget 32768 --kvmem-gen-reserve 12288
 --kvmem-block-tokens 128 --kv-dtype q5_0
---spec-type draft-mtp --spec-draft-n-max 2 --spec-kv-dtype f16
+--spec-type draft-mtp --spec-draft-n-max 3 --spec-kv-dtype f16
+--kvmem-mtp-state replay
 --enable-thinking --reasoning-budget 4096
 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
 --presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
@@ -178,49 +180,52 @@ The supplied [tensor map](scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types
 
 **Test hardware:** RTX 5060 Ti 16 GiB, Intel Core Ultra 7 255H, 32 GiB RAM. Ubuntu 22.04.5 on WSL2 exposes 16 logical CPUs and 19.53 GiB RAM.
 
-Both tasks use thinking with a 128-token budget and at most 512 output tokens per request. That is the speed-test setting; the start scripts default to `--reasoning-budget 4096`. IQ3 uses GPU Q8_0 vision; IQ4 uses CPU BF16 vision. RAM is runtime process RSS, excluding loading; VRAM is whole-GPU usage.
+Both tasks use MTP3 with ReplaySSM and thinking with a 128-token budget and at most 512 output tokens per request. That is the speed-test setting; the start scripts default to `--reasoning-budget 4096`. IQ3 uses GPU Q8_0 vision; IQ4 uses CPU BF16 vision. RAM is runtime process RSS, excluding loading; VRAM is whole-GPU usage.
 
-Task 1: ~12K text, then one image, then code generation.
+Task 1: ~12K text, then one image, then code generation. One warmup run precedes two measured runs. This test uses `--image-max-tokens 1024`; measured repeats reuse cached image embeddings. The recipes retain a 512-token image limit.
 
 | Metric | IQ3 | IQ4 |
 |---|---:|---:|
-| Prefill — initial computation | 549.50 token/s | 582.34 token/s |
-| Prefill — overall | 517.99 token/s | 378.67 token/s |
-| Image encode | **0.30 s** | **10.70 s** |
-| Image decode | 37.35 token/s | 41.25 token/s |
-| Code decode (512 tokens) | 38.28 token/s | 41.04 token/s |
-| Runtime host RAM peak | **3012.52 MiB** | **3674.52 MiB** |
-| VRAM peak | **15639.10 MiB** | **15539.10 MiB** |
-| Minimum free VRAM | 412.90 MiB | 512.90 MiB |
+| Prefill — initial computation | 574.49 token/s | 595.60 token/s |
+| Prefill — overall | 544.65 token/s | 505.52 token/s |
+| First image encode (warmup) | **0.41 s** | **21.79 s** |
+| Aggregate decode | **38.55 token/s** | **44.30 token/s** |
+| Image decode | 38.64 token/s | 45.83 token/s |
+| Code decode (512 tokens) | 39.88 token/s | 44.35 token/s |
+| MTP acceptance | 70.74% | 80.85% |
+| Runtime host RAM peak | **4308.21 MiB** | **4846.82 MiB** |
+| VRAM peak | **15591.10 MiB** | **15445.10 MiB** |
+| Minimum free VRAM | 460.90 MiB | 606.90 MiB |
 
 Task 2: 32 tool-result rounds plus a base request, reaching **262058 / 262144 tokens** including generation. Both recipes receive identical requests; projectors stay loaded, but no images are sent.
 
 | Metric | IQ3 | IQ4 |
 |---|---:|---:|
-| Prefill — initial computation | 436.72 token/s | 465.61 token/s |
-| Prefill — overall | 243.16 token/s | 254.91 token/s |
-| Aggregate tool-round decode | 29.96 token/s | 32.71 token/s |
-| Code decode (512 tokens) | 29.33 token/s | 35.30 token/s |
-| Runtime host RAM peak | **13444.70 MiB** | **11249.84 MiB** |
-| VRAM peak | **15873.10 MiB** | **15931.10 MiB** |
-| Minimum free VRAM | 178.90 MiB | 120.90 MiB |
+| Prefill — initial computation | 437.13 token/s | 463.18 token/s |
+| Prefill — overall | 242.06 token/s | 253.41 token/s |
+| Aggregate tool-round decode | 31.74 token/s | 33.31 token/s |
+| Code decode (512 tokens) | 30.53 token/s | 38.15 token/s |
+| MTP acceptance | 64.70% | 67.08% |
+| Runtime host RAM peak | **13483.52 MiB** | **11244.75 MiB** |
+| VRAM peak | **15617.10 MiB** | **15591.69 MiB** |
+| Minimum free VRAM | 434.90 MiB | 460.31 MiB |
 
 Initial computation measures the first processing of new input. Overall includes any repeated processing, cache management and image encoding. Both rates use **total new input divided by the corresponding total time across the task**, counting visual rows as input positions. Decode includes thinking tokens. Code decode refers to the final request.
 
-[Full results](docs/recommended-config-performance.md) · [Benchmark commands](docs/long-context-benchmark-2026-09-14.md). Summarize saved logs with `python3 scripts/summarize_canary.py <artifact-directory>`.
+[Full results and benchmark commands](docs/recommended-config-performance.md). Summarize saved logs with `python3 scripts/summarize_canary.py <artifact-directory>`.
 
 ### Which one to run
 
 | | IQ3 | IQ4 |
 |---|---|---|
-| Images | GPU encode **0.3 s** | CPU encode **10.7 s** |
-| Decode (image / long-context task) | ~38 / ~30 token/s | ~41 / ~33 token/s |
+| Images | GPU vision | CPU vision |
+| Decode (Task 1 / Task 2) | ~39 / ~32 token/s | ~44 / ~33 token/s |
 | GPU KV window | 36K retrieve / 16K generate | 32K / 12K |
 | Main KV | q8_0 | q5_0 |
 | MTP weights | Official ISTA `-mtp` | Local Q4_0 requant of Unsloth |
-| Runtime host RAM (image / 256K tool task) | 3012.52 / 13444.70 MiB RSS | 3674.52 / 11249.84 MiB RSS |
+| Runtime host RAM (Task 1 / Task 2) | 4308.21 / 13483.52 MiB RSS | 4846.82 / 11244.75 MiB RSS |
 
-**Default: IQ3** for fast image encoding and a larger KV window. **IQ4** suits mostly text workloads with lower long-context RAM use, if ~11 s CPU image encoding is acceptable.
+**Default: IQ3** for fast image encoding and a larger KV window. **IQ4** suits mostly text workloads, with faster decode and lower RAM use in the long-context test, if CPU image encoding is acceptable.
 
 ## APIs
 

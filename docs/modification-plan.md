@@ -58,7 +58,8 @@
 
 已知 v1 限制（后续单独立项，不挡当前 retrieval）：
 
-- **生成不能无限长。** retrieval pin 之后 decode 只吃 `gen_reserve` 空槽；槽满且当前块已写满则 `no free GPU slot` / `llama_decode(gen) failed`，**不会**为了续写去挤掉召回块。今天的办法是加大 `--kvmem-gen-reserve`。后续 feature：只回收生成占用的槽（或把那些 gen 块溢到 CPU/NVMe），pin 住的 retrieval 工作集不动。详见 `docs/architecture.md`。
+- **生成不能无限长（v1）。** retrieval pin 之后 decode 只吃 `gen_reserve` 空槽；槽满且当前块已写满则 `no free GPU slot` / `llama_decode(gen) failed`，**不会**为了续写去挤掉召回块。今天的办法是加大 `--kvmem-gen-reserve`，并在 agent prompt 里限制单轮（含思考）长度。
+- **后续：只在 `gen_reserve` 里做 ring。** 不新开第三块池、不加 VRAM、不从 pin 住的 select 里抠槽。`alloc_slot` 失败时只 evict **一块**已写满的生成块（粒度 = `--kvmem-block-tokens`，16 GiB 配方 128），KV 下到 host store；GPU 上仍是完整召回窗口 + 本轮最近约 `gen_reserve`（IQ3 16K / IQ4 12K）。正在写的块不动。MTP 跟同一 slot 下标。详见 `docs/architecture.md`「Known v1 limit」。
 
 ---
 
