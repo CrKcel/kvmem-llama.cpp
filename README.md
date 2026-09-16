@@ -275,6 +275,10 @@ llama.cpp/        Submodule (pin only; apply patches after clone)
 models/           Local GGUFs (gitignored)
 ```
 
+## Acknowledgments
+
+Thanks to **melis** and **redsnow23** from Bilibili for testing the project and providing helpful feedback.
+
 ## License
 
 Checkpoints are distributed separately and may use different terms. llama.cpp remains under its upstream license. KVMem-qw3 source is Apache-2.0; this port should be treated the same unless a `LICENSE` file is added to this tree.
