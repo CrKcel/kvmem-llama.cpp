@@ -343,6 +343,17 @@ class LauncherTests(unittest.TestCase):
         self.run_recipe('iq3', '--dry-run', '--chat-template-kwargs', '[]', success=False)
         self.run_recipe('iq3', '--dry-run', '--chat-template', 'chatml', '--chat-template-file', str(template), success=False)
 
+    def test_ui_options(self):
+        ui = self.root / 'chat UI'
+        ui.mkdir()
+        (ui / 'index.html').write_text('<title>Chat</title>')
+        for recipe in ('iq3', 'iq4'):
+            data = json.loads(self.run_recipe(recipe, '--dry-run', '--ui-dir', str(ui)).stdout)
+            self.assertEqual(data['argv'][data['argv'].index('--ui-dir') + 1], str(ui))
+            data = json.loads(self.run_recipe(recipe, '--dry-run', '--no-ui').stdout)
+            self.assertIn('--no-ui', data['argv'])
+        self.run_recipe('iq3', '--dry-run', '--ui-dir', str(self.root / 'missing'), success=False)
+
     def test_cuda_library_discovery(self):
         cuda = self.root / 'custom CUDA'
         (cuda / 'bin').mkdir(parents=True)

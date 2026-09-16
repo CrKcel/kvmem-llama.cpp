@@ -274,6 +274,8 @@ def main():
     templates.add_argument('--chat-template-file', type=Path, help='custom Jinja template file')
     ap.add_argument('--chat-template-kwargs', help='default template arguments as a JSON object')
     ap.add_argument('--reasoning-effort', help='template effort (GSQ 27B: low, medium, xhigh); default or none')
+    ap.add_argument('--ui-dir', type=Path, help='static chat UI directory')
+    ap.add_argument('--no-ui', action='store_true', help='disable chat UI')
     ap.add_argument('--jinja', action='store_true', help='native Jinja rendering is always enabled')
     action = ap.add_mutually_exclusive_group()
     action.add_argument('--restart', action='store_true')
@@ -326,6 +328,13 @@ def main():
             '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
             '--kv-dtype', args.kv, '--spec-type', 'draft-mtp',
             '--enable-thinking', '--reasoning-budget', '4096']
+    if args.ui_dir is not None:
+        ui = args.ui_dir.resolve()
+        if not (ui / 'index.html').is_file():
+            raise ValueError(f'UI directory has no index.html: {ui}')
+        argv += ['--ui-dir', str(ui)]
+    if args.no_ui:
+        argv += ['--no-ui']
     # These match server defaults; only emit caller overrides.
     if args.kvmem_block_tokens is not None:
         argv += ['--kvmem-block-tokens', str(args.kvmem_block_tokens)]

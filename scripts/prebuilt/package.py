@@ -29,6 +29,7 @@ def main():
     ap.add_argument('--source-manifest', required=True, type=Path)
     ap.add_argument('--source-archive', required=True, type=Path)
     ap.add_argument('--output', required=True, type=Path)
+    ap.add_argument('--ui-dir', type=Path, help='optional built static chat UI')
     args = ap.parse_args()
     source, build = args.source.resolve(), args.build.resolve()
     manifest = json.loads(args.source_manifest.read_text())
@@ -62,6 +63,11 @@ def main():
     (package / 'scripts/prebuilt').mkdir()
     shutil.copy2(scripts_root / 'prebuilt/diagnose.py', package / 'scripts/prebuilt/diagnose.py')
     shutil.copy2(scripts_root / 'prebuilt/README.md', package / 'README.md')
+    ui = args.ui_dir if args.ui_dir is not None else build / 'share/kvmem/ui'
+    if args.ui_dir is not None and not (ui / 'index.html').is_file():
+        raise RuntimeError(f'UI directory has no index.html: {ui}')
+    if (ui / 'index.html').is_file():
+        shutil.copytree(ui, package / 'share/kvmem/ui')
     shutil.copy2(args.cudart_license, package / 'licenses/NVIDIA-CUDA.txt')
     shutil.copy2(args.cublas_license, package / 'licenses/NVIDIA-cuBLAS.txt')
     shutil.copy2(args.apache_license, package / 'licenses/Apache-2.0.txt')

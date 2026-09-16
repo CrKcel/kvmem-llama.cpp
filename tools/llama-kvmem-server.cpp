@@ -4,6 +4,7 @@
 #include "kvmem-chat-sampling.h"
 #include "kvmem-chat-template.h"
 #include "kvmem-chat-id.h"
+#include "kvmem-webui.h"
 #include "kvmem-vision.h"
 #include "kvmem-prefill-policy.h"
 
@@ -48,6 +49,8 @@ static void print_usage(const char * argv0) {
             "  --image-max-tokens N       native maximum image token count\n"
             "  --host HOST                bind address (default 127.0.0.1)\n"
             "  --port N                   port (default 8080)\n"
+            "  --ui-dir PATH              serve static chat UI from PATH\n"
+            "  --no-ui                    disable bundled chat UI\n"
             "  -c, --ctx-size N           context size (default 2048)\n"
             "  -n, --n-predict N          default max_tokens (default 128)\n"
             "  -b, --batch-size N         logical batch (default 512)\n"
@@ -1448,11 +1451,6 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
             }
         }
     }
-    if (body.contains("max_tokens") && body["max_tokens"].is_number()) {
-        out.max_tokens = body["max_tokens"].get<int>();
-    } else if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()) {
-        out.max_tokens = body["max_completion_tokens"].get<int>();
-    }
     out.stream = body.value("stream", false);
     if (body.contains("kvmem") && body["kvmem"].is_object()) {
         const auto & k = body["kvmem"];
@@ -1486,6 +1484,8 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 }
 
 int main(int argc, char ** argv) {
+    std::string ui_dir;
+    bool no_ui = false;
     std::string model_path;
     std::string mmproj_path;
     std::string chat_template;
@@ -1540,6 +1540,10 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "%s requires a positive integer\n", arg);
                 return 1;
             }
+        } else if (eq(arg, "--ui-dir")) {
+            ui_dir = need(arg);
+        } else if (eq(arg, "--no-ui")) {
+            no_ui = true;
         } else if (eq(arg, "--host")) {
             host = need(arg);
         } else if (eq(arg, "--port")) {
@@ -1826,13 +1830,36 @@ int main(int argc, char ** argv) {
         res.status = 204;
     });
 
+    if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0])) return 1;
+    const int generation_limit = st.kparams.enabled && st.kparams.gen_reserve > 0 ?
+        std::min(n_ctx, (int) st.kparams.gen_reserve) : n_ctx;
+    json kwargs = json::object();
+    for (const auto & item : st.template_kwargs) kwargs[item.first] = json::parse(item.second);
+    const auto thinking_params = kvmem_ui_sampling(true, st.sampling_overrides);
+    const auto plain_params = kvmem_ui_sampling(false, st.sampling_overrides);
+    auto default_params = st.enable_thinking_default ? thinking_params : plain_params;
+    default_params["n_predict"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
+    default_params["max_tokens"] = default_params["n_predict"];
+    const json props = {
+        {"role", "model"}, {"total_slots", 1}, {"model_name", st.model_name},
+        {"default_generation_settings", {{"n_ctx", n_ctx}, {"params", default_params}}},
+        {"modalities", {{"vision", st.vision != nullptr}, {"audio", false}, {"video", false}}},
+        {"kvmem", {{"generation_limit", generation_limit},
+            {"defaults", {{"enable_thinking", st.enable_thinking_default},
+                          {"reasoning_budget_tokens", st.reasoning_budget_default}, {"chat_template_kwargs", kwargs}}},
+            {"sampling", {{"thinking", thinking_params}, {"non_thinking", plain_params}}}}}
+    };
+    svr.Get("/props", [props](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(props.dump(), "application/json");
+    });
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
     });
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {
             {"object", "list"},
-            {"data", json::array({json{{"id", st.model_name}, {"object", "model"}}})},
+            {"data", json::array({json{{"id", st.model_name}, {"name", st.model_name}, {"object", "model"}, {"status", {{"value", "loaded"}}}}})},
         };
         res.set_content(j.dump(), "application/json");
     });
@@ -1854,7 +1881,8 @@ int main(int argc, char ** argv) {
         cr.reasoning_budget_tokens = st.reasoning_budget_default;
         cr.reasoning_budget_message = st.reasoning_budget_message;
         std::string err;
-        if (!parse_chat_request(body, cr, err)) {
+        if (!parse_chat_request(body, cr, err) ||
+            !kvmem_output_limit(body, generation_limit, cr.max_tokens, err)) {
             res.status = 400;
             res.set_content(json{{"error", err}}.dump(), "application/json");
             return;
@@ -1874,6 +1902,7 @@ int main(int argc, char ** argv) {
         }
 
         auto slot = std::make_shared<std::unique_lock<std::mutex>>(st.mu);
+        if (req.is_connection_closed && req.is_connection_closed()) return;
         st.mm_reset_requested = body.value("cache_reset", false);
 
         common_chat_templates_inputs inputs;
@@ -2044,13 +2073,15 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        auto make_emit_gen_wall = [n_prompt = (int) toks.size()](
+        auto timings = std::make_shared<json>(json::object());
+        auto make_emit_gen_wall = [timings, n_prompt = (int) toks.size()](
                 std::chrono::steady_clock::time_point t_turn0,
                 std::chrono::steady_clock::time_point t_pf1,
                 double prefill_ms) {
-            return [t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen) {
+            return [timings, t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen) {
                 const auto now = std::chrono::steady_clock::now();
                 const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
+                *timings = {{"predicted_n", n_gen}, {"predicted_ms", gen_ms}};
                 const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
                 const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
                 fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
@@ -2095,6 +2126,7 @@ int main(int argc, char ** argv) {
                 }})},
                 {"usage", usage_json((int) toks.size(), n_gen, n_cache_hit)},
             };
+            out["timings"] = *timings;
             res.set_content(out.dump(), "application/json");
         };
 
@@ -2105,7 +2137,7 @@ int main(int argc, char ** argv) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
                 [slot, &st, &req, toks, cid, request_id, max_tokens, sparams, parse_tools, formatted, stops,
-                 spec_stream, ctx, vocab, make_emit_gen_wall](size_t, httplib::DataSink & sink) mutable {
+                 spec_stream, ctx, vocab, make_emit_gen_wall, timings](size_t, httplib::DataSink & sink) mutable {
                     StreamIo io;
                     io.sink = &sink;
                     io.req = &req;
@@ -2230,7 +2262,9 @@ int main(int argc, char ** argv) {
                         emit_gen_wall((int) gen.size());
                         commit_cached(st, toks, gen);
                         send(stream_choice_chunk(cid, json::object(), finish).dump());
-                        send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit).dump());
+                        auto usage = stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit);
+                        usage["timings"] = *timings;
+                        send(usage.dump());
                         sink.write("data: [DONE]\n\n", 14);
                         multimodal_finish_request(st);
                         slot->unlock();
@@ -2256,7 +2290,9 @@ int main(int argc, char ** argv) {
                     emit_gen_wall((int) gen.size());
                     commit_cached(st, toks, gen);
                     send(stream_choice_chunk(cid, json::object(), finish).dump());
-                    send(stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit).dump());
+                    auto usage = stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit);
+                    usage["timings"] = *timings;
+                    send(usage.dump());
                     sink.write("data: [DONE]\n\n", 14);
                     multimodal_finish_request(st);
                     slot->unlock();
