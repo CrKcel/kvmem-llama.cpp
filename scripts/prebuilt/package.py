@@ -78,7 +78,7 @@ def main():
         'Host glibc, libstdc++, libgcc, libgomp and NVIDIA driver are not redistributed.\n')
     shutil.copy2(args.source_manifest, package / 'provenance/source-manifest.json')
     cache = (build / 'CMakeCache.txt').read_text()
-    options = dict(re.findall(r'^((?:CMAKE_(?:CUDA|CXX)_COMPILER|CMAKE_BUILD_TYPE|CMAKE_CUDA_ARCHITECTURES|GGML_NATIVE|GGML_AVX\w*|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_CUDA_FA_ALL_QUANTS)):[^=]+=(.*)$', cache, re.M))
+    options = dict(re.findall(r'^((?:BUILD_SHARED_LIBS|CMAKE_(?:CUDA|CXX)_COMPILER|CMAKE_BUILD_TYPE|CMAKE_CUDA_ARCHITECTURES|GGML_NATIVE|GGML_AVX\w*|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_CUDA_FA_ALL_QUANTS)):[^=]+=(.*)$', cache, re.M))
     info = {'status': 'experimental-build', 'version': (source / 'VERSION').read_text().strip(),
             'base_commit': manifest['base_commit'],
             'llama_commit': manifest['llama_commit'], 'source_archive_sha256': sha(args.source_archive),
