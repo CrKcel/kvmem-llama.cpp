@@ -7,6 +7,44 @@
 #include <limits>
 #include <string>
 
+// Match llama-server: omitted/null/-1 inherits the process budget.
+inline bool kvmem_chat_reasoning_budget_override(
+        const nlohmann::json & body, int & budget, std::string & err) {
+    if (!body.is_object()) {
+        err = "request must be a JSON object";
+        return false;
+    }
+    const nlohmann::json * selected = nullptr;
+    for (const char * key : {"reasoning_budget_tokens", "thinking_budget_tokens"}) {
+        const auto it = body.find(key);
+        if (it == body.end() || it->is_null()) continue;
+        if (!it->is_number_integer()) {
+            err = std::string(key) + " must be an integer (-1 to inherit, 0 or greater to limit thinking)";
+            return false;
+        }
+        // Check before narrowing: unsigned JSON integers can exceed INT64_MAX.
+        const double value = it->get<double>();
+        if (value < -1 || value > std::numeric_limits<int32_t>::max()) {
+            err = std::string(key) + " must be between -1 and 2147483647";
+            return false;
+        }
+        if (!selected) selected = &*it;
+    }
+    if (selected && selected->get<int>() != -1) budget = selected->get<int>();
+    return true;
+}
+
+inline bool kvmem_chat_reasoning_budget_supported(
+        const common_params_sampling & sp, bool thinking, std::string & err) {
+    if (thinking && sp.reasoning_budget_tokens >= 0 &&
+            (sp.reasoning_budget_start.empty() || sp.reasoning_budget_end.empty() ||
+             sp.reasoning_budget_forced.empty())) {
+        err = "the current chat template has no usable thinking markers; cannot enforce reasoning_budget_tokens";
+        return false;
+    }
+    return true;
+}
+
 // Qwen3.8-27B model card, Best Practices (2026-09-13).
 inline common_params_sampling kvmem_chat_sampling_defaults(bool thinking) {
     common_params_sampling sp;

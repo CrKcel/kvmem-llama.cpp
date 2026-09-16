@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA="${KVMEM_LLAMA_DIR:-$ROOT/llama.cpp}"
 PATCH="$ROOT/patches/llama-kvmem-current.patch"
+BUDGET_UPGRADE="$ROOT/patches/reasoning-budget-upgrade.patch"
 REPLAY_UPGRADE="$ROOT/patches/replayssm-upgrade.patch"
 UPGRADE="$ROOT/patches/multimodal-upgrade.patch"
 cd "$LLAMA"
@@ -32,6 +33,9 @@ if git apply --reverse --check "$PATCH" 2>/dev/null; then
 elif git apply --check "$PATCH" 2>/dev/null; then
     git apply "$PATCH"
     echo "applied current KVMem patch to pinned llama.cpp"
+elif can_upgrade "$BUDGET_UPGRADE"; then
+    git apply "$BUDGET_UPGRADE"
+    echo "upgraded existing KVMem tree with reasoning budget fix"
 elif can_upgrade "$REPLAY_UPGRADE"; then
     git apply "$REPLAY_UPGRADE"
     echo "upgraded existing KVMem tree with ReplaySSM support"

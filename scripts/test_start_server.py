@@ -217,8 +217,8 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], 'GPU-big')
         self.assertIn(str(self.model), data['argv'])
         self.assertIn('--mmproj-offload', data['argv'])
-        self.assertEqual(data['argv'][data['argv'].index('--spec-draft-n-max')+1], '3')
-        self.assertEqual(data['argv'][data['argv'].index('--kvmem-mtp-state')+1], 'replay')
+        self.assertNotIn('--spec-draft-n-max', data['argv'])
+        self.assertNotIn('--kvmem-mtp-state', data['argv'])
         self.assertFalse((self.root / 'BAD').exists())
         self.assertFalse((self.root / 'logs').exists())
         data = json.loads(self.run_recipe('iq4', '--dry-run', overrides={
@@ -235,6 +235,23 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], 'GPU-only')
         self.run_recipe('iq3', '--dry-run', overrides={'TEST_GPUS': 'GPU-a, GPU A\nGPU-b, GPU B'}, success=False)
         self.run_recipe('iq3', '--dry-run', overrides={'CUDA_VISIBLE_DEVICES': ''}, success=False)
+
+    def test_recipes_use_server_defaults(self):
+        for recipe, kv, budget, reserve in [('iq3', 'q8_0', '36864', '16384'),
+                                             ('iq4', 'q5_0', '32768', '12288')]:
+            argv = json.loads(self.run_recipe(recipe, '--dry-run').stdout)['argv']
+            for flag in ('--temp', '--top-p', '--top-k', '--min-p', '--presence-penalty',
+                         '--frequency-penalty', '--repeat-penalty', '--kvmem', '--kvmem-method',
+                         '--kvmem-block-tokens', '--kvmem-query-policy', '--kvmem-query-replay',
+                         '--spec-kv-dtype', '--spec-draft-n-max', '--kvmem-mtp-state', '-b', '-ngl'):
+                self.assertNotIn(flag, argv)
+            for flag, value in [('--kv-dtype', kv), ('--kvmem-budget', budget),
+                                ('--kvmem-gen-reserve', reserve), ('-n', reserve)]:
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+        argv = json.loads(self.run_recipe('iq3', '--dry-run', overrides={
+            'KVMEM_QUERY_REPLAY': 'legacy', 'KVMEM_QUERY_POLICY': 'legacy'}).stdout)['argv']
+        for flag in ('--kvmem-query-replay', '--kvmem-query-policy'):
+            self.assertEqual(argv[argv.index(flag) + 1], 'legacy')
 
     def test_reuse_and_switch(self):
         self.run_recipe()
@@ -310,6 +327,22 @@ class LauncherTests(unittest.TestCase):
         self.pid('iq4')
         self.assertIsNone(LAUNCHER.process_info(child))
 
+    def test_template_options(self):
+        template = self.root / 'custom $(touch BAD).jinja'
+        template.write_text('{{ messages }}')
+        for recipe in ('iq3', 'iq4'):
+            data = json.loads(self.run_recipe(recipe, '--dry-run', '--chat-template-file', str(template),
+                '--reasoning-effort', 'low', '--chat-template-kwargs', '{"flag":true,"count":2}', '--jinja').stdout)
+            argv = data['argv']
+            self.assertEqual(argv[argv.index('--chat-template-file') + 1], str(template))
+            self.assertEqual(argv[argv.index('--reasoning-effort') + 1], 'low')
+            self.assertEqual(json.loads(argv[argv.index('--chat-template-kwargs') + 1]), {'flag': True, 'count': 2})
+            self.assertIn('--jinja', argv)
+        self.assertFalse((self.root / 'BAD').exists())
+        self.run_recipe('iq3', '--dry-run', '--chat-template-file', '/missing/template', success=False)
+        self.run_recipe('iq3', '--dry-run', '--chat-template-kwargs', '[]', success=False)
+        self.run_recipe('iq3', '--dry-run', '--chat-template', 'chatml', '--chat-template-file', str(template), success=False)
+
     def test_cuda_library_discovery(self):
         cuda = self.root / 'custom CUDA'
         (cuda / 'bin').mkdir(parents=True)
@@ -320,6 +353,12 @@ class LauncherTests(unittest.TestCase):
         paths = data['environment']['LD_LIBRARY_PATH'].split(':')
         self.assertEqual(paths[:2], [str(self.binary.parent), '/caller/libs'])
         self.assertIn(str(cuda / 'lib'), paths)
+
+        bundled = self.binary.parent.parent / 'lib'
+        bundled.mkdir()
+        data = json.loads(self.run_recipe('iq3', '--dry-run', overrides={'LD_LIBRARY_PATH': '/caller/libs'}).stdout)
+        self.assertEqual(data['environment']['LD_LIBRARY_PATH'].split(':')[:3],
+                         [str(self.binary.parent), str(bundled), '/caller/libs'])
 
 
 if __name__ == '__main__':

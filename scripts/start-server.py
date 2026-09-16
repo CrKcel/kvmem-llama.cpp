@@ -41,6 +41,9 @@ def library_path(binary, env):
     # Honor caller settings and use the toolkit recorded by this build, without
     # embedding the developer's CUDA installation path in a portable launcher.
     directories = [str(binary.parent)]
+    bundled = binary.parent.parent / 'lib'
+    if bundled.is_dir():
+        directories.append(str(bundled))
     directories += [p for p in env.get('LD_LIBRARY_PATH', '').split(':') if p]
     roots = [Path(env[k]) for k in ('CUDA_HOME', 'CUDA_PATH') if env.get(k)]
     cache = binary.parent.parent / 'CMakeCache.txt'
@@ -265,7 +268,13 @@ def main():
     ap.add_argument('--kv', required=True)
     ap.add_argument('--budget', type=int, required=True)
     ap.add_argument('--reserve', type=int, required=True)
-    ap.add_argument('--explicit-sampling', action='store_true')
+    ap.add_argument('--kvmem-block-tokens', type=int, help='override retrieval block size (server default 128)')
+    templates = ap.add_mutually_exclusive_group()
+    templates.add_argument('--chat-template', help='Jinja template text')
+    templates.add_argument('--chat-template-file', type=Path, help='custom Jinja template file')
+    ap.add_argument('--chat-template-kwargs', help='default template arguments as a JSON object')
+    ap.add_argument('--reasoning-effort', help='template effort (GSQ 27B: low, medium, xhigh); default or none')
+    ap.add_argument('--jinja', action='store_true', help='native Jinja rendering is always enabled')
     action = ap.add_mutually_exclusive_group()
     action.add_argument('--restart', action='store_true')
     action.add_argument('--stop', action='store_true', help="stop this project's server on PORT, without loading models")
@@ -280,6 +289,8 @@ def main():
     if args.stop:
         stop_server(binary, port)
         return
+    if args.kvmem_block_tokens is not None and not 1 <= args.kvmem_block_tokens <= 2147483647:
+        raise ValueError('--kvmem-block-tokens must be a positive int32')
     model = Path(env.get('MODEL', args.default_model)).resolve()
     mmproj = Path(env.get('MMPROJ', args.default_mmproj)).resolve()
     for path in (binary, model, mmproj):
@@ -311,17 +322,42 @@ def main():
     argv = [str(binary), '-m', str(model), '--mmproj', str(mmproj),
             '--mmproj-offload' if vision == 'gpu' else '--no-mmproj-offload',
             '--image-max-tokens', str(image_tokens), '--host', '127.0.0.1', '--port', str(port),
-            '-c', '262144', '-n', str(args.reserve), '-b', '512', '-ngl', '99',
-            '--kvmem', '--kvmem-method', 'retrieval',
-            '--kvmem-query-replay', replay, '--kvmem-query-policy', policy,
+            '-c', '262144', '-n', str(args.reserve),
             '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
-            '--kvmem-block-tokens', '128', '--kv-dtype', args.kv,
-            '--spec-type', 'draft-mtp', '--spec-draft-n-max', str(draft_max), '--spec-kv-dtype', draft_kv,
-            '--kvmem-mtp-state', mtp_state,
+            '--kv-dtype', args.kv, '--spec-type', 'draft-mtp',
             '--enable-thinking', '--reasoning-budget', '4096']
-    if args.explicit_sampling:
-        argv += ['--temp', '1.0', '--top-p', '0.95', '--top-k', '20', '--min-p', '0.0',
-                 '--presence-penalty', '0.0', '--frequency-penalty', '0.0', '--repeat-penalty', '1.0']
+    # These match server defaults; only emit caller overrides.
+    if args.kvmem_block_tokens is not None:
+        argv += ['--kvmem-block-tokens', str(args.kvmem_block_tokens)]
+    for key, flag, value in (
+        ('KVMEM_MTP_STATE', '--kvmem-mtp-state', mtp_state),
+        ('KVMEM_QUERY_REPLAY', '--kvmem-query-replay', replay),
+        ('KVMEM_QUERY_POLICY', '--kvmem-query-policy', policy),
+        ('SPEC_DRAFT_N_MAX', '--spec-draft-n-max', str(draft_max)),
+        ('SPEC_KV_DTYPE', '--spec-kv-dtype', draft_kv),
+    ):
+        if key in env:
+            argv += [flag, value]
+    if args.chat_template_file is not None:
+        template = args.chat_template_file.resolve()
+        if not template.is_file() or not template.read_text().strip():
+            raise ValueError(f'chat template file missing or empty: {template}')
+        argv += ['--chat-template-file', str(template)]
+    if args.chat_template is not None:
+        if not args.chat_template.strip():
+            raise ValueError('chat template must not be empty')
+        argv += ['--chat-template', args.chat_template]
+    if args.chat_template_kwargs is not None:
+        kwargs = json.loads(args.chat_template_kwargs)
+        if not isinstance(kwargs, dict):
+            raise ValueError('--chat-template-kwargs requires a JSON object')
+        argv += ['--chat-template-kwargs', json.dumps(kwargs, ensure_ascii=False)]
+    if args.reasoning_effort is not None:
+        if not args.reasoning_effort.strip():
+            raise ValueError('--reasoning-effort must not be empty')
+        argv += ['--reasoning-effort', args.reasoning_effort]
+    if args.jinja:
+        argv += ['--jinja']
     if args.dry_run:
         print(json.dumps(dict(argv=argv, environment={k: env[k] for k in
                          ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'LD_LIBRARY_PATH')}), indent=2))

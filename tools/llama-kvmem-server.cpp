@@ -2,6 +2,8 @@
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
+#include "kvmem-chat-template.h"
+#include "kvmem-chat-id.h"
 #include "kvmem-vision.h"
 #include "kvmem-prefill-policy.h"
 
@@ -19,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -61,7 +64,7 @@ static void print_usage(const char * argv0) {
             "                            request fields override these process defaults\n"
             "  --kvmem / --no-kvmem       enable KVMem (default on)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx\n"
-            "  --kvmem-block-tokens N     block size (default 32)\n"
+            "  --kvmem-block-tokens N     block size (default 128)\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
@@ -69,8 +72,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-query-max-tokens N cap last-user retrieval query to this many tokens\n"
             "                            from the end of the span (default 512; qw3-style)\n"
             "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
-            "  --kvmem-query-policy MODE  legacy or user (default legacy)\n"
-            "  --kvmem-mtp-state MODE     snapshots, auto or replay (default snapshots)\n"
+            "  --kvmem-query-policy MODE  legacy or user (default user)\n"
+            "  --kvmem-mtp-state MODE     snapshots, auto or replay (default replay with MTP)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -81,9 +84,14 @@ static void print_usage(const char * argv0) {
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (must match K when quantized)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
-            "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
-            "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
+            "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
+            "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
+            "  --jinja                    native Jinja rendering (always enabled)\n"
+            "  --chat-template TEMPLATE   override model chat template (Jinja text)\n"
+            "  --chat-template-file PATH  load a Jinja template file\n"
+            "  --chat-template-kwargs JSON  default template arguments\n"
+            "  --reasoning-effort LEVEL   template effort; default uses template default, none disables thinking\n"
             "  --enable-thinking          Qwen thinking on (default off; request can override)\n"
             "  --no-think                 force thinking off\n"
             "  --reasoning-budget N       thinking token budget: -1 unlimited, 0 end immediately,\n"
@@ -172,18 +180,19 @@ struct ServerState {
     int query_last_fallback = 64;
     int query_max_tokens = 512;
     bool query_replay_auto = true;
-    bool query_policy_user = false;
+    bool query_policy_user = true;
     uint32_t turn_generation_rows = 0;
     bool turn_query_exact = false;
     std::string model_name = "kvmem";
     kvmem_spec_session spec;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
-    ggml_type spec_cache_type = GGML_TYPE_COUNT;
+    ggml_type spec_cache_type = GGML_TYPE_F16;
     bool spec_mtp = false;
-    int spec_n_max = 2;
+    int spec_n_max = 3;
     float spec_p_min = 0.0f;
     bool enable_thinking_default = false;
+    std::map<std::string, std::string> template_kwargs;
     int reasoning_budget_default = -1;
     std::string reasoning_budget_message;
     std::vector<llama_token> cached_tokens;
@@ -1069,6 +1078,7 @@ struct ChatRequest {
     int query_end = -1;
     std::string force_substr;
     bool enable_thinking = false;
+    std::map<std::string, std::string> template_kwargs;
     int reasoning_budget_tokens = -1;
     std::string reasoning_budget_message;
 };
@@ -1226,10 +1236,11 @@ struct StreamChatOut {
     common_chat_msg prev;
     std::string acc;
     std::vector<std::string> tc_ids;
+    std::string request_id;
     int n_id = 0;
     int n_tc_delta = 0;
 
-    StreamChatOut(const common_chat_params & chat, bool parse_tools) {
+    StreamChatOut(const common_chat_params & chat, bool parse_tools, const std::string & id) : request_id(id) {
         pp = common_chat_parser_params(chat);
         pp.parse_tool_calls = parse_tools;
         if (!chat.parser.empty()) {
@@ -1249,7 +1260,7 @@ struct StreamChatOut {
                 msg.role = "assistant";
             }
             msg.set_tool_call_ids(tc_ids, [this]() {
-                return std::string("call_") + std::to_string(++n_id);
+                return kvmem_chat_tool_id(request_id, ++n_id);
             });
             const auto diffs = common_chat_msg_diff::compute_diffs(prev, msg);
             prev = std::move(msg);
@@ -1461,35 +1472,12 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
                 out.force_substr = k["pin"][0].get<std::string>();
             }
         }
-        if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean()) {
-            out.enable_thinking = k["enable_thinking"].get<bool>();
-        }
     }
-    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean()) {
-        out.enable_thinking = body["enable_thinking"].get<bool>();
+    if (!kvmem_chat_template_override(body, out.enable_thinking, out.template_kwargs, err)) {
+        return false;
     }
-    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
-        const auto & kw = body["chat_template_kwargs"];
-        if (kw.contains("enable_thinking")) {
-            if (kw["enable_thinking"].is_boolean()) {
-                out.enable_thinking = kw["enable_thinking"].get<bool>();
-            } else if (kw["enable_thinking"].is_string()) {
-                out.enable_thinking = kw["enable_thinking"].get<std::string>() == "true";
-            }
-        }
-    }
-    int budget = -1;
-    bool budget_set = false;
-    if (body.contains("reasoning_budget_tokens") && body["reasoning_budget_tokens"].is_number()) {
-        budget = body["reasoning_budget_tokens"].get<int>();
-        budget_set = true;
-    } else if (body.contains("thinking_budget_tokens") && body["thinking_budget_tokens"].is_number()) {
-        budget = body["thinking_budget_tokens"].get<int>();
-        budget_set = true;
-    }
-    // llama-server: omitted or -1 keeps the process default; >= 0 overrides.
-    if (budget_set && budget != -1) {
-        out.reasoning_budget_tokens = budget;
+    if (!kvmem_chat_reasoning_budget_override(body, out.reasoning_budget_tokens, err)) {
+        return false;
     }
     if (body.contains("reasoning_budget_message") && body["reasoning_budget_message"].is_string()) {
         out.reasoning_budget_message = body["reasoning_budget_message"].get<std::string>();
@@ -1500,6 +1488,9 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string mmproj_path;
+    std::string chat_template;
+    bool template_set = false;
+    json template_defaults = json::object();
     bool mmproj_gpu = true;
     int image_min_tokens = -1, image_max_tokens = -1;
     std::string host = "127.0.0.1";
@@ -1508,7 +1499,8 @@ int main(int argc, char ** argv) {
     int n_ctx = 2048;
     int ngl = 99;
     ServerState st;
-    st.kparams.block_tokens = 32;
+    st.kparams.mtp_state = 2; // ReplaySSM by default when MTP is enabled.
+    st.kparams.block_tokens = 128;
     st.kparams.gen_reserve = 256;
     st.kparams.recent_tokens = 0;
     st.kparams.method = 1;
@@ -1674,16 +1666,44 @@ int main(int argc, char ** argv) {
             st.spec_n_max = std::atoi(need(arg));
         } else if (eq(arg, "--spec-draft-p-min")) {
             st.spec_p_min = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--jinja")) {
+            // Native Jinja rendering is always enabled in this server.
+        } else if (eq(arg, "--chat-template") || eq(arg, "--chat-template-file")) {
+            if (template_set) {
+                fprintf(stderr, "choose only one --chat-template or --chat-template-file\n");
+                return 1;
+            }
+            template_set = true;
+            const std::string value = need(arg);
+            if (eq(arg, "--chat-template-file")) {
+                std::ifstream file(value);
+                if (!file) { fprintf(stderr, "cannot read chat template: %s\n", value.c_str()); return 1; }
+                chat_template.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            } else {
+                chat_template = value;
+            }
+            if (chat_template.empty()) { fprintf(stderr, "chat template must not be empty\n"); return 1; }
+        } else if (eq(arg, "--chat-template-kwargs")) {
+            const auto kw = json::parse(need(arg), nullptr, false);
+            if (!kw.is_object()) { fprintf(stderr, "--chat-template-kwargs requires a JSON object\n"); return 1; }
+            template_defaults["chat_template_kwargs"] = kw;
+        } else if (eq(arg, "--reasoning-effort")) {
+            template_defaults["reasoning_effort"] = need(arg);
         } else if (eq(arg, "--enable-thinking")) {
             st.enable_thinking_default = true;
         } else if (eq(arg, "--no-think")) {
             st.enable_thinking_default = false;
         } else if (eq(arg, "--reasoning-budget")) {
-            st.reasoning_budget_default = std::atoi(need(arg));
-            if (st.reasoning_budget_default < -1) {
-                fprintf(stderr, "invalid --reasoning-budget (want >= -1)\n");
+            const char * value = need(arg);
+            std::string err;
+            const auto parsed = json::parse(value, nullptr, false);
+            int budget = -1;
+            if (parsed.is_discarded() || parsed.is_null() ||
+                    !kvmem_chat_reasoning_budget_override({{"reasoning_budget_tokens", parsed}}, budget, err)) {
+                fprintf(stderr, "invalid --reasoning-budget: %s\n", err.empty() ? "expected an integer >= -1" : err.c_str());
                 return 1;
             }
+            st.reasoning_budget_default = budget;
         } else if (eq(arg, "--reasoning-budget-message")) {
             st.reasoning_budget_message = need(arg);
         } else {
@@ -1695,6 +1715,13 @@ int main(int argc, char ** argv) {
     if (model_path.empty()) {
         print_usage(argv[0]);
         return 1;
+    }
+    {
+        std::string err;
+        if (!kvmem_chat_template_override(template_defaults, st.enable_thinking_default, st.template_kwargs, err)) {
+            fprintf(stderr, "invalid template defaults: %s\n", err.c_str());
+            return 1;
+        }
     }
     {
         const auto slash = model_path.find_last_of("/\\");
@@ -1711,6 +1738,8 @@ int main(int argc, char ** argv) {
     }, nullptr);
     ggml_backend_load_all();
 
+    // No speculative rollback state is needed without MTP.
+    if (!st.spec_mtp) st.kparams.mtp_state = 0;
     if (st.kparams.enabled) {
         if (!nvme_dir.empty()) {
             st.kparams.nvme_dir = nvme_dir.c_str();
@@ -1727,7 +1756,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     st.vocab = llama_model_get_vocab(st.model);
-    st.tmpls = common_chat_templates_init(st.model, "");
+    try {
+        st.tmpls = common_chat_templates_init(st.model, chat_template);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "invalid chat template: %s\n", e.what());
+        return 1;
+    }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = (uint32_t) n_ctx;
@@ -1816,6 +1850,7 @@ int main(int argc, char ** argv) {
         ChatRequest cr;
         cr.max_tokens = st.n_predict_default;
         cr.enable_thinking = st.enable_thinking_default;
+        cr.template_kwargs = st.template_kwargs;
         cr.reasoning_budget_tokens = st.reasoning_budget_default;
         cr.reasoning_budget_message = st.reasoning_budget_message;
         std::string err;
@@ -1850,6 +1885,7 @@ int main(int argc, char ** argv) {
         inputs.add_generation_prompt = true;
         inputs.use_jinja = true;
         inputs.enable_thinking = cr.enable_thinking;
+        inputs.chat_template_kwargs = cr.template_kwargs;
         // llama-server default: extract <think> into delta.reasoning_content.
         // NONE leaves thinking in content, so OpenCode TUI never classifies it.
         inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
@@ -1860,7 +1896,14 @@ int main(int argc, char ** argv) {
             const auto it = caps.find("supports_parallel_tool_calls");
             inputs.parallel_tool_calls = it != caps.end() && it->second;
         }
-        const common_chat_params formatted = common_chat_templates_apply(st.tmpls.get(), inputs);
+        common_chat_params formatted;
+        try {
+            formatted = common_chat_templates_apply(st.tmpls.get(), inputs);
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", std::string("chat template: ") + e.what()}}.dump(), "application/json");
+            return;
+        }
         const std::string & prompt = formatted.prompt;
         std::shared_ptr<kvmem_prompt> parsed_prompt;
         try {
@@ -1950,11 +1993,17 @@ int main(int argc, char ** argv) {
                 common_reasoning_format_name(inputs.reasoning_format),
                 formatted.parser.size());
 
-        const std::string cid = "chatcmpl-kvmem";
+        const std::string request_id = kvmem_chat_request_id();
+        const std::string cid = "chatcmpl-" + request_id;
         llama_context * ctx = st.ctx;
         const llama_vocab * vocab = st.vocab;
 
         common_params_sampling sparams = make_chat_sampling(vocab, formatted, cr);
+        if (!kvmem_chat_reasoning_budget_supported(sparams, cr.enable_thinking, err)) {
+            res.status = 400;
+            res.set_content(json{{"error", err}}.dump(), "application/json");
+            return;
+        }
         fprintf(stderr,
                 "KVMEM_TRACE sampling thinking=%d temperature=%.6g top_p=%.6g top_k=%d min_p=%.6g "
                 "presence_penalty=%.6g frequency_penalty=%.6g repetition_penalty=%.6g seed=%u\n",
@@ -2017,8 +2066,8 @@ int main(int argc, char ** argv) {
             common_chat_msg msg = parse_assistant_output(content, formatted, parse_tools);
             std::vector<std::string> tc_ids;
             int n_id = 0;
-            msg.set_tool_call_ids(tc_ids, [&n_id]() {
-                return std::string("call_") + std::to_string(++n_id);
+            msg.set_tool_call_ids(tc_ids, [&n_id, &request_id]() {
+                return kvmem_chat_tool_id(request_id, ++n_id);
             });
             std::string finish = "stop";
             if (!msg.tool_calls.empty()) {
@@ -2055,7 +2104,7 @@ int main(int argc, char ** argv) {
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
-                [slot, &st, &req, toks, cid, max_tokens, sparams, parse_tools, formatted, stops,
+                [slot, &st, &req, toks, cid, request_id, max_tokens, sparams, parse_tools, formatted, stops,
                  spec_stream, ctx, vocab, make_emit_gen_wall](size_t, httplib::DataSink & sink) mutable {
                     StreamIo io;
                     io.sink = &sink;
@@ -2092,7 +2141,7 @@ int main(int argc, char ** argv) {
 
                     std::vector<llama_token> gen;
                     std::string content;
-                    StreamChatOut sco(formatted, parse_tools);
+                    StreamChatOut sco(formatted, parse_tools, request_id);
                     bool aborted = false;
                     if (spec_stream) {
                         const auto gst = kvmem_spec_generate(st.ctx, st.model, st.spec, toks, max_tokens, sparams,

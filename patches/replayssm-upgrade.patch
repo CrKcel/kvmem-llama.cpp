@@ -673,3 +673,53 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      // TG: n_seq_tokens=1 (autoregressive)
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -185,6 +185,21 @@
+     }
+ }
+ 
++void common_reasoning_budget_accept_prefill(struct llama_sampler * smpl, llama_token token) {
++    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
++    if (ctx->state != REASONING_BUDGET_FORCING) {
++        common_reasoning_budget_accept(smpl, token);
++        return;
++    }
++    // A prompt can contain whitespace or continued reasoning after the budget
++    // is exhausted. Only an actual end tag closes it; output forcing is pending.
++    const int32_t match = ctx->end_matcher.advance(token);
++    if (match >= 0) {
++        ctx->state = REASONING_BUDGET_DONE;
++        ctx->end_match = match;
++    }
++}
++
+ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
+     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+     ctx->state = REASONING_BUDGET_IDLE;
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+--- a/common/reasoning-budget.h
++++ b/common/reasoning-budget.h
+@@ -43,6 +43,9 @@
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+ 
++// Read prompt tokens without consuming the forced output sequence.
++void common_reasoning_budget_accept_prefill(struct llama_sampler * smpl, llama_token token);
++
+ // The end sequence that transitioned the sampler to DONE, or nullptr if none
+ // was recorded. Cleared when a new start sequence re-arms the sampler.
+ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -317,7 +317,7 @@
+             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+ 
+         for (const auto & token : prefill_tokens) {
+-            llama_sampler_accept(rbudget, token);
++            common_reasoning_budget_accept_prefill(rbudget, token);
+             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+         }
+     }

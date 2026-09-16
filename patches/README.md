@@ -3,9 +3,11 @@
 `llama-kvmem-current.patch` is the cumulative diff against pinned `b81c99b`.
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
+It also fixes reasoning-budget initialization from a template's generation prefix.
 `scripts/apply-patches.sh` applies it
 without creating commits and checks for an already applied tree.
 
+`reasoning-budget-upgrade.patch` upgrades the v0.15.0 ReplaySSM tree.
 `replayssm-upgrade.patch` upgrades the preceding multimodal/query-replay tree.
 `multimodal-upgrade.patch` upgrades the KVMem working tree recorded before
 the 2026-09-14 implementation to the same current code. The script checks applicability before
