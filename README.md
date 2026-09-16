@@ -28,21 +28,18 @@ Completed KV blocks are stored in host RAM. For each agent step, KVMem retrieves
 
 ![High-level KVMem flow](docs/assets/kvmem-flow.svg)
 
-Core flags:
+Core flags (what the 16 GiB recipes still pass):
 
 | Flag | Meaning |
 |---|---|
 | `-c` | Logical workspace, including history stored off GPU. 256K is the tested default; larger is experimental. |
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
-| `--kvmem-query-replay` | `auto` skips a second prefill when the GPU history view did not change; `legacy` always replays. |
-| `--kvmem-query-policy` | `user` retrieves from the last real user question and reuses it on tool turns; `legacy` uses the older suffix policy. Recipes use `auto` + `user`. |
-| `--kv-dtype` | Quantization of the **main** attention KV (e.g. q8_0, q5_0). |
-| `--spec-kv-dtype` | Quantization of the **MTP draft** KV (often F16). |
-| `--spec-type draft-mtp` | Enable multi-token prediction (`--spec-draft-n-max` is draft length). |
+| `--kv-dtype` | Quantization of the **main** attention KV (IQ3 q8_0, IQ4 q5_0). |
+| `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
-GPU KV size is `budget + gen_reserve` (aligned to `--kvmem-block-tokens`). When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
+KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
 
 ## How KVMem attaches to llama.cpp
 
@@ -79,7 +76,7 @@ The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested
 
 ## Recommended settings (16 GiB)
 
-Both recipes use a 256K workspace and a bounded GPU KV working set. Sampling follows the Qwen3.8-27B card and can be overridden per request; `temperature=0` is greedy.
+Both recipes use a 256K workspace and a bounded GPU KV working set. The listings below match `scripts/start-iq3.sh` / `start-iq4.sh`: they only pass flags that are not already server defaults. Sampling follows the Qwen3.8-27B card and can be overridden per request; `temperature=0` is greedy.
 
 | | Thinking (these recipes) | Non-thinking |
 |---|---:|---:|
@@ -104,7 +101,35 @@ CUDA_VISIBLE_DEVICES=0 MODEL=/path/model.gguf scripts/start-iq4.sh
 scripts/start-iq4.sh --dry-run
 ```
 
-GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. Both recipes use MTP3 with ReplaySSM; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE`. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
+GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. MTP3 and ReplaySSM are server defaults; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE` if needed. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
+
+### Thinking and chat templates
+
+The launchers accept optional template settings, using llama.cpp's native Jinja renderer:
+
+```bash
+scripts/start-iq3.sh --reasoning-effort low
+scripts/start-iq4.sh --chat-template-file /path/custom.jinja \
+  --chat-template-kwargs '{"enable_thinking":true}'
+```
+
+Add `--restart` to change an existing service. Inline Jinja is accepted through `--chat-template`; Jinja is always enabled (`--jinja` is also accepted).
+
+Requests to `/v1/chat/completions` can override the defaults:
+
+```json
+{
+  "messages": [{"role": "user", "content": "What is 19 × 23?"}],
+  "reasoning_effort": "low",
+  "chat_template_kwargs": {"enable_thinking": true},
+  "reasoning_budget_tokens": 128,
+  "max_tokens": 512
+}
+```
+
+In the current GSQ 27B template, `low` and `xhigh` inject instructions for brief or careful reasoning; `medium` adds neither instruction. The template defaults to `xhigh`. These are prompt preferences: `reasoning_budget_tokens` controls the thinking budget, while `max_tokens` limits the whole output. Other models may support different effort levels.
+
+`reasoning_effort: "none"` disables thinking; `"default"` removes the effort override and uses the template's default. A positive effort does not turn thinking back on if it is disabled. Request kwargs override launcher defaults, and top-level `reasoning_effort` overrides the value in kwargs. For `enable_thinking`, kwargs take precedence over the top-level field; use JSON booleans, not strings. Template changes reuse the common rendered prefix where possible; changing instructions near the start of the history can require processing that history again.
 
 ### IQ3 27B — text + vision, with MTP
 
@@ -126,16 +151,11 @@ The quantizer automatically falls back to F16 for the 27 incompatible `ffn_down`
 ```text
 -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 --mmproj mmproj-Q8_0.gguf --mmproj-offload --image-max-tokens 512
--c 262144 -n 16384 -b 512 -ngl 99
---kvmem --kvmem-method retrieval
---kvmem-query-replay auto --kvmem-query-policy user
+-c 262144 -n 16384
 --kvmem-budget 36864 --kvmem-gen-reserve 16384
---kvmem-block-tokens 128 --kv-dtype q8_0
---spec-type draft-mtp --spec-draft-n-max 3 --spec-kv-dtype f16
---kvmem-mtp-state replay
+--kv-dtype q8_0
+--spec-type draft-mtp
 --enable-thinking --reasoning-budget 4096
---temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
---presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
 ```
 
 If GPU vision does not fit, `MMPROJ_DEVICE=cpu`.
@@ -164,16 +184,11 @@ The supplied [tensor map](scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types
 ```text
 -m Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf
 --mmproj mmproj-BF16.gguf --no-mmproj-offload --image-max-tokens 512
--c 262144 -n 12288 -b 512 -ngl 99
---kvmem --kvmem-method retrieval
---kvmem-query-replay auto --kvmem-query-policy user
+-c 262144 -n 12288
 --kvmem-budget 32768 --kvmem-gen-reserve 12288
---kvmem-block-tokens 128 --kv-dtype q5_0
---spec-type draft-mtp --spec-draft-n-max 3 --spec-kv-dtype f16
---kvmem-mtp-state replay
+--kv-dtype q5_0
+--spec-type draft-mtp
 --enable-thinking --reasoning-budget 4096
---temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
---presence-penalty 0.0 --frequency-penalty 0.0 --repeat-penalty 1.0
 ```
 
 ### 5060 Ti results
