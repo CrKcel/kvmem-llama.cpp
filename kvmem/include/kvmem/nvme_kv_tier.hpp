@@ -1,5 +1,15 @@
 #pragma once
 
+// Standalone header users retain the platform default; CMake publishes an
+// explicit value to every consumer of libkvmem.
+#ifndef KVMEM_ENABLE_NVME
+#ifdef _WIN32
+#define KVMEM_ENABLE_NVME 0
+#else
+#define KVMEM_ENABLE_NVME 1
+#endif
+#endif
+
 // NVMe KV tier — fixed-slot metadata plus positional byte I/O.
 //
 // The legacy API remains synchronous. Positional pread/pwrite removes the
@@ -13,7 +23,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <memory>
 #include <limits>
 #include <mutex>
@@ -24,9 +33,12 @@
 #include <utility>
 #include <vector>
 
+#if KVMEM_ENABLE_NVME
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 namespace kvmem {
 
@@ -98,6 +110,7 @@ struct NvmeBatchIoStats {
     uint32_t cpu_copy_blocks = 0;
 };
 
+#if KVMEM_ENABLE_NVME
 class NvmeKvTier {
 public:
     explicit NvmeKvTier(NvmeKvTierConfig cfg) : cfg_(std::move(cfg)) {
@@ -843,5 +856,40 @@ private:
     std::unordered_map<uint32_t, int32_t> block_to_slot_;
     std::vector<uint32_t> lru_;
 };
+
+#else
+// Keep the memory-only runtime's interface intact without importing POSIX
+// headers. Storage operations fail rather than silently discarding KV data.
+class NvmeKvTier {
+public:
+    explicit NvmeKvTier(const NvmeKvTierConfig & cfg) {
+        if (cfg.total_bytes) unavailable();
+    }
+    bool enabled() const { return false; }
+    uint32_t slot_count() const { return 0; }
+    uint64_t slot_bytes() const { return 0; }
+    uint32_t free_slots() const { return 0; }
+    uint32_t used_slots() const { return 0; }
+    int32_t block_slot(uint32_t) const { return -1; }
+    int32_t lru_victim() const { return -1; }
+    void release_block(uint32_t) {}
+    void clear() {}
+    void touch(uint32_t) {}
+    NvmeSlotPlacement place_block(uint32_t) { unavailable(); }
+    NvmeSlotPlacement place_block_evicting(uint32_t) { unavailable(); }
+    void write_block(uint32_t, const void *, uint64_t) { unavailable(); }
+    void read_block(uint32_t, void *, uint64_t) { unavailable(); }
+    void write_slot(int32_t, const void *, uint64_t) const { unavailable(); }
+    void read_slot(int32_t, void *, uint64_t) const { unavailable(); }
+    void write_spans(const std::vector<NvmeIoSpan> &, const void *, uint64_t,
+                     NvmeBatchIoStats * = nullptr) const { unavailable(); }
+    void read_spans(const std::vector<NvmeIoSpan> &, void *, uint64_t,
+                    NvmeBatchIoStats * = nullptr) const { unavailable(); }
+private:
+    [[noreturn]] static void unavailable() {
+        throw std::runtime_error("NVMe offload is disabled in this build (KVMEM_ENABLE_NVME=OFF)");
+    }
+};
+#endif
 
 } // namespace kvmem

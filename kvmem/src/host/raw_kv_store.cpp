@@ -4,18 +4,15 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <time.h>
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
 namespace {
 uint64_t monotonic_ns() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
-           static_cast<uint64_t>(ts.tv_nsec);
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 } // namespace
 
@@ -100,6 +97,9 @@ void unpack_f16(const uint16_t * src, float * dst, size_t n) {
 } // namespace
 
 RawKvStore::RawKvStore(RawKvStoreConfig cfg) : cfg_(std::move(cfg)) {
+#if !KVMEM_ENABLE_NVME
+    if (cfg_.nvme_bytes) throw std::runtime_error("NVMe offload is disabled in this build");
+#endif
     if (cfg_.nvme_bytes > 0 && !cfg_.nvme_dir.empty() && cfg_.block_tokens > 0) {
         NvmeKvTierConfig ncfg;
         ncfg.dir = cfg_.nvme_dir;

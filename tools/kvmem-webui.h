@@ -3,6 +3,28 @@
 #include "kvmem-chat-sampling.h"
 #include "httplib.h"
 #include <filesystem>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+inline std::filesystem::path kvmem_executable_path(const char * argv0) {
+#ifdef _WIN32
+    std::wstring name(32768, L'\0');
+    const DWORD size = GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
+    if (size > 0 && size < name.size()) {
+        name.resize(size);
+        return std::filesystem::path(name);
+    }
+#else
+    std::error_code ec;
+    auto binary = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) return binary;
+#endif
+    return std::filesystem::absolute(argv0);
+}
 
 inline bool kvmem_output_limit(const nlohmann::json & body, int limit, int & value, std::string & error) {
     const char * key = body.contains("max_tokens") ? "max_tokens" : "max_completion_tokens";
@@ -31,9 +53,7 @@ inline nlohmann::json kvmem_ui_sampling(bool thinking, const nlohmann::json & ov
 inline bool kvmem_mount_ui(httplib::Server & server, const std::string & requested, bool disabled, const char * argv0) {
     namespace fs = std::filesystem;
     if (disabled) return true;
-    std::error_code ec;
-    auto binary = fs::read_symlink("/proc/self/exe", ec);
-    if (ec) binary = fs::absolute(argv0);
+    const auto binary = kvmem_executable_path(argv0);
     const auto directory = requested.empty() ? binary.parent_path().parent_path() / "share/kvmem/ui" : fs::path(requested);
     if (!fs::is_regular_file(directory / "index.html")) {
         if (requested.empty()) return true;

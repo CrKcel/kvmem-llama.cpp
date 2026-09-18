@@ -1,0 +1,105 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidateSet('iq3', 'iq4')][string]$Recipe,
+    [string]$Model = $env:MODEL,
+    [string]$Mmproj = $env:MMPROJ,
+    [string]$BuildDir = $env:BUILD_DIR,
+    [string]$Gpu = $env:CUDA_VISIBLE_DEVICES,
+    [ValidateRange(1, 65535)][int]$Port = 18200,
+    [ValidateRange(1, 2147483647)][int]$BlockTokens = 128,
+    [string]$ReasoningEffort,
+    [ValidateRange(0, 2147483647)][int]$ReasoningBudget = 4096,
+    [ValidateRange(1, 5)][int]$Mtp = 3,
+    [ValidateSet('cpu', 'gpu')][string]$VisionDevice,
+    [string]$ChatTemplateFile,
+    [string]$ChatTemplateKwargs,
+    [string]$UiDir,
+    [switch]$NoUi,
+    [switch]$DryRun
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'native-process.ps1')
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+if (!$BuildDir) {
+    if (Test-Path -LiteralPath (Join-Path $root 'bin/llama-kvmem-server.exe')) { $BuildDir = $root }
+    else { $BuildDir = Join-Path $root 'build-win' }
+}
+$binary = Join-Path $BuildDir 'bin/llama-kvmem-server.exe'
+foreach ($item in @(@('server', $binary), @('Model', $Model), @('Mmproj', $Mmproj))) {
+    if (!$item[1] -or !(Test-Path -LiteralPath $item[1] -PathType Leaf)) {
+        throw "Missing $($item[0]) file: $($item[1]). Pass -Model / -Mmproj or set MODEL / MMPROJ."
+    }
+}
+$binary = (Resolve-Path -LiteralPath $binary).Path
+$Model = (Resolve-Path -LiteralPath $Model).Path
+$Mmproj = (Resolve-Path -LiteralPath $Mmproj).Path
+if (!$Gpu) {
+    $rows = @(& nvidia-smi --query-gpu=uuid,name --format=csv,noheader)
+    if ($LASTEXITCODE -ne 0) { throw 'nvidia-smi failed; select a GPU with -Gpu' }
+    $preferred = @($rows | Where-Object { $_ -match 'RTX 5060 Ti' })
+    if ($preferred.Count -eq 1) { $Gpu = ($preferred[0] -split ',')[0].Trim() }
+    elseif ($rows.Count -eq 1) { $Gpu = ($rows[0] -split ',')[0].Trim() }
+    else { throw 'Multiple GPUs found; select one with -Gpu or CUDA_VISIBLE_DEVICES' }
+}
+if ([string]::IsNullOrWhiteSpace($Gpu) -or $Gpu -eq '-1') { throw 'Select an enabled GPU' }
+$budget = 36864; $reserve = 16384; $kv = 'q8_0'
+if ($Recipe -eq 'iq4') { $budget = 32768; $reserve = 12288; $kv = 'q5_0' }
+if (!$VisionDevice) { if ($Recipe -eq 'iq3') { $VisionDevice = 'gpu' } else { $VisionDevice = 'cpu' } }
+$visionFlag = '--mmproj-offload'
+if ($VisionDevice -eq 'cpu') { $visionFlag = '--no-mmproj-offload' }
+$serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,
+    '--image-max-tokens', '512', '--host', '127.0.0.1', '--port', "$Port",
+    '-c', '262144', '-n', "$reserve", '--kvmem-budget', "$budget", '--kvmem-gen-reserve', "$reserve",
+    '--kv-dtype', $kv, '--spec-type', 'draft-mtp', '--spec-draft-n-max', "$Mtp",
+    '--kvmem-block-tokens', "$BlockTokens", '--kvmem-query-policy', 'user',
+    '--enable-thinking', '--reasoning-budget', "$ReasoningBudget")
+if ($ReasoningEffort) { $serverArgs += @('--reasoning-effort', $ReasoningEffort) }
+if ($ChatTemplateFile) {
+    $template = (Resolve-Path -LiteralPath $ChatTemplateFile).Path
+    if (!(Test-Path -LiteralPath $template -PathType Leaf) -or [string]::IsNullOrWhiteSpace([IO.File]::ReadAllText($template))) {
+        throw 'ChatTemplateFile must be a nonempty file'
+    }
+    $serverArgs += @('--chat-template-file', $template)
+}
+if ($ChatTemplateKwargs) {
+    $parsed = ConvertFrom-Json $ChatTemplateKwargs
+    if ($null -eq $parsed -or $parsed -isnot [System.Management.Automation.PSCustomObject]) {
+        throw 'ChatTemplateKwargs must be a JSON object'
+    }
+    $serverArgs += @('--chat-template-kwargs', $ChatTemplateKwargs)
+}
+if ($UiDir) {
+    if (!(Test-Path -LiteralPath (Join-Path $UiDir 'index.html') -PathType Leaf)) { throw 'UiDir must contain index.html' }
+    $serverArgs += @('--ui-dir', (Resolve-Path -LiteralPath $UiDir).Path)
+}
+if ($NoUi) { $serverArgs += '--no-ui' }
+if ($DryRun) {
+    @{ argv = @($binary) + $serverArgs; environment = @{ CUDA_VISIBLE_DEVICES = $Gpu; CUDA_DEVICE_ORDER = 'PCI_BUS_ID' } } |
+        ConvertTo-Json -Depth 5
+    return
+}
+# Check for an existing listener without terminating any process. The server
+# still owns the final bind, so a race results in a normal startup failure.
+$probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
+$probe.Server.ExclusiveAddressUse = $true
+try { $probe.Start() } finally { $probe.Stop() }
+$info = New-KVMemProcessInfo $binary $serverArgs
+$info.EnvironmentVariables['CUDA_VISIBLE_DEVICES'] = $Gpu
+$info.EnvironmentVariables['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+$info.EnvironmentVariables['KVMEM_VISION_DEVICE'] = $VisionDevice
+$child = New-Object System.Diagnostics.Process
+$child.StartInfo = $info
+$started = $false
+try {
+    Write-Host "Starting $Recipe on http://127.0.0.1:$Port/ (foreground; Ctrl+C to stop)"
+    $started = $child.Start()
+    while (!$child.WaitForExit(250)) {}
+    $code = $child.ExitCode
+} finally {
+    # Own process handle only; no PID-file or port-based process termination.
+    if ($started -and !$child.HasExited) { $child.Kill(); $child.WaitForExit() }
+    $child.Dispose()
+}
+exit $code

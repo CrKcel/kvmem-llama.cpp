@@ -5,7 +5,7 @@
 #include <cstring>
 #include <map>
 #include <string>
-#include <unistd.h>
+#include <filesystem>
 #include <vector>
 
 using namespace kvmem;
@@ -137,6 +137,7 @@ static void test_maybe_offload_evicts_before_stage_in() {
     CHECK(!idle.maybe_offload_during_prefill(32, 32, 32 * 8));
 }
 
+#if KVMEM_ENABLE_NVME
 static void test_cpu_full_spills_to_nvme_and_roundtrips() {
     struct MemoryBackend : KvMemBackend {
         uint64_t slot_bytes = 64;
@@ -164,9 +165,7 @@ static void test_cpu_full_spills_to_nvme_and_roundtrips() {
         }
     };
 
-    const char *base = std::getenv("TMPDIR");
-    if (!base) base = "/tmp";
-    const std::string dir = std::string(base) + "/kvmem_p32_nvme";
+    const std::string dir = (std::filesystem::temp_directory_path() / "kvmem_p32_nvme").string();
 
     MemoryBackend be;
     KvMemRuntimeConfig cfg = make_cfg();
@@ -214,6 +213,8 @@ static void test_cpu_full_spills_to_nvme_and_roundtrips() {
     CHECK(payload[0] == 5);
 }
 
+#endif
+
 static void test_selection_preview_and_resident_commit() {
     RecordingBackend be;
     KvMemRuntime rt(make_cfg(), &be);
@@ -250,7 +251,9 @@ int main() {
     test_high_overlap_skips_stage_in();
     test_pressure_keeps_sink_and_tail();
     test_maybe_offload_evicts_before_stage_in();
+#if KVMEM_ENABLE_NVME
     test_cpu_full_spills_to_nvme_and_roundtrips();
+#endif
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);
         return 1;

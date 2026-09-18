@@ -18,7 +18,7 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 **Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
-Current milestone: [`v0.16.0-rc1`](docs/milestones/v0.16.0-rc1.md) (pre-release).
+Current milestone: [`v0.16.0-rc2`](docs/milestones/v0.16.0-rc2.md) (pre-release).
 
 **Limitation:** one generation cannot exceed `--kvmem-gen-reserve` (16384 tokens on the IQ3 recipe, 12288 on IQ4), including thinking. Retrieval pins the GPU window; new tokens only use those reserved slots. We are working on fixing this. For agent use, add a line to the system prompt such as: *Keep each turn's output, including thinking, within 16384 tokens* (use 12288 on IQ4). That makes oversized single-turn replies much less likely.
 
@@ -35,7 +35,7 @@ Core flags (what the 16 GiB recipes still pass):
 | `-c` | Logical workspace, including history stored off GPU. 256K is the tested default; larger is experimental. |
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
-| `--kv-dtype` | Quantization of the **main** attention KV (IQ3 q8_0, IQ4 q5_0). |
+| `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Quantized K/V must use the same type; mixed quantization is not supported. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
@@ -55,18 +55,38 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 
 The project builds on llama.cpp's CUDA backend, with the platform above used for our measurements. Reports of successful runs, benchmarks and issues on other NVIDIA GPUs and systems are welcome. AMD/ROCm and Metal backends would need integration work.
 
+## Prebuilt downloads
+
+| Platform | Download | Notes |
+|---|---|---|
+| Windows x64 | [v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) | Choose the **runtime** ZIP; CUDA 13.2.86, `sm_120a`, experimental. Quantizer is a separate optional ZIP. |
+| Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; it has not been rebuilt or relabeled as rc2. |
+
+No model weights are bundled. For a Windows text-only setup, download the
+ready-made IQ3 `-mtp` model linked in the [Windows quick start](scripts/windows/README.md).
+For vision, download **`mmproj-Qwen3.8-27B-Q5_K-MIX.gguf`** from
+[HermiHg](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF) and pass its path with `-Mmproj`
+(Windows launchers) or `--mmproj` (server). No local projector quantization is
+needed. This newly recommended download has not been independently validated
+here; the performance tables below retain their original Q8/BF16 projectors.
+The locally converted IQ4 MTP-Q4_0 main model does not yet have a project-provided
+download link in this release; use your prepared file or the optional quantizer.
+The recipes and conversion commands below document the historical tested setup.
+
 ## Clone, patch, build
 
-Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer**. The startup scripts use Python 3.10+ and `ss` (iproute2).
+Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer**. The Linux startup scripts use Python 3.10+ and `ss` (iproute2).
 
 **CUDA compiler version matters for correctness.** The validated baseline is nvcc **13.2.86** on Linux/WSL2 and native Windows. A Windows build made with nvcc 13.2.51 produced garbage output from Qwen3.8-27B IQ3_S even with KVMem and MTP disabled; rebuilding unchanged source with 13.2.86 restored correct output. A successful build, health check or small Q8 model test does not validate IQ3 inference. Newer toolchains still need correctness testing before release.
 
 Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone is insufficient, and the CUDA version shown by `nvidia-smi` describes driver support. After upgrading the Toolkit, configure a **new build directory** and rebuild the binaries. Updating the driver or replacing CUDA DLLs does not fix CUDA kernels already compiled into an old binary.
 
+An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
+
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.16.0-rc1
+git checkout v0.16.0-rc2
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
@@ -107,19 +127,42 @@ Both recipes use a 256K workspace and a bounded GPU KV working set. The listings
 | repetition_penalty | 1.0 | 1.0 |
 
 ```bash
-# Choose one recipe; both default to port 18200.
-scripts/start-iq3.sh    # text + GPU vision + MTP, :18200
-scripts/start-iq4.sh    # text + CPU vision + MTP, :18200
+# Recommended IQ3 recipe; select the downloaded vision projector explicitly.
+MMPROJ=/path/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf scripts/start-iq3.sh
 
-# Switch an existing KVMem service to IQ4.
-scripts/start-iq4.sh --restart
-
-# Override GPU and model, or preview the resolved configuration.
-CUDA_VISIBLE_DEVICES=0 MODEL=/path/model.gguf scripts/start-iq4.sh
-scripts/start-iq4.sh --dry-run
+# Preview the recommended configuration.
+MODEL=/path/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+  MMPROJ=/path/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf scripts/start-iq3.sh --dry-run
 ```
 
 GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. MTP3 and ReplaySSM are server defaults; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE` if needed. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
+
+### llama.cpp-compatible KV cache flags
+
+Both `llama-kvmem-server` and `llama-kvmem-cli` accept llama.cpp's main-model
+KV cache flags. These are equivalent ways to select Q8 K and V:
+
+```text
+-ctk q8_0 -ctv q8_0
+--cache-type-k q8_0 --cache-type-v q8_0
+--kv-dtype q8_0
+```
+
+For the IQ4 recipe, use `-ctk q5_0 -ctv q5_0`. `--kv-dtype` remains a shorthand
+that sets both types. Arguments apply from left to right; the last assignment
+to each component wins. Setting only `-ctk` does not change V (both default to
+`q8_0`), so specify both when changing precision.
+
+Supported types are `f16`, `f32`, `q8_0`, `q5_0` and `q4_0`.
+**Currently, quantized K and V must use the same cache type. Mixed K/V
+quantization is not supported.** Valid quantized pairs are `q8_0/q8_0`,
+`q5_0/q5_0` and `q4_0/q4_0`. If either side is quantized, pairs such as
+`q8_0/q4_0` or `q8_0/f16` are rejected before loading the model, with an error
+showing the selected K and V types. Use `--kv-dtype TYPE` to set both together.
+
+Flag compatibility does not imply support for every llama.cpp cache type or
+mixed K/V combination. These flags affect the main model; MTP cache precision
+is configured separately with `--spec-kv-dtype`.
 
 ### Thinking and chat templates
 
@@ -154,21 +197,13 @@ In the current GSQ 27B template, `low` and `xhigh` inject instructions for brief
 `scripts/start-iq3.sh`. ISTA GGUF **as published** (MTP head not requantized). **Main KV q8_0**, MTP KV F16.
 
 - Text: [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) → `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (use the `-mtp` file)
-- Vision: [unsloth/Qwen3.8-27B-GGUF](https://www.modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) `mmproj-BF16.gguf`, locally quantized to `mmproj-Q8_0.gguf` (`llama-quantize`; most weights Q8_0, 27 `ffn_down` tensors stay F16)
+- Vision: [HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF) → `mmproj-Qwen3.8-27B-Q5_K-MIX.gguf` (already quantized; no local conversion).
 
-After downloading the BF16 projector, run from the repository root:
-
-```bash
-model_dir=models/unsloth/Qwen3.8-27B-GGUF
-build/bin/llama-quantize --max-buffer-size 256 \
-  "$model_dir/mmproj-BF16.gguf" "$model_dir/mmproj-Q8_0.gguf" Q8_0
-```
-
-The quantizer automatically falls back to F16 for the 27 incompatible `ffn_down` tensors.
+Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf` for the Linux launcher, `-Mmproj` for the Windows launcher, or `--mmproj` for the server. This new projector recommendation is not the Q8 projector used in the historical performance results below, and its compatibility/quality has not been independently validated here.
 
 ```text
 -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
---mmproj mmproj-Q8_0.gguf --mmproj-offload --image-max-tokens 512
+--mmproj mmproj-Qwen3.8-27B-Q5_K-MIX.gguf --mmproj-offload --image-max-tokens 512
 -c 262144 -n 16384
 --kvmem-budget 36864 --kvmem-gen-reserve 16384
 --kv-dtype q8_0
@@ -178,36 +213,14 @@ The quantizer automatically falls back to F16 for the 27 incompatible `ffn_down`
 
 If GPU vision does not fit, `MMPROJ_DEVICE=cpu`.
 
-### IQ4 27B — text + vision on CPU, with MTP
+### IQ4 27B — optional experimental comparison
 
-`scripts/start-iq4.sh`. Projector is **on CPU** by default (`--no-mmproj-offload`) so 16 GiB VRAM stays for the language model. Override with `MMPROJ_DEVICE=gpu` if you have spare VRAM.
-
-Download Unsloth `Qwen3.8-27B-UD-IQ4_XS.gguf` and `mmproj-BF16.gguf` ([ModelScope](https://www.modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) / [Hugging Face](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)). Upstream MTP head is Q6_K / Q8_0.
-
-The language GGUF this recipe runs, `Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf`, is **not** an Unsloth release: only MTP (`blk.64`) matmul weights were requantized to **Q4_0**. Vision uses the official **BF16** `mmproj-BF16.gguf` on CPU.
-
-Download [imatrix_unsloth.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/imatrix_unsloth.gguf) into the same model directory, then run from the repository root:
-
-```bash
-model_dir=models/unsloth/Qwen3.8-27B-GGUF
-build/bin/llama-quantize --allow-requantize --max-buffer-size 256 \
-  --imatrix "$model_dir/imatrix_unsloth.gguf" \
-  --tensor-type-file scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types \
-  "$model_dir/Qwen3.8-27B-UD-IQ4_XS.gguf" \
-  "$model_dir/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf" IQ4_XS
-```
-
-The supplied [tensor map](scripts/quantization/qwen3.8-27b-iq4-xs-mtp-q4_0.types) preserves the original model's mixed quantization and changes only eight MTP matrices. The current quantizer requires the imatrix file to accept the existing low-bit tensors.
-
-```text
--m Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf
---mmproj mmproj-BF16.gguf --no-mmproj-offload --image-max-tokens 512
--c 262144 -n 12288
---kvmem-budget 32768 --kvmem-gen-reserve 12288
---kv-dtype q5_0
---spec-type draft-mtp
---enable-thinking --reasoning-budget 4096
-```
+**IQ3 is the primary recommended model and download for this release.** IQ4 is
+retained only as an optional test configuration and in the historical benchmark
+tables below. It uses a separately prepared MTP-Q4_0 main model, q5_0 main KV,
+budget 32768 and generation reserve 12288. Native Windows IQ4 is not validated.
+The existing IQ4 launchers remain available to testers who already have the
+required files; IQ4 is not part of the primary download/setup instructions.
 
 ### 5060 Ti results
 
@@ -247,7 +260,7 @@ Initial computation measures the first processing of new input. Overall includes
 
 [Full results and benchmark commands](docs/recommended-config-performance.md). Summarize saved logs with `python3 scripts/summarize_canary.py <artifact-directory>`.
 
-### Which one to run
+### Historical configuration comparison
 
 | | IQ3 | IQ4 |
 |---|---|---|
@@ -258,7 +271,7 @@ Initial computation measures the first processing of new input. Overall includes
 | MTP weights | Official ISTA `-mtp` | Local Q4_0 requant of Unsloth |
 | Runtime host RAM (Task 1 / Task 2) | 4308.21 / 13483.52 MiB RSS | 4846.82 / 11244.75 MiB RSS |
 
-**Default: IQ3** for fast image encoding and a larger KV window. **IQ4** suits mostly text workloads, with faster decode and lower RAM use in the long-context test, if CPU image encoding is acceptable.
+**Use IQ3 for the recommended setup.** IQ4 is retained only as an optional experimental comparison; the figures above are historical Linux/WSL2 measurements.
 
 ## APIs
 
@@ -270,7 +283,7 @@ No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_toke
 
 ## Documentation
 
-- [v0.16.0-rc1 milestone](docs/milestones/v0.16.0-rc1.md)
+- [v0.16.0-rc2 milestone](docs/milestones/v0.16.0-rc2.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)

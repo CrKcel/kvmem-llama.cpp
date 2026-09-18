@@ -1,5 +1,7 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/rope.hpp"
+#include "kvmem/nvme_kv_tier.hpp"
+#include <filesystem>
 
 #include <algorithm>
 #include <utility>
@@ -166,8 +168,9 @@ int main() {
     CHECK(raw_h.copy_k(0, 1, hgot.data()));
     CHECK(hgot[0] == 0.0f);
 
+#if KVMEM_ENABLE_NVME
     kvmem::RawKvStoreConfig ncfg = cfg;
-    ncfg.nvme_dir = "/tmp/kvmem_raw_k_test";
+    ncfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_k_test").string();
     ncfg.nvme_file = "raw.bin";
     ncfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawn(ncfg);
@@ -185,6 +188,8 @@ int main() {
     std::vector<float> nmean(4, 0.0f);
     rawn.mean_k(0, 0, nmean.data());
     CHECK(std::fabs(nmean[0] - 6.0f) < 1e-2f); // (0+4+8+12)/4
+
+#endif
 
     // F16 write: 0x3c00 is 1.0 in IEEE half.
     kvmem::RawKvStore raw16(cfg);
@@ -275,22 +280,25 @@ int main() {
 
     kvmem::RawKvStoreConfig ngcfg = cfg;
     ngcfg.v_gpu_row_bytes = 6;
-    ngcfg.nvme_dir = "/tmp/kvmem_raw_vgpu_test";
+    ngcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_vgpu_test").string();
     ngcfg.nvme_file = "raw_vgpu.bin";
     ngcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
-    kvmem::RawKvStore rawgn(ngcfg);
-    CHECK(rawgn.nvme_enabled());
     std::vector<uint8_t> packed4(24);
     for (int i = 0; i < 24; ++i) {
         packed4[static_cast<size_t>(i)] = static_cast<uint8_t>(i + 1);
     }
+    std::vector<uint8_t> gout4(24, 0);
+#if KVMEM_ENABLE_NVME
+    kvmem::RawKvStore rawgn(ngcfg);
+    CHECK(rawgn.nvme_enabled());
     rawgn.write_layer_v_gpu(0, 4, 0, packed4.data());
     CHECK(rawgn.has_v(0, 0));
-    std::vector<uint8_t> gout4(24, 0);
     CHECK(rawgn.copy_v_gpu(0, 0, gout4.data(), 4));
     CHECK(gout4[0] == 1);
     CHECK(gout4[23] == 24);
     CHECK(!rawgn.copy_v(0, 0, no_f32.data()));
+
+#endif
 
     kvmem::RawKvStoreConfig kcfg = cfg;
     kcfg.k_row_bytes = 6;
@@ -306,9 +314,10 @@ int main() {
     rawk.mean_k(0, 0, mk.data());
     CHECK(std::fabs(mk[0] - 2.0f) < 1e-3f);
 
+#if KVMEM_ENABLE_NVME
     kvmem::RawKvStoreConfig nkcfg = cfg;
     nkcfg.k_row_bytes = 6;
-    nkcfg.nvme_dir = "/tmp/kvmem_raw_krow_test";
+    nkcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_krow_test").string();
     nkcfg.nvme_file = "raw_krow.bin";
     nkcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawkn(nkcfg);
@@ -328,9 +337,12 @@ int main() {
     rawkn.mean_k(0, 0, krowmean.data());
     CHECK(std::fabs(krowmean[0] - 6.0f) < 1e-3f);
 
+#endif
+
     // Replacing a suffix preserves prefix bytes and rejects stale packed rows,
     // even if the mean-K capture has already extended the logical block.
     for (bool nvme : {false, true}) {
+        if (nvme && !KVMEM_ENABLE_NVME) continue;
         auto tail_cfg = ngcfg;
         tail_cfg.k_gpu_row_bytes = 6;
         if (!nvme) tail_cfg.nvme_bytes = 0;
