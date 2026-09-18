@@ -59,7 +59,7 @@ The project builds on llama.cpp's CUDA backend, with the platform above used for
 
 | Platform | Download | Notes |
 |---|---|---|
-| Windows x64 | [v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) | Choose the **runtime** ZIP; CUDA 13.2.86, `sm_120a`, experimental. Quantizer is a separate optional ZIP. |
+| Windows x64 | [v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) | Choose the **runtime** ZIP; CUDA 13.2.86; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
 | Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; it has not been rebuilt or relabeled as rc2. |
 
 No model weights are bundled. For a Windows text-only setup, download the

@@ -4,7 +4,7 @@ param(
     [string]$SourceDir = (Join-Path $PSScriptRoot '../..'),
     [string]$BuildDir,
     [string]$CudaPath = $env:CUDA_PATH,
-    [string]$CudaArchitectures = '120a-real',
+    [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
     [ValidateRange(1, 64)][int]$Jobs = 4,
     [switch]$HostOnly,
     [switch]$BuildOnly

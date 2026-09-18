@@ -2,15 +2,15 @@
 
 ## Download and run
 
-Download the **windows-x86_64-cuda13.2.86-sm120a.zip** runtime from
+Download the **windows-x86_64-cuda13.2.86.zip** runtime from
 [v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2).
 It contains the server, CLI, matching CUDA DLLs and browser UI. It does **not**
 contain model weights or the quantization tool. The separate **quantizer** ZIP
 is optional; it is unnecessary when your GGUF files are already prepared.
 
 Requirements: Windows x64, a compatible NVIDIA driver, Microsoft Visual C++ x64
-runtime, and an AVX2/FMA/F16C/BMI2 CPU. The CUDA target is `sm_120a`; the tested
-GPU is RTX 5060 Ti 16 GiB. CUDA Toolkit,
+runtime, and an AVX2/FMA/F16C/BMI2 CPU. The package contains CUDA targets `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`
+and `sm_120a`; the tested GPU is RTX 5060 Ti 16 GiB. CUDA Toolkit,
 Visual Studio and Node.js are not needed to run the package. Tested driver: 610.62.
 
 ### Text-only quick start (no model conversion)
@@ -47,8 +47,19 @@ recommendation.
 
 Target: Windows x64 with an NVIDIA CUDA GPU. NVMe KV storage is disabled;
 CPU memory KV, retrieval, MTP/ReplaySSM and vision remain in the build.
-The initial GPU target is `120a-real`, matching the current Linux package.
-Other architectures require an explicit build target and separate testing.
+The Windows build defaults to `75-real;80-real;86-real;89-real;90-real;120a-real`.
+
+| CUDA target | GPU families / examples |
+|---|---|
+| 75 | RTX 20 series, T4, TITAN RTX, Quadro RTX 6000/8000 |
+| 80 | A100, A30 |
+| 86 | RTX 30 series, A10/A40, RTX A4000/A5000/A6000 |
+| 89 | RTX 40 series, L4/L40/L40S, RTX 6000 Ada |
+| 90 | H100, H200 |
+| 120a | RTX 50 series, RTX PRO Blackwell |
+
+This table lists compiled GPU targets. Model memory requirements are separate.
+Host platform for this package: Windows x64.
 
 See the validation record below for the completed checks.
 
