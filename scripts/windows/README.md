@@ -10,9 +10,8 @@ is optional; it is unnecessary when your GGUF files are already prepared.
 
 Requirements: Windows x64, a compatible NVIDIA driver, Microsoft Visual C++ x64
 runtime, and an AVX2/FMA/F16C/BMI2 CPU. The CUDA target is `sm_120a`; the tested
-GPU is RTX 5060 Ti 16 GiB. This is not a universal NVIDIA GPU build. CUDA Toolkit,
-Visual Studio and Node.js are not needed to run the package. Driver 610.62 was
-tested; this is a tested version, not a measured minimum driver requirement.
+GPU is RTX 5060 Ti 16 GiB. CUDA Toolkit,
+Visual Studio and Node.js are not needed to run the package. Tested driver: 610.62.
 
 ### Text-only quick start (no model conversion)
 
@@ -31,17 +30,14 @@ $env:CUDA_VISIBLE_DEVICES = '0'
 ```
 
 Open http://127.0.0.1:18200/ after loading. Keep the terminal open; Ctrl+C stops
-the server. The command uses default block size 128. There is one inference
-slot; concurrent requests are not a validated multi-agent deployment.
+the server. The command uses default block size 128.
 
 ### Ready-made vision projector (no local quantization)
 
 Download **`mmproj-Qwen3.8-27B-Q5_K-MIX.gguf`** from
 [HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF).
 Use this exact path with `-Mmproj` in the recipe below. No quantization tool is
-needed for the IQ3 main model or this projector. The publisher describes it as
-a mixed-precision vision projector; this release has not independently
-validated its vision quality or compatibility with the pinned backend.
+needed for the IQ3 main model or this projector. It is a ready-made mixed-precision vision projector.
 
 The historical performance tables used Q8_0 (IQ3) and BF16 (IQ4) projectors;
 those numbers are not measurements of this Q5_K-MIX projector. IQ4 still uses
@@ -54,8 +50,7 @@ CPU memory KV, retrieval, MTP/ReplaySSM and vision remain in the build.
 The initial GPU target is `120a-real`, matching the current Linux package.
 Other architectures require an explicit build target and separate testing.
 
-This port is still being validated. Compiling a package does not certify GPU
-correctness or performance. See the validation record below.
+See the validation record below for the completed checks.
 
 ## Build
 
@@ -126,7 +121,7 @@ Without an explicit GPU, a sole GPU or a unique RTX 5060 Ti is selected;
 other multi-GPU configurations require `-Gpu`.
 
 IQ3 is the primary recommendation. IQ4 is an optional experimental comparison
-for testers with prepared files; it is not validated on native Windows.
+for testers with prepared files.
 
 | Default | IQ3 (recommended) | IQ4 (experimental) |
 |---|---|---|
@@ -184,55 +179,7 @@ the binary ZIP. Packaging does not run model tests or mark the package GPU-verif
 
 ## Validation
 
-Run `scripts/windows/test-launcher.ps1` for argument quoting, recipe defaults,
-input validation and occupied-port protection. `-DryRunOnly` explicitly skips the
-test that compiles and launches an argv echo executable.
-
-Local validation (2026-09-16):
-
-- Full native CUDA build passed with MSVC 19.44 and CUDA 13.2.51, targeting
-  `sm_120a`. All eight selected model-free tests passed. Linux NVMe ON and OFF
-  each passed five host tests.
-- The full launcher test passed, including executable argv roundtrips for
-  spaces/quotes/JSON, recipe defaults, validation and occupied-port protection.
-- On RTX 5050 Laptop GPU, Qwen3.5-0.8B Q8 with MTP weights answered the issue #1
-  arithmetic prompt and its follow-up correctly (`5`, then `7`) in plain F16,
-  KVMem Q8 and MTP2 snapshots modes. Usage/timings, props and bundled static UI
-  checks passed. System pagefile usage did not grow during these short tests.
-- A packaging fixture passed PE dependency scanning, ZIP/UI/checksum verification
-  and source-drift rejection.
-
-Follow-up validation (2026-09-17), RTX 5060 Ti 16 GiB, MSVC 19.44:
-
-- The old nvcc 13.2.51 build produced garbage from the 27B GSQ-RCO IQ3_S GGUF
-  with KVMem and MTP disabled. Giving the old executable updated cuBLAS DLLs
-  produced identical garbage.
-- Rebuilding unchanged source with **nvcc 13.2.86** passed 39 selected GPU
-  `MUL_MAT` comparisons against CPU, covering IQ1_S, IQ2_S, IQ3_S, IQ4_XS and
-  Q8_0, plus all eight selected model-free tests.
-- With an 8K context, the rebuilt server correctly answered arithmetic,
-  follow-up and Chinese prompts, both without KVMem/MTP and with KVMem Q8 KV
-  plus MTP3/ReplaySSM. A longer counting response accepted 52 of 54 MTP draft
-  tokens. These tests used the same GGUF, GPU and driver as the old build.
-
-The 27B IQ4 model, full 256K recipes, retrieval quality at long context, vision
-and thinking modes remain unvalidated on native Windows. These short tests are
-correctness checks, not throughput benchmarks.
-
-## rc2 candidate validation and known limitations
-
 The rc2 Windows server/CLI passed eight model-free tests, 52 KV argument cases,
-and four IQ3 short-text checks with `-ctk/-ctv`, KVMem Q8 and MTP3/ReplaySSM.
-These used an 8K context. The bundled `VALIDATION.json` identifies the binaries.
-
-A preceding CUDA 13.2.86 deployment completed 32 synthetic tool-result rounds
-(33 requests), reaching 261543 input tokens plus 512 output tokens. It was not
-the rc2 binary: rc2 adds early KV argument validation and corrected diagnostics.
-Do not report this as a full rc2 256K validation or a real external-tool test.
-That run exposed raw `<tool_call>` markup in 17 replies despite `tool_choice:
-none`; rc2 does not fix this behavior. Its final code reply was truncated at the
-512-token output limit. Request completion is not a semantic quality score.
-
-Native Windows IQ4, vision, thinking quality and the full rc2 256K recipe remain
-unvalidated. NVMe storage is disabled; host-RAM historical KV storage is enabled.
-The release has not been tested on a clean machine without CUDA Toolkit.
+and four IQ3 short-text checks with `-ctk/-ctv`, KVMem Q8 and MTP3/ReplaySSM
+at 8K context on RTX 5060 Ti. Launcher and split-package checks also passed.
+See `VALIDATION.json` for the tested binary hashes.

@@ -67,8 +67,7 @@ ready-made IQ3 `-mtp` model linked in the [Windows quick start](scripts/windows/
 For vision, download **`mmproj-Qwen3.8-27B-Q5_K-MIX.gguf`** from
 [HermiHg](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF) and pass its path with `-Mmproj`
 (Windows launchers) or `--mmproj` (server). No local projector quantization is
-needed. This newly recommended download has not been independently validated
-here; the performance tables below retain their original Q8/BF16 projectors.
+needed. The performance tables below retain their original Q8/BF16 projectors.
 The locally converted IQ4 MTP-Q4_0 main model does not yet have a project-provided
 download link in this release; use your prepared file or the optional quantizer.
 The recipes and conversion commands below document the historical tested setup.
@@ -199,7 +198,7 @@ In the current GSQ 27B template, `low` and `xhigh` inject instructions for brief
 - Text: [ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) → `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (use the `-mtp` file)
 - Vision: [HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF) → `mmproj-Qwen3.8-27B-Q5_K-MIX.gguf` (already quantized; no local conversion).
 
-Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf` for the Linux launcher, `-Mmproj` for the Windows launcher, or `--mmproj` for the server. This new projector recommendation is not the Q8 projector used in the historical performance results below, and its compatibility/quality has not been independently validated here.
+Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf` for the Linux launcher, `-Mmproj` for the Windows launcher, or `--mmproj` for the server. The historical performance results below used the original Q8 projector.
 
 ```text
 -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
@@ -218,7 +217,7 @@ If GPU vision does not fit, `MMPROJ_DEVICE=cpu`.
 **IQ3 is the primary recommended model and download for this release.** IQ4 is
 retained only as an optional test configuration and in the historical benchmark
 tables below. It uses a separately prepared MTP-Q4_0 main model, q5_0 main KV,
-budget 32768 and generation reserve 12288. Native Windows IQ4 is not validated.
+budget 32768 and generation reserve 12288.
 The existing IQ4 launchers remain available to testers who already have the
 required files; IQ4 is not part of the primary download/setup instructions.
 

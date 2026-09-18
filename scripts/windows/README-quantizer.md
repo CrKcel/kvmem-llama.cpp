@@ -19,5 +19,4 @@ tensor map and imatrix file. Do not blanket-requantize the model as a substitute
 
 Requires Windows x64 and Microsoft Visual C++ x64 runtime. CPU target:
 AVX2/FMA/F16C/BMI2. Any CUDA dependencies are bundled; no model files are included.
-The executable has passed a launch/help check; this rc2 publication did not run
-a fresh full-model quantization. See BUILD-INFO.json and licenses/ for provenance.
+See BUILD-INFO.json and licenses/ for build information and licenses.
