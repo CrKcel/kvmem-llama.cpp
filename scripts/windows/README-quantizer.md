@@ -1,4 +1,4 @@
-# Optional Windows quantizer — v0.16.0-rc3
+# Optional Windows quantizer — v0.16.0-rc2
 
 This package contains `bin/llama-quantize.exe` and any discovered application
 dependencies. It converts GGUF model weights; it does not run the chat server

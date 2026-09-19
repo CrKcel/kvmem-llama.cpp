@@ -1,9 +1,9 @@
-# Windows x64 CUDA preview — v0.16.0-rc3
+# Windows x64 CUDA preview — v0.16.0-rc2
 
 ## Download and run
 
-This is the **v0.16.0-rc3 Windows x64 CUDA** runtime candidate.
-Published versions are available on the [Releases page](https://github.com/kvmem/kvmem-llama.cpp/releases).
+Download the **windows-x86_64-cuda13.2.86.zip** runtime from
+[v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2).
 It contains the server, CLI, matching CUDA DLLs and browser UI. It does **not**
 contain model weights or the quantization tool. The separate **quantizer** ZIP
 is optional; it is unnecessary when your GGUF files are already prepared.
