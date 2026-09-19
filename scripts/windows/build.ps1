@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$SourceDir = (Join-Path $PSScriptRoot '../..'),
+    [string]$SourceDir,
     [string]$BuildDir,
     [string]$CudaPath = $env:CUDA_PATH,
     [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
@@ -11,6 +11,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if (!$SourceDir) { $SourceDir = Join-Path $PSScriptRoot '../..' }
 $SourceDir = (Resolve-Path -LiteralPath $SourceDir).Path
 if (!$BuildDir) { $BuildDir = Join-Path $SourceDir 'build-win' }
 $BuildDir = [IO.Path]::GetFullPath($BuildDir)
