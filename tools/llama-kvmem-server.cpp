@@ -1508,7 +1508,7 @@ int main(int argc, char ** argv) {
     json template_defaults = json::object();
     bool mmproj_gpu = true;
     int image_min_tokens = -1, image_max_tokens = -1;
-    std::string host = "127.0.0.1";
+    std::string host = "0.0.0.0";
     std::string nvme_dir;
     int port = 8080;
     int n_ctx = 2048;
