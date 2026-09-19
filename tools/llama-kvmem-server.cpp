@@ -1306,6 +1306,7 @@ static json stream_choice_chunk(const std::string & cid, const std::string & mod
         {"finish_reason", finish ? json(finish) : json(nullptr)},
     };
     // 1:1 upstream: {choices, created, id, model, system_fingerprint, object} (server-task.cpp to_json_oaicompat_chat)
+    // 中文：逐字段对齐上游 OpenAI 流式 chunk 结构，客户端可无差别解析
     json chunk = {
         {"choices", json::array({std::move(choice)})},
         {"created", std::time(nullptr)},
@@ -1348,6 +1349,7 @@ static json usage_json(int n_prompt, int n_gen, int n_cache_hit) {
 
 // OpenAI: last stream chunk has empty choices + usage, no finish_reason.
 // 1:1 upstream final usage chunk: {choices, created, id, model, system_fingerprint, object, usage}
+// 中文：流式结尾的 usage 块——choices 为空、无 finish_reason，携带 usage 统计
 static json stream_usage_chunk(const std::string & cid, const std::string & model, int n_prompt, int n_gen, int n_cache_hit) {
     return json{
         {"created", std::time(nullptr)},
@@ -1848,12 +1850,15 @@ int main(int argc, char ** argv) {
     svr.set_write_timeout(1800, 0);
     svr.set_idle_interval(0, 100000);
     svr.set_socket_options([](socket_t sock) {
+        // Reuse the address/port so a restart can rebind immediately instead of waiting for TIME_WAIT.
+        // 中文：允许地址/端口复用，重启后可立即重新绑定，无需等待 TIME_WAIT 超时
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
 #ifdef SO_REUSEPORT
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEPORT, 1);
 #endif
     });
     // CORS pre-routing handler (same pattern as upstream llama.cpp)
+    // 中文：与上游 llama.cpp 相同的 CORS 预路由处理——统一加响应头，OPTIONS 直接应答
     svr.set_pre_routing_handler([](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Headers", "*");
@@ -1876,6 +1881,7 @@ int main(int argc, char ** argv) {
     default_params["n_predict"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
     default_params["max_tokens"] = default_params["n_predict"];
     // 1:1 upstream /props extras (server-context.cpp get_res_props).
+    // 中文：除 kvmem 扩展字段外，补齐上游 /props 的标准字段（bos/eos token、模板能力等）
     std::string bos_token_str, eos_token_str;
     if (st.vocab != nullptr) {
         const llama_token bos_id = llama_vocab_bos(st.vocab);
@@ -1891,10 +1897,12 @@ int main(int argc, char ** argv) {
     }
     const json props = {
         // upstream get_res_props fields
+        // 中文：上游 /props 返回的标准字段，UI 依赖这些键渲染模型信息
         {"default_generation_settings", {{"params", default_params}, {"n_ctx", n_ctx}}},
         {"total_slots", 1},
         {"model_alias", st.model_name},
         // kvmem's llama.cpp predates llama_model_ftype_name(); keep the field for UI parity.
+        // 中文：当前 kvmem 的 llama.cpp 尚无 llama_model_ftype_name()，保留空字段以兼容上游 UI 展示
         {"model_ftype", ""},
         {"model_path", model_path},
         {"modalities", {{"vision", st.vision != nullptr}, {"audio", false}, {"video", false}}},
@@ -1910,6 +1918,7 @@ int main(int argc, char ** argv) {
         {"is_sleeping", false},
         {"cors_proxy_enabled", false},
         // kvmem extensions (kept for existing clients)
+        // 中文：kvmem 扩展字段，保留以兼容既有客户端
         {"role", "model"}, {"model_name", st.model_name},
         {"kvmem", {{"generation_limit", generation_limit},
             {"defaults", {{"enable_thinking", st.enable_thinking_default},
@@ -1925,6 +1934,7 @@ int main(int argc, char ** argv) {
     });
     // 1:1 upstream GET /slots (server-context.cpp server_slot::to_json).
     // kvmem serves a single slot; is_processing reflects whether st.mu is held by handle_chat.
+    // 中文：对齐上游 GET /slots——kvmem 仅单槽位，is_processing 反映 st.mu 是否被 handle_chat 占用
     svr.Get("/slots", [&](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Cache-Control", "no-store");
         const bool busy = !st.mu.try_lock();
@@ -2179,6 +2189,8 @@ int main(int argc, char ** argv) {
         }
 
         auto timings = std::make_shared<json>(json::object());
+        // 1:1 upstream timings block (server-context.cpp): prompt/predicted counts, ms, per-token and per-second rates.
+        // 中文：对齐上游的 timings 统计块——prompt/predicted 的计数、耗时、每 token 与每秒速率，供 /v1 响应回传
         auto make_emit_gen_wall = [timings, n_prompt = (int) toks.size()](
                 std::chrono::steady_clock::time_point t_turn0,
                 std::chrono::steady_clock::time_point t_pf1,
@@ -2272,6 +2284,7 @@ int main(int argc, char ** argv) {
                         return true;
                     };
                     // 1:1 upstream initial delta: {role, content:null} (server-task.cpp to_json_oaicompat_chat)
+                    // 中文：对齐上游流式首帧 delta——role=assistant 且 content=null，客户端按此初始化
                     send(stream_choice_chunk(cid, st.model_name, json{{"role", "assistant"}, {"content", nullptr}}, nullptr).dump());
                     const auto t_turn0 = std::chrono::steady_clock::now();
                     int n_cache_hit = 0;
@@ -2555,6 +2568,7 @@ int main(int argc, char ** argv) {
     svr.Post("/chat/completions", handle_chat);
 
     // bind and listen (same pattern as upstream llama.cpp)
+    // 中文：与上游 llama.cpp 相同的 bind + listen 流程——先绑端口再监听，便于提前暴露绑定失败
     if (!svr.bind_to_port(host, port)) {
         fprintf(stderr, "couldn't bind HTTP server socket, host: %s, port: %d\n", host.c_str(), port);
         return 1;

@@ -30,6 +30,7 @@ inline bool kvmem_output_limit(const nlohmann::json & body, int limit, int & val
     const char * key = body.contains("max_tokens") ? "max_tokens" : "max_completion_tokens";
     if (body.contains(key)) {
         const auto & n = body[key];
+        // Align with upstream llama.cpp oaicompat: -1/0 = server default; out-of-range values are clamped to limit below; only non-integers or values < -1 are rejected.
         // 对齐原版 llama.cpp oaicompat：-1/0 = 服务器默认；超限值由下方 clamp 到 limit；仅非整数或 < -1 拒绝
         if (!n.is_number_integer() || n.get<double>() < -1) {
             error = std::string(key) + " must be -1 (server default) or a non-negative integer";
