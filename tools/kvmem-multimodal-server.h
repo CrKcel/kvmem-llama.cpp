@@ -384,6 +384,17 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
                     }
                 }
             }
+            if (replay && !prompt.has_media() && !llama_kvmem_query_replay_fits(query, eval_end)) {
+                // Selection may trim the mandatory suffix when a long tool history
+                // exceeds the retrieval budget. Keep the completed first-pass
+                // recurrent state, logits and MTP carry; restoring the query
+                // checkpoint would require replaying rows with no resident slot.
+                path = "query_replay_skipped";
+                reason = "replay_exceeds_budget";
+                replay = false;
+                fprintf(stderr, "KVMEM_TRACE replay_skipped reason=over_budget query=[%d,%d) replay_rows=%d budget_tokens=%u\n",
+                        query, eval_end, eval_end - query, st.kparams.budget);
+            }
             if (replay) {
                 multimodal_restore(st, query_checkpoint, false);
                 llama_kvmem_set_replay(true);

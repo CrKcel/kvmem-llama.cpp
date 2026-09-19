@@ -1,0 +1,47 @@
+name: Server and UI compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  server-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: bash scripts/apply-patches.sh
+      - run: cmake -S . -B build -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DKVMEM_ENABLE_NVME=OFF
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+      - run: python3 scripts/test_server_compat.py --server build/bin/llama-kvmem-server --output build/compat
+      - run: python3 scripts/test_server_environment.py --server build/bin/llama-kvmem-server --output build/environment
+  ui-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        mode: [lightweight, full]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python3 tests/test_webui_builder.py
+      - name: Build UI
+        env:
+          UI_MODE: ${{ matrix.mode }}
+        run: |
+          if [ "$UI_MODE" = full ]; then
+            python3 scripts/build-webui.py --full-ui
+          else
+            python3 scripts/build-webui.py
+          fi

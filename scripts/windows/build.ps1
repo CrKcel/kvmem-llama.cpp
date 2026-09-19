@@ -77,11 +77,11 @@ Invoke-Checked cmake $options
 $targets = @('kvmem_store_test', 'pinned_kv_tier_test', 'nvme_disabled_test', 'kvmem_runtime_test', 'raw_kv_store_test')
 if (!$HostOnly) {
     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
-        'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test')
+        'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test')
 }
 Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
 if (!$BuildOnly) {
     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
-        '^(kvmem_store_test|pinned_kv_tier_test|nvme_disabled_test|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test)$')
+        '^(kvmem_store_test|pinned_kv_tier_test|nvme_disabled_test|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test)$')
     Write-Host "Built and tested: $BuildDir"
 } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }
