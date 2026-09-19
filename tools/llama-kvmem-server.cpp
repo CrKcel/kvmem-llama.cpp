@@ -11,6 +11,7 @@
 #include "chat.h"
 #include "common.h"
 #include "json.h"
+#include "build-info.h"
 #include "sampling.h"
 
 #include "httplib.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -99,7 +101,8 @@ static void print_usage(const char * argv0) {
             "  --no-think                 force thinking off\n"
             "  --reasoning-budget N       thinking token budget: -1 unlimited, 0 end immediately,\n"
             "                            N>0 force </think> after N think tokens (default -1)\n"
-            "  --reasoning-budget-message MSG  injected before forced </think> (default none)\n",
+            "  --reasoning-budget-message MSG  injected before forced </think> (default none)\n"
+            "  --webui                    serve bundled chat UI (default on)\n",
             argv0);
 }
 
@@ -1296,17 +1299,25 @@ struct StreamChatOut {
     }
 };
 
-static json stream_choice_chunk(const std::string & cid, const json & delta, const char * finish) {
+static json stream_choice_chunk(const std::string & cid, const std::string & model, const json & delta, const char * finish, const json * timings = nullptr) {
     json choice = {
         {"index", 0},
         {"delta", delta},
         {"finish_reason", finish ? json(finish) : json(nullptr)},
     };
-    return json{
-        {"id", cid},
-        {"object", "chat.completion.chunk"},
+    // 1:1 upstream: {choices, created, id, model, system_fingerprint, object} (server-task.cpp to_json_oaicompat_chat)
+    json chunk = {
         {"choices", json::array({std::move(choice)})},
+        {"created", std::time(nullptr)},
+        {"id", cid},
+        {"model", model},
+        {"system_fingerprint", std::string(llama_build_info())},
+        {"object", "chat.completion.chunk"},
     };
+    if (timings != nullptr) {
+        chunk["timings"] = *timings;
+    }
+    return chunk;
 }
 
 // DeepSeek Chat Completions usage: prompt_tokens = hit + miss.
@@ -1336,10 +1347,14 @@ static json usage_json(int n_prompt, int n_gen, int n_cache_hit) {
 }
 
 // OpenAI: last stream chunk has empty choices + usage, no finish_reason.
-static json stream_usage_chunk(const std::string & cid, int n_prompt, int n_gen, int n_cache_hit) {
+// 1:1 upstream final usage chunk: {choices, created, id, model, system_fingerprint, object, usage}
+static json stream_usage_chunk(const std::string & cid, const std::string & model, int n_prompt, int n_gen, int n_cache_hit) {
     return json{
+        {"created", std::time(nullptr)},
         {"id", cid},
         {"object", "chat.completion.chunk"},
+        {"system_fingerprint", std::string(llama_build_info())},
+        {"model", model},
         {"choices", json::array()},
         {"usage", usage_json(n_prompt, n_gen, n_cache_hit)},
     };
@@ -1544,6 +1559,8 @@ int main(int argc, char ** argv) {
             ui_dir = need(arg);
         } else if (eq(arg, "--no-ui")) {
             no_ui = true;
+        } else if (eq(arg, "--webui")) {
+            no_ui = false;
         } else if (eq(arg, "--host")) {
             host = need(arg);
         } else if (eq(arg, "--port")) {
@@ -1830,13 +1847,22 @@ int main(int argc, char ** argv) {
     svr.set_read_timeout(1800, 0);
     svr.set_write_timeout(1800, 0);
     svr.set_idle_interval(0, 100000);
-    svr.set_default_headers({
-        {"Access-Control-Allow-Origin", "*"},
-        {"Access-Control-Allow-Headers", "*"},
-        {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+    svr.set_socket_options([](socket_t sock) {
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+#ifdef SO_REUSEPORT
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEPORT, 1);
+#endif
     });
-    svr.Options(".*", [](const httplib::Request &, httplib::Response & res) {
-        res.status = 204;
+    // CORS pre-routing handler (same pattern as upstream llama.cpp)
+    svr.set_pre_routing_handler([](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        if (req.method == "OPTIONS") {
+            res.set_content("", "text/html");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
     });
 
     if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0])) return 1;
@@ -1849,10 +1875,42 @@ int main(int argc, char ** argv) {
     auto default_params = st.enable_thinking_default ? thinking_params : plain_params;
     default_params["n_predict"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
     default_params["max_tokens"] = default_params["n_predict"];
+    // 1:1 upstream /props extras (server-context.cpp get_res_props).
+    std::string bos_token_str, eos_token_str;
+    if (st.vocab != nullptr) {
+        const llama_token bos_id = llama_vocab_bos(st.vocab);
+        const llama_token eos_id = llama_vocab_eos(st.vocab);
+        if (bos_id >= 0) bos_token_str = token_piece(st.vocab, bos_id);
+        if (eos_id >= 0) eos_token_str = token_piece(st.vocab, eos_id);
+    }
+    json chat_template_caps = json::object();
+    if (st.tmpls) {
+        for (const auto & cap : common_chat_templates_get_caps(st.tmpls.get())) {
+            chat_template_caps[cap.first] = cap.second;
+        }
+    }
     const json props = {
-        {"role", "model"}, {"total_slots", 1}, {"model_name", st.model_name},
-        {"default_generation_settings", {{"n_ctx", n_ctx}, {"params", default_params}}},
+        // upstream get_res_props fields
+        {"default_generation_settings", {{"params", default_params}, {"n_ctx", n_ctx}}},
+        {"total_slots", 1},
+        {"model_alias", st.model_name},
+        // kvmem's llama.cpp predates llama_model_ftype_name(); keep the field for UI parity.
+        {"model_ftype", ""},
+        {"model_path", model_path},
         {"modalities", {{"vision", st.vision != nullptr}, {"audio", false}, {"video", false}}},
+        {"media_marker", mtmd_default_marker()},
+        {"endpoint_slots", true}, {"endpoint_props", false}, {"endpoint_metrics", false},
+        {"ui", !no_ui},
+        {"ui_settings", json::object()},
+        {"chat_template", chat_template},
+        {"chat_template_caps", chat_template_caps},
+        {"bos_token", bos_token_str},
+        {"eos_token", eos_token_str},
+        {"build_info", std::string(llama_build_info())},
+        {"is_sleeping", false},
+        {"cors_proxy_enabled", false},
+        // kvmem extensions (kept for existing clients)
+        {"role", "model"}, {"model_name", st.model_name},
         {"kvmem", {{"generation_limit", generation_limit},
             {"defaults", {{"enable_thinking", st.enable_thinking_default},
                           {"reasoning_budget_tokens", st.reasoning_budget_default}, {"chat_template_kwargs", kwargs}}},
@@ -1864,6 +1922,44 @@ int main(int argc, char ** argv) {
     });
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
+    });
+    // 1:1 upstream GET /slots (server-context.cpp server_slot::to_json).
+    // kvmem serves a single slot; is_processing reflects whether st.mu is held by handle_chat.
+    svr.Get("/slots", [&](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Cache-Control", "no-store");
+        const bool busy = !st.mu.try_lock();
+        if (!busy) st.mu.unlock();
+        json slot = {
+            {"id", 0},
+            {"n_ctx", n_ctx},
+            {"speculative", st.spec.ok},
+            {"is_processing", busy},
+            {"id_task", 0},
+            {"n_prompt_tokens", 0},
+            {"n_prompt_tokens_processed", 0},
+            {"n_prompt_tokens_cache", 0},
+            {"params", default_params},
+            {"next_token", json::array({
+                {
+                    {"has_next_token", busy},
+                    {"has_new_line", false},
+                    {"n_remain", 0},
+                    {"n_decoded", st.last_n_gen},
+                }
+            })},
+            {"prompt", ""},
+            {"generated", ""},
+        };
+        if (busy && req.target.find("fail_on_no_slot") != std::string::npos) {
+            res.status = 503;
+            res.set_content(json{{"error", json{
+                {"code", 503},
+                {"message", "no slot available"},
+                {"type", "unavailable_error"},
+            }}}.dump(), "application/json");
+            return;
+        }
+        res.set_content(json::array({slot}).dump(), "application/json");
     });
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {
@@ -2087,10 +2183,25 @@ int main(int argc, char ** argv) {
                 std::chrono::steady_clock::time_point t_turn0,
                 std::chrono::steady_clock::time_point t_pf1,
                 double prefill_ms) {
-            return [timings, t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen) {
+            return [timings, t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen, bool verbose = true) {
                 const auto now = std::chrono::steady_clock::now();
                 const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
-                *timings = {{"predicted_n", n_gen}, {"predicted_ms", gen_ms}};
+                const double prompt_per_second = prefill_ms > 0.0 ? 1000.0 * (double) n_prompt / prefill_ms : 0.0;
+                const double predicted_per_second = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
+                *timings = {
+                    {"prompt_n", n_prompt},
+                    {"prompt_ms", prefill_ms},
+                    {"prompt_per_token_ms", n_prompt > 0 ? prefill_ms / (double) n_prompt : 0.0},
+                    {"prompt_per_second", prompt_per_second},
+                    {"predicted_n", n_gen},
+                    {"predicted_ms", gen_ms},
+                    {"predicted_per_token_ms", n_gen > 0 ? gen_ms / (double) n_gen : 0.0},
+                    {"predicted_per_second", predicted_per_second},
+                    {"cache_n", 0}
+                };
+                if (!verbose) {
+                    return;
+                }
                 const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
                 const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
                 fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
@@ -2127,7 +2238,9 @@ int main(int argc, char ** argv) {
             json out = {
                 {"id", cid},
                 {"object", "chat.completion"},
+                {"created", std::time(nullptr)},
                 {"model", st.model_name},
+                {"system_fingerprint", std::string(llama_build_info())},
                 {"choices", json::array({json{
                     {"index", 0},
                     {"message", message},
@@ -2158,7 +2271,8 @@ int main(int argc, char ** argv) {
                         }
                         return true;
                     };
-                    send(stream_choice_chunk(cid, json{{"role", "assistant"}}, nullptr).dump());
+                    // 1:1 upstream initial delta: {role, content:null} (server-task.cpp to_json_oaicompat_chat)
+                    send(stream_choice_chunk(cid, st.model_name, json{{"role", "assistant"}, {"content", nullptr}}, nullptr).dump());
                     const auto t_turn0 = std::chrono::steady_clock::now();
                     int n_cache_hit = 0;
                     if (!run_prefill_retrieval(st, toks, &io, &n_cache_hit)) {
@@ -2189,8 +2303,11 @@ int main(int argc, char ** argv) {
                             [&](llama_token id, const std::string & piece, bool) {
                                 gen.push_back(id);
                                 content += piece;
-                                for (const auto & delta : sco.set_text(content, true)) {
-                                    send(stream_choice_chunk(cid, delta, nullptr).dump());
+                                emit_gen_wall((int) gen.size(), false);
+                                auto deltas = sco.set_text(content, true);
+                                for (size_t i = 0; i < deltas.size(); ++i) {
+                                    const json * ts = (i + 1 == deltas.size()) ? &*timings : nullptr;
+                                    send(stream_choice_chunk(cid, st.model_name, deltas[i], nullptr, ts).dump());
                                 }
                             },
                             [&]() { return !stream_heartbeat(&io); },
@@ -2243,8 +2360,11 @@ int main(int argc, char ** argv) {
                             content += piece;
                             gen.push_back(id);
                             hit_stop = strip_stop(content, stops);
-                            for (const auto & delta : sco.set_text(content, !hit_stop)) {
-                                send(stream_choice_chunk(cid, delta, nullptr).dump());
+                            emit_gen_wall((int) gen.size(), false);
+                            auto deltas = sco.set_text(content, !hit_stop);
+                            for (size_t i = 0; i < deltas.size(); ++i) {
+                                const json * ts = (i + 1 == deltas.size()) ? &*timings : nullptr;
+                                send(stream_choice_chunk(cid, st.model_name, deltas[i], nullptr, ts).dump());
                             }
                             if (hit_stop) {
                                 break;
@@ -2258,8 +2378,11 @@ int main(int argc, char ** argv) {
                             return true;
                         }
                         const bool hit_limit = !stopped && !hit_stop && (int) gen.size() >= max_tokens;
-                        for (const auto & delta : sco.set_text(content, false)) {
-                            send(stream_choice_chunk(cid, delta, nullptr).dump());
+                        emit_gen_wall((int) gen.size(), false);
+                        auto flush_deltas = sco.set_text(content, false);
+                        for (size_t i = 0; i < flush_deltas.size(); ++i) {
+                            const json * ts = (i + 1 == flush_deltas.size()) ? &*timings : nullptr;
+                            send(stream_choice_chunk(cid, st.model_name, flush_deltas[i], nullptr, ts).dump());
                         }
                         const char * finish = sco.finish_reason(hit_limit);
                         fprintf(stderr,
@@ -2270,8 +2393,8 @@ int main(int argc, char ** argv) {
                         llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
                         commit_cached(st, toks, gen);
-                        send(stream_choice_chunk(cid, json::object(), finish).dump());
-                        auto usage = stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit);
+                        send(stream_choice_chunk(cid, st.model_name, json::object(), finish).dump());
+                        auto usage = stream_usage_chunk(cid, st.model_name, (int) toks.size(), (int) gen.size(), n_cache_hit);
                         usage["timings"] = *timings;
                         send(usage.dump());
                         sink.write("data: [DONE]\n\n", 14);
@@ -2287,8 +2410,11 @@ int main(int argc, char ** argv) {
                         return true;
                     }
                     const bool hit_limit = (int) gen.size() >= max_tokens;
-                    for (const auto & delta : sco.set_text(content, false)) {
-                        send(stream_choice_chunk(cid, delta, nullptr).dump());
+                    emit_gen_wall((int) gen.size(), false);
+                    auto flush_deltas = sco.set_text(content, false);
+                    for (size_t i = 0; i < flush_deltas.size(); ++i) {
+                        const json * ts = (i + 1 == flush_deltas.size()) ? &*timings : nullptr;
+                        send(stream_choice_chunk(cid, st.model_name, flush_deltas[i], nullptr, ts).dump());
                     }
                     const char * finish = sco.finish_reason(hit_limit);
                     fprintf(stderr,
@@ -2298,8 +2424,8 @@ int main(int argc, char ** argv) {
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
                     emit_gen_wall((int) gen.size());
                     commit_cached(st, toks, gen);
-                    send(stream_choice_chunk(cid, json::object(), finish).dump());
-                    auto usage = stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit);
+                    send(stream_choice_chunk(cid, st.model_name, json::object(), finish).dump());
+                    auto usage = stream_usage_chunk(cid, st.model_name, (int) toks.size(), (int) gen.size(), n_cache_hit);
                     usage["timings"] = *timings;
                     send(usage.dump());
                     sink.write("data: [DONE]\n\n", 14);
@@ -2428,12 +2554,19 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/chat/completions", handle_chat);
     svr.Post("/chat/completions", handle_chat);
 
+    // bind and listen (same pattern as upstream llama.cpp)
+    if (!svr.bind_to_port(host, port)) {
+        fprintf(stderr, "couldn't bind HTTP server socket, host: %s, port: %d\n", host.c_str(), port);
+        return 1;
+    }
+
     fprintf(stderr, "llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
             st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,
             st.reasoning_budget_default, st.query_max_tokens);
-    if (!svr.listen(host, port)) {
+
+    if (!svr.listen_after_bind()) {
         fprintf(stderr, "listen failed\n");
         return 1;
     }
