@@ -11,7 +11,8 @@ import tempfile
 
 
 def check(binary, args, expected, missing):
-    result = subprocess.run([str(binary), '-m', str(missing), *args],
+    # Keep model-free cache validation independent of automatic GPU selection.
+    result = subprocess.run([str(binary), '-m', str(missing), '-ngl', '0', *args],
                             capture_output=True, text=True, timeout=30)
     output = result.stdout + result.stderr
     assert result.returncode != 0, (args, output)

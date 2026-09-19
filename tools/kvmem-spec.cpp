@@ -84,6 +84,9 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     p.n_batch = opts.n_batch;
     p.n_ubatch = opts.n_ubatch > 0 ? opts.n_ubatch : opts.n_batch;
     p.n_parallel = 1;
+    if (opts.n_threads > 0) p.cpuparams.n_threads = opts.n_threads;
+    if (opts.n_threads_batch > 0) p.cpuparams_batch.n_threads = opts.n_threads_batch;
+    p.flash_attn_type = opts.flash_attn;
     p.n_outputs_max = 1 + std::max(0, opts.n_max);
     p.n_outputs_max_per_seq = p.n_outputs_max;
     p.cache_type_k = opts.type_k;
@@ -102,6 +105,9 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
         return false;
     }
 
+    fprintf(stderr, "KVMEM_CONTEXT draft threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
+            llama_n_threads(sess.ctx_dft), llama_n_threads_batch(sess.ctx_dft), llama_n_ubatch(sess.ctx_dft),
+            llama_flash_attn_type_name(p_dft.flash_attn_type));
     sess.spec_params = std::move(p);
     sess.spec_params.speculative.draft.ctx_tgt = ctx_tgt;
     sess.spec_params.speculative.draft.ctx_dft = sess.ctx_dft;

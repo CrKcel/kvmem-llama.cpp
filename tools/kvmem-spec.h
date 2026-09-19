@@ -20,6 +20,9 @@ struct kvmem_spec_opts {
     int32_t n_ctx = 0;
     int32_t n_batch = 512;
     int32_t n_ubatch = 512;
+    int32_t n_threads = -1;
+    int32_t n_threads_batch = -1;
+    llama_flash_attn_type flash_attn = LLAMA_FLASH_ATTN_TYPE_AUTO;
     bool    kvmem_enabled = false;
     std::string draft_model; // optional sidecar GGUF; empty = welded nextn
     ggml_type type_k = GGML_TYPE_Q8_0;
