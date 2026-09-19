@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  server-linux:
+  host-and-server-units-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -17,11 +17,11 @@ jobs:
         with:
           submodules: true
       - run: bash scripts/apply-patches.sh
-      - run: cmake -S . -B build -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DKVMEM_ENABLE_NVME=OFF
+      # The full KVMem adapter requires CUDA; this runner validates portable host code.
+      - run: cmake -S . -B build -DKVMEM_BUILD_LLAMA=OFF -DKVMEM_ENABLE_NVME=OFF
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
-      - run: python3 scripts/test_server_compat.py --server build/bin/llama-kvmem-server --output build/compat
-      - run: python3 scripts/test_server_environment.py --server build/bin/llama-kvmem-server --output build/environment
+      - run: bash scripts/test_server_portable.sh build/portable
   ui-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 20
