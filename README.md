@@ -1,5 +1,7 @@
 # KVMem + llama.cpp
 
+**Prebuilt downloads:** [Windows x64 (rc2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
+
 ## Near-lossless Qwen3.8-27B at a full 256K workspace on 16 GiB VRAM
 
 llama.cpp inference with tiered KV memory for long-running agents.
