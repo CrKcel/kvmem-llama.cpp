@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -197,11 +198,28 @@ def run_cli(cli: Path, model: Path, extra: list[str], prompt: str,
             n_predict: int) -> tuple[str, str]:
     env = gpu_env.apply_gpu(os.environ.copy(), "small")
     env.setdefault("KVMEM_TRACE", "1")
-    cmd = [
-        str(cli), "-m", str(model), "-n", str(n_predict), "-ngl", "99",
-        "--no-prompt", "--temp", "0", *extra, prompt,
-    ]
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
+    # Hand the prompt over in a file. A single argv entry is capped by the
+    # kernel at MAX_ARG_STRLEN (128 KiB on Linux), and a long-document prompt
+    # blows past that well before the model's context does: a 32k-token prompt
+    # is already ~167 KB, which fails with E2BIG ("Argument list too long").
+    # The CLI's -f/--file reads the same text back verbatim, with no argv
+    # ceiling and no shell quoting involved.
+    prompt_file = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                         encoding="utf-8", newline="\n") as fh:
+            # Record the path before writing so write/flush failures also clean up.
+            prompt_file = fh.name
+            fh.write(prompt)
+        cmd = [
+            str(cli), "-m", str(model), "-n", str(n_predict), "-ngl", "99",
+            "--no-prompt", "--temp", "0", *extra, "-f", prompt_file,
+        ]
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True,
+                              env=env)
+    finally:
+        if prompt_file is not None:
+            os.unlink(prompt_file)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-4000:])
         raise SystemExit(f"command failed rc={proc.returncode}")
