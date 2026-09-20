@@ -54,7 +54,10 @@ ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
 
 bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v) {
     if (ggml_is_quantized(type_k) || ggml_is_quantized(type_v)) {
-        return type_k == type_v || (type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q4_0);
+        const auto supported_quant = [](ggml_type type) {
+            return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q4_0;
+        };
+        return supported_quant(type_k) && supported_quant(type_v);
     }
     return true;
 }
