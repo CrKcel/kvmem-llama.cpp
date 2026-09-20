@@ -66,8 +66,9 @@ The project builds on llama.cpp's CUDA backend, with the platform above used for
 
 | Platform | Download | Notes |
 |---|---|---|
-| Windows x64 | [v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) | Choose the **runtime** ZIP; CUDA 13.2.86; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
-| Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; it has not been rebuilt or relabeled as rc2. |
+| Windows x64 — CUDA 13.2.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Recommended **runtime** ZIP; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
+| Windows x64 — CUDA 12.9.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Alternative **runtime** ZIP; GPU targets 70/75/80/86/89/90/120a, including Volta. Quantizer is a separate optional ZIP. |
+| Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; no rc3 Linux/WSL rebuild is included. |
 
 No model weights are bundled. For a Windows text-only setup, download the
 ready-made IQ3 `-mtp` model linked in the [Windows quick start](scripts/windows/README.md).
@@ -92,7 +93,7 @@ An experimental [native Windows build](scripts/windows/README.md) is being valid
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.16.0-rc2
+git checkout v0.16.0-rc3
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
@@ -460,11 +461,11 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
 
-No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+Optional API-key authentication is available through `--api-key` / `--api-key-file`; native TLS is not supported. The default bind address is `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
 
 ## Documentation
 
-- [v0.16.0-rc2 milestone](docs/milestones/v0.16.0-rc2.md)
+- [v0.16.0-rc3 milestone](docs/milestones/v0.16.0-rc3.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)
