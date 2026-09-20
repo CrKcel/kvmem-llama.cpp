@@ -25,6 +25,7 @@ a = p.parse_args()
 out = Path(a.output).resolve()
 out.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
+env["KVMEM_TRACE"] = "1"
 checks = []
 
 def check(name, ok):

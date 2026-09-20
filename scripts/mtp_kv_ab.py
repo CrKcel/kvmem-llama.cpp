@@ -229,6 +229,7 @@ def main():
                LD_LIBRARY_PATH=str(ROOT / 'build/bin') + ':/home/leye/kvmem_qw3/.cu13-env/lib')
     for key in ('KVMEM_TRACE', 'KVMEM_PERF'):
         env.pop(key, None)
+    env['KVMEM_TRACE'] = '1'  # Pool/follow records are required by this benchmark.
     nvml = ctypes.CDLL('libnvidia-ml.so.1')
     assert nvml.nvmlInit_v2() == 0
     device = ctypes.c_void_p()
@@ -258,7 +259,7 @@ def main():
             while '--spec-kv-dtype' in argv:
                 override = argv.index('--spec-kv-dtype')
                 del argv[override:override + 2]
-            argv += ['--spec-kv-dtype', dtype]
+            argv += ['--spec-kv-dtype', dtype, '--verbosity', '4']
             row = trial(root / f'{index:02d}_{dtype}', dtype, argv, request_bytes, env, nvml, device)
             summary['trials'].append(row)
             (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')

@@ -25,6 +25,7 @@ def main():
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
+    env["KVMEM_TRACE"] = "1"
     env['CUDA_VISIBLE_DEVICES'] = args.gpu
     env['PATH'] = str(args.exe.parent) + os.pathsep + env['PATH']
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

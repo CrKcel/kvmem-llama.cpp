@@ -274,6 +274,10 @@ def main():
     ap.add_argument('--default-mmproj', required=True)
     ap.add_argument('--default-vision-device', choices=('cpu', 'gpu'), required=True)
     ap.add_argument('--kv', required=True)
+    ap.add_argument('--cache-type-k', '-ctk', choices=('f16', 'f32', 'q8_0', 'q5_0', 'q4_0'),
+                    help='override the recipe K cache type')
+    ap.add_argument('--cache-type-v', '-ctv', choices=('f16', 'f32', 'q8_0', 'q5_0', 'q4_0'),
+                    help='override the recipe V cache type')
     ap.add_argument('--budget', type=int, required=True)
     ap.add_argument('--reserve', type=int, required=True)
     ap.add_argument('--kvmem-block-tokens', type=int, help='override retrieval block size (server default 128)')
@@ -337,6 +341,9 @@ def main():
             '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
             '--kv-dtype', args.kv, '--spec-type', 'draft-mtp',
             '--enable-thinking', '--reasoning-budget', '4096']
+    for flag, value in (('--cache-type-k', args.cache_type_k), ('--cache-type-v', args.cache_type_v)):
+        if value is not None:
+            argv += [flag, value]
     if args.ui_dir is not None:
         ui = args.ui_dir.resolve()
         if not (ui / 'index.html').is_file():
