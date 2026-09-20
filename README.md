@@ -7,7 +7,7 @@
 ---
 # KVMem + llama.cpp
 
-**Prebuilt downloads:** [Windows x64 (rc2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
+**Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
 
 **QQ community / QQ 交流群：1040777853**
 
@@ -29,9 +29,11 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 **Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
-Current milestone: [`v0.16.0-rc2`](docs/milestones/v0.16.0-rc2.md) (pre-release).
+Current milestone: [`v0.16.0-rc3`](docs/milestones/v0.16.0-rc3.md) (pre-release).
 
 **Limitation:** one generation cannot exceed `--kvmem-gen-reserve` (16384 tokens on the IQ3 recipe, 12288 on IQ4), including thinking. Retrieval pins the GPU window; new tokens only use those reserved slots. We are working on fixing this. For agent use, add a line to the system prompt such as: *Keep each turn's output, including thinking, within 16384 tokens* (use 12288 on IQ4). That makes oversized single-turn replies much less likely.
+
+Version: **0.16.0-rc3**. See the [English / 中文 release notes](docs/releases/v0.16.0-rc3.md) for CUDA build choices and measured results.
 
 ## How KVMem works
 
@@ -71,8 +73,9 @@ The project builds on llama.cpp's CUDA backend, with the platform above used for
 
 | Platform | Download | Notes |
 |---|---|---|
-| Windows x64 | [v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) | Choose the **runtime** ZIP; CUDA 13.2.86; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
-| Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; it has not been rebuilt or relabeled as rc2. |
+| Windows x64 — CUDA 13.2.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Recommended **runtime** ZIP; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
+| Windows x64 — CUDA 12.9.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Alternative **runtime** ZIP; GPU targets 70/75/80/86/89/90/120a, including Volta. Quantizer is a separate optional ZIP. |
+| Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; no rc3 Linux/WSL rebuild is included. |
 
 No model weights are bundled. For a Windows text-only setup, download the
 ready-made IQ3 `-mtp` model linked in the [Windows quick start](scripts/windows/README.md).
@@ -97,7 +100,7 @@ An experimental [native Windows build](scripts/windows/README.md) is being valid
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.16.0-rc2
+git checkout v0.16.0-rc3
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
@@ -111,6 +114,8 @@ The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested
 
 ## Browser chat
 
+The updated Windows rc3 runtime packages include both UIs: **full UI by default** at `share/kvmem/ui`, plus the lightweight UI at `share/kvmem/ui-lightweight`. The normal IQ3/IQ4 launch scripts enable the full UI automatically. To choose the lightweight UI, append `-UiDir '.\share\kvmem\ui-lightweight'` when running from the extracted package directory; `-NoUi` disables UI. Download the runtime ZIP again if you have the original lightweight-only rc3 package. Full UI does not add server-side tool execution or stream resumption to the KVMem backend.
+
 The optional lightweight UI reuses llama.cpp's Markdown/code renderer, input components and browser-local history. It supports text and images, separate thinking effort/budget controls, stopping generation, and server-measured decode speed. It does not execute tools or manage model loading.
 
 Build the static page once with Node.js 22 and npm:
@@ -119,9 +124,144 @@ Build the static page once with Node.js 22 and npm:
 python3 scripts/build-webui.py
 ```
 
+Add `--full-ui` to build the full upstream UI, including its generated icons and PWA assets. Use separate `--output` directories when keeping both builds.
+
 Then start the rebuilt server with the usual IQ3/IQ4 script and open `http://127.0.0.1:18200/`. The server automatically serves `build/share/kvmem/ui/` when present. Precompiled packages can include the page, so users do not need Node.js. `--ui-dir PATH` selects another static directory; `--no-ui` disables the page.
 
 Chat histories stay in this browser. Switching histories can require recomputing an uncached prompt; normal continuation reuses the existing KV cache. Closing or reloading the page interrupts generation; stream resumption is not included.
+
+## llama-server CLI compatibility
+
+The rc3 version of `llama-kvmem-server` accepts the common flags below with
+their llama.cpp meanings. Use the rc3 binaries or rebuild from source; rc2
+binaries predate these additions. This is an independent, single-slot server, so it does not
+yet accept every `llama-server` option.
+
+| Options | Meaning |
+| --- | --- |
+| `-t`, `--threads`; `-tb`, `--threads-batch` | CPU generation/batch threads; values <= 0 select hardware concurrency. An explicit `-t` also sets batch threads unless `-tb` is given. |
+| `-b`, `--batch-size`; `-ub`, `--ubatch-size` | Logical/physical batch sizes. Omitted `-ub` retains KVMem's existing default of the logical batch size. |
+| `-fa`, `--flash-attn on\|off\|auto` | Flash Attention mode; also applied to the MTP draft context. Backend/model restrictions still apply. |
+| `-ngl`, `--gpu-layers`, `--n-gpu-layers` | Nonnegative layer count or `all` (`-2`). Automatic GPU fitting (`auto`/`-1`) is not implemented and produces an error. |
+| `-a`, `--alias` | Model name returned by `/v1/models`, `/props` and chat responses. |
+| `--api-key`, `--api-key-file` | API authentication; details below. |
+| `-lm`, `--load-mode` | `auto`, `none`, `mmap`, `mlock`, `mmap+mlock`, `dio`; legacy `--mmap`, `--no-mmap`, `--mlock` map to the corresponding mode. Last loading-mode flag wins. |
+| `-np`, `--parallel` | Only `1` is supported. Automatic or multiple slots produce an error. |
+| `-to`, `--timeout` | HTTP read/write timeout in seconds; KVMem retains its 1800-second default. |
+| `--threads-http` | HTTP worker count; <= 0 selects automatically. This does not enable parallel inference slots. |
+| `-dev`, `--device`; `--list-devices` | Select one offload device (for example `CUDA0`), or `none` for CPU; list devices without loading a model. |
+| `-mg`, `--main-gpu`; `-sm`, `--split-mode` | Select a single GPU using `--split-mode none --main-gpu INDEX`. `layer` is accepted only when offloading to at most one device. |
+| `-ts`, `--tensor-split` | A single proportion is accepted; multi-device proportions are rejected. |
+
+Additional upstream aliases: `--usage` = `--help`, `--predict` = `--n-predict`,
+`-s` = `--seed`, `-mm` = `--mmproj`, `--no-webui` = `--no-ui`, and
+`--path` = `--ui-dir`.
+
+**Multi-GPU operation is not supported yet**, including with `--no-kvmem`.
+Multiple `--device` names, multiple `--tensor-split` entries, and `row`/`tensor`
+split modes fail before model loading. When automatic discovery sees multiple
+GPUs, select one with `--device CUDA0`, use `--split-mode none --main-gpu INDEX`,
+or expose one GPU through `CUDA_VISIBLE_DEVICES`. Indices refer to the visible
+device list (and to the selected device list when `--device` is supplied).
+
+Threads, physical batch size and Flash Attention settings propagate to MTP.
+Existing model, host/port, context, sampling, chat-template, vision and KV-cache
+flags remain available; run `--help` for the full supported list. `-n` / `--n-predict`
+now defaults to `-1`, matching llama-server: no additional output-token cap.
+Generation still stops at EOS/stop sequences and remains bounded by the available
+context and KVMem generation reserve; a request may set `max_tokens` explicitly.
+Other KVMem defaults
+and `--kvmem-*` controls remain unchanged. Numeric arguments reject malformed and
+out-of-range values. Context size must be positive; `--n-predict` accepts `-1`
+or a positive number.
+
+For example, append these options to an existing model/KVMem launch command:
+
+```sh
+--threads 8 --threads-batch 8 --batch-size 512 --ubatch-size 128 \
+--flash-attn on --gpu-layers all --parallel 1 --alias kvmem-27b \
+--api-key-file /path/to/api-keys.txt
+```
+
+`--api-key KEY1,KEY2` accepts comma-separated keys (CSV quoting is supported).
+`--api-key-file PATH` reads one key per line, ignoring blank lines and lines
+starting with `#`; Windows CRLF files are supported. Repeated key flags append
+allowed keys. Keys must contain printable ASCII without whitespace; empty lists,
+empty/unreadable key files and malformed quoting fail startup.
+
+Clients send `Authorization: Bearer YOUR_KEY` (or `X-Api-Key: YOUR_KEY`). With
+keys configured, API routes including `/props` and `/v1/models` require a matching
+key and return HTTP 401 otherwise. Health checks, CORS preflights and mounted UI
+assets remain public. Loading the UI does not grant access to authenticated APIs;
+clients must supply the key. Without key flags, authentication remains disabled.
+
+Regression checks: `kvmem-server-options-test` via CTest, and
+`python scripts/test_server_compat.py --server /path/to/llama-kvmem-server`.
+Add `--model PATH` for live auth/inference checks, `--mtp` for MTP, and
+`--mmproj PATH --image PATH` for the optional vision fixture containing `6037`.
+
+### Environment variables and startup diagnostics
+
+Supported environment variables use the names from this project's pinned
+llama.cpp version. Values pass through the same validation as CLI arguments.
+For ordinary settings, precedence is **CLI > environment > default**. Environment
+values are validated first, so an invalid environment value must be corrected
+even when a CLI override is present. API keys are additive: environment keys,
+environment key files, CLI keys and CLI key files all add allowed credentials.
+A CLI key does not revoke an environment key.
+
+| Environment variables | Corresponding settings |
+| --- | --- |
+| `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS` | Model path and API model name |
+| `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_TIMEOUT`, `LLAMA_ARG_THREADS_HTTP` | HTTP server |
+| `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_ARG_BATCH`, `LLAMA_ARG_UBATCH`, `LLAMA_ARG_THREADS` | Context, output and CPU/batch configuration |
+| `LLAMA_ARG_DEVICE`, `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_MAIN_GPU`, `LLAMA_ARG_SPLIT_MODE`, `LLAMA_ARG_TENSOR_SPLIT` | GPU selection; the same single-GPU restrictions apply |
+| `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_N_PARALLEL` | Attention, KV types and single-slot configuration |
+| `LLAMA_ARG_LOAD_MODE`, `LLAMA_ARG_MMAP`, `LLAMA_ARG_MLOCK` | Model loading; legacy environment options apply before `LOAD_MODE` |
+| `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_OFFLOAD`, `LLAMA_ARG_IMAGE_MIN_TOKENS`, `LLAMA_ARG_IMAGE_MAX_TOKENS` | Vision |
+| `LLAMA_ARG_UI`, `LLAMA_ARG_STATIC_PATH` | UI enabled/disabled and static directory |
+| `LLAMA_API_KEY`, `LLAMA_ARG_API_KEY_FILE` | Authentication; no secret values are logged |
+| `LLAMA_ARG_JINJA`, `LLAMA_ARG_CHAT_TEMPLATE`, `LLAMA_ARG_CHAT_TEMPLATE_FILE`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS` | Templates; disabling Jinja is unsupported |
+| `LLAMA_ARG_REASONING_EFFORT`, `LLAMA_ARG_THINK_BUDGET`, `LLAMA_ARG_THINK_BUDGET_MESSAGE`, `LLAMA_ARG_TOP_K` | Reasoning and top-k sampling |
+| `LLAMA_ARG_SPEC_TYPE`, `LLAMA_ARG_SPEC_DRAFT_N_MAX`, `LLAMA_ARG_SPEC_DRAFT_P_MIN` | Existing MTP settings; independent draft models remain unsupported |
+
+Boolean environment values accept `1/0`, `true/false`, `on/off`, `yes/no`
+(case-insensitive). `--ui` / `--webui` can override `LLAMA_ARG_UI=false`.
+Unsupported `LLAMA_ARG_*` names produce a warning without printing their values.
+Unsupported API-key/TLS variable names fail startup rather than silently leaving
+authentication or native TLS unconfigured. Empty keys and empty/unreadable key
+files also fail startup. Unset both key variables and omit both key flags to
+disable authentication.
+
+PowerShell example (the values apply to the current shell and its child processes):
+
+```powershell
+$env:LLAMA_ARG_MODEL = 'C:\models\model.gguf'
+$env:LLAMA_ARG_DEVICE = 'CUDA0'
+$env:LLAMA_ARG_CTX_SIZE = '32768'
+$env:LLAMA_ARG_PORT = '18200'
+$env:LLAMA_ARG_API_KEY_FILE = 'C:\config\kvmem-api-keys.txt'
+.\llama-kvmem-server.exe --ctx-size 65536
+```
+
+Enable `--kvmem-trace` (or `KVMEM_TRACE=1`) to emit the structured startup records described below. Without tracing, normal startup messages and errors remain available.
+
+Startup first validates configuration, model/projector/UI files and incompatible
+settings before loading model weights. `KVMEM_STARTUP requested=...` records the
+requested configuration. After initialization and a successful port bind,
+`KVMEM_STARTUP ready=...` records actual context/batch/thread values, output limits,
+vision/MTP state, authentication status/key count and parameter sources. GPU and
+Flash Attention requests are labeled as requested; llama.cpp's backend logs show
+the actual placement and attention selection. Unlisted sources use defaults;
+inherited batch/thread settings are identified explicitly. No raw key values or
+key-file contents are included. Bind failures identify the address/port and do
+not print a successful listening message.
+
+Run `python scripts/test_server_environment.py --server PATH --output DIR`
+for environment validation; add `--model SMALL_GGUF` for live precedence,
+authentication, inference and startup-summary checks.
+
+The default bind address remains `127.0.0.1`. For LAN access, pass `--host 0.0.0.0 --port 18200`; clients use the host computer's LAN IP. Configure `--api-key` when authentication is needed and allow the port through the host firewall.
 
 ## Recommended settings (16 GiB)
 
@@ -232,7 +372,7 @@ Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q
 
 ```text
 -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
---mmproj mmproj-Qwen3.8-27B-Q5_K-MIX.gguf --mmproj-offload --image-max-tokens 512
+--mmproj mmproj-Qwen3.8-27B-Q5_K-MIX.gguf --no-mmproj-offload --image-max-tokens 512
 -c 262144 -n 16384
 --kvmem-budget 36864 --kvmem-gen-reserve 16384
 --kv-dtype q8_0
@@ -240,7 +380,7 @@ Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q
 --enable-thinking --reasoning-budget 4096
 ```
 
-If GPU vision does not fit, `MMPROJ_DEVICE=cpu`.
+IQ3 now defaults to CPU vision (`--no-mmproj-offload`) to leave more GPU memory for inference. Vision remains available. To explicitly use GPU vision, set `MMPROJ_DEVICE=gpu` on Linux/WSL or pass `-VisionDevice gpu` to the Windows launcher. Historical performance tables below retain their original projector placement.
 
 ### IQ4 27B — optional experimental comparison
 
@@ -332,11 +472,11 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
 
-No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+Optional API-key authentication is available through `--api-key` / `--api-key-file`; native TLS is not supported. The default bind address is `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
 
 ## Documentation
 
-- [v0.16.0-rc2 milestone](docs/milestones/v0.16.0-rc2.md)
+- [v0.16.0-rc3 milestone](docs/milestones/v0.16.0-rc3.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)

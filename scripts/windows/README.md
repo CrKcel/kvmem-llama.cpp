@@ -1,16 +1,27 @@
-# Windows x64 CUDA preview — v0.16.0-rc2
+# Windows x64 CUDA preview — v0.16.0-rc3
+
+This document describes the **rc3 prerelease**, available with CUDA 13.2.86 and CUDA 12.9.86.
 
 ## Download and run
 
-Download the **windows-x86_64-cuda13.2.86.zip** runtime from
-[v0.16.0-rc2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2).
+Download the **windows-x86_64-cuda13.2.86.zip** runtime (recommended), or the
+**windows-x86_64-cuda12.9.86.zip** alternative, from
+[v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3).
 It contains the server, CLI, matching CUDA DLLs and browser UI. It does **not**
 contain model weights or the quantization tool. The separate **quantizer** ZIP
 is optional; it is unnecessary when your GGUF files are already prepared.
 
+Updated rc3 runtime ZIPs include the full UI (default, `share/kvmem/ui`) and
+lightweight UI (`share/kvmem/ui-lightweight`). Normal IQ3/IQ4 launch scripts
+enable the full UI automatically. From the extracted package directory, append
+`-UiDir '.\share\kvmem\ui-lightweight'` to select the lightweight UI, or `-NoUi`
+to disable UI. Existing rc3 users should download the updated runtime ZIP again.
+Full UI does not add backend tool execution or stream resumption support.
+
 Requirements: Windows x64, a compatible NVIDIA driver, Microsoft Visual C++ x64
 runtime, and an AVX2/FMA/F16C/BMI2 CPU. The package contains CUDA targets `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`
-and `sm_120a`; the tested GPU is RTX 5060 Ti 16 GiB. CUDA Toolkit,
+and `sm_120a`; the CUDA 12.9.86 package additionally contains `sm_70` for Volta.
+The tested GPU is RTX 5060 Ti 16 GiB; other targets have not been physically tested. CUDA Toolkit,
 Visual Studio and Node.js are not needed to run the package. Tested driver: 610.62.
 
 ### Text-only quick start (no model conversion)
@@ -150,6 +161,8 @@ for testers with prepared files.
 | Vision placement | GPU | CPU |
 | Block size | 128 | 128 |
 | Thinking budget | 4096 | 4096 |
+
+IQ3 defaults to CPU vision with `--no-mmproj-offload`, leaving more GPU memory for inference. To use GPU vision explicitly, pass `-VisionDevice gpu`. IQ4 continues to default to CPU vision.
 
 Other switches include `-Port`, `-Mtp`, `-VisionDevice cpu|gpu`,
 `-ReasoningBudget`, `-ChatTemplateFile`, `-ChatTemplateKwargs`, `-UiDir`, `-NoUi`.
