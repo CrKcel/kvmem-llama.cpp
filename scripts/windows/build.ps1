@@ -4,6 +4,7 @@ param(
     [string]$SourceDir,
     [string]$BuildDir,
     [string]$CudaPath = $env:CUDA_PATH,
+    [switch]$ExperimentalCuda129,
     [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
     [ValidateRange(1, 64)][int]$Jobs = 4,
     [switch]$HostOnly,
@@ -66,7 +67,9 @@ if ($HostOnly) {
     if ($LASTEXITCODE -ne 0 -or ($nvccVersion -join ' ') -notmatch 'V(\d+\.\d+\.\d+)') {
         throw 'Cannot determine nvcc version'
     }
-    if ([version]$Matches[1] -lt [version]'13.2.86') {
+    if ($ExperimentalCuda129) {
+        if ($Matches[1] -ne '12.9.86') { throw 'Experimental CUDA 12.9 build requires nvcc 12.9.86' }
+    } elseif ([version]$Matches[1] -lt [version]'13.2.86') {
         throw 'CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer is required; rebuild in a new directory.'
     }
     $env:PATH = "$CudaPath\bin;$CudaPath\bin\x64;$env:PATH"

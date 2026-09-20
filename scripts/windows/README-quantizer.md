@@ -1,4 +1,6 @@
-# Optional Windows quantizer — v0.16.0-rc2
+# Optional Windows quantizer — v0.16.0-rc3 — CUDA 12.9.86 experimental build
+
+This package uses CUDA 12.9.86 with GPU targets 70/75/80/86/89/90/120a. Consult the bundled validation report for actual hardware and inference coverage. It is separate from the CUDA 13.2 package.
 
 This package contains `bin/llama-quantize.exe` and any discovered application
 dependencies. It converts GGUF model weights; it does not run the chat server

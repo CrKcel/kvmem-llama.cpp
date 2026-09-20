@@ -1,4 +1,8 @@
-# Windows x64 CUDA preview — v0.16.0-rc2
+# Windows x64 CUDA preview — v0.16.0-rc3 — CUDA 12.9.86 experimental build
+
+This package uses CUDA 12.9.86 with GPU targets 70/75/80/86/89/90/120a. Consult the bundled validation report for actual hardware and inference coverage. It is separate from the CUDA 13.2 package.
+
+This document describes the **unreleased rc3 source/candidate**. The rc2 download below remains the latest published Windows package and does not include the new rc3 features.
 
 ## Download and run
 
