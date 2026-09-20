@@ -1,5 +1,7 @@
 # KVMem × llama.cpp 修改计划
 
+当前状态以 [rc3 变更说明](milestones/v0.16.0-rc3.md)和[用户反馈待办](user-feedback-triage.md)为准。下方 2026-09-15 的阶段说明保留作历史记录，其中默认值不代表当前版本。
+
 **状态（2026-09-15）：** P0–P3 **`v0.3.0`**。P4–P5 **`v0.4.0`**。P7 **`v0.5.0`**。量化 KV spill **`v0.6.0`**。GPU stage-in **`v0.7.0`**。32 MiB slab **`v0.8.0`**。packed GPU K/V memcpy + mean-K + 块写满异步 D2H **`v0.9.0`**。decode mean-K + 进程内 prefix reuse + chat tools T1–T5 **`v0.10.0`**。query clamp / thinking budget / stream heartbeat **`v0.11.0`**。same-query skip / recency suffix / stream usage **`v0.12.0`**。compact `drop_reuse` / role-block query / `prompt_cache_*` **`v0.12.1`**。GDN gen-start ckpt / `prefill_tail_offload` **`v0.12.2`**。MTP KV dtype / `FA_ALL_QUANTS` / Qwen3.8 sampling **`v0.12.3`**。OpenAI 图片 / mmproj / 视觉 KV **`v0.13.0`**。query replay skip / IQ3·IQ4 可移植启动器 **`v0.14.0`**。FP32 GDN ReplaySSM / 默认 MTP3 / IQ3·IQ4 图文与 256K 复测 **`v0.15.0`**。host mean-K 单累加器 **`v0.15.1`**（tag `v0.15.1`）。产品默认 `--kvmem` = retrieval + query-last 64，`--kvmem-query-max-tokens` 512，GPU KV **q8_0**；MTP 可选 `--spec-type draft-mtp`（默认 **none**），`--spec-kv-dtype` 可单独设 MTP KV。IQ3/IQ4 脚本默认 `--kvmem-query-replay auto --kvmem-query-policy user`、`--mmproj` + MTP n_max=3、`--kvmem-mtp-state replay`。阶段测试：[milestones/v0.15.1.md](milestones/v0.15.1.md)。P6 未开始。阶段 D `state_write` 与 T6 json_schema 未进此 tag。
 
 本文是落地文档，不是再写一遍可行性分析。架构结论见技术方案；这里规定：**改什么、不改什么、按什么顺序合入、每一步怎样算过关。**

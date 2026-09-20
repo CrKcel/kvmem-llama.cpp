@@ -48,7 +48,7 @@ if (!$Gpu) {
 if ([string]::IsNullOrWhiteSpace($Gpu) -or $Gpu -eq '-1') { throw 'Select an enabled GPU' }
 $budget = 36864; $reserve = 16384; $kv = 'q8_0'
 if ($Recipe -eq 'iq4') { $budget = 32768; $reserve = 12288; $kv = 'q5_0' }
-if (!$VisionDevice) { if ($Recipe -eq 'iq3') { $VisionDevice = 'gpu' } else { $VisionDevice = 'cpu' } }
+if (!$VisionDevice) { $VisionDevice = 'cpu' }
 $visionFlag = '--mmproj-offload'
 if ($VisionDevice -eq 'cpu') { $visionFlag = '--no-mmproj-offload' }
 $serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,

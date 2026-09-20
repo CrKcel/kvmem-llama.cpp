@@ -43,12 +43,17 @@ public class ArgvEcho {
         Check ($a[[Array]::IndexOf($a, '--kvmem-block-tokens') + 1] -eq '32') 'block tokens'
         Check ($a[[Array]::IndexOf($a, '--spec-draft-n-max') + 1] -eq '3') 'MTP default'
         Check ($a[[Array]::IndexOf($a, '--chat-template-kwargs') + 1] -eq '{"enable_thinking":true}') 'template JSON'
-        $limit = '16384'; $budget = '36864'; $vision = '--mmproj-offload'; $kv = 'q8_0'
+        $limit = '16384'; $budget = '36864'; $vision = '--no-mmproj-offload'; $kv = 'q8_0'
         if ($recipe -eq 'iq4') { $limit = '12288'; $budget = '32768'; $vision = '--no-mmproj-offload'; $kv = 'q5_0' }
         Check ($a[[Array]::IndexOf($a, '--kvmem-gen-reserve') + 1] -eq $limit) 'generation reserve'
         Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq $budget) 'retrieval budget'
         Check ($a[[Array]::IndexOf($a, '--kv-dtype') + 1] -eq $kv) 'KV type'
         Check ($a -contains $vision) 'vision placement'
+        Check ($a -notcontains '--mmproj-offload') 'default vision must not use GPU'
+        $gpuVision = & (Join-Path $PSScriptRoot "start-$recipe.ps1") -BuildDir $temp -Model $model -Mmproj $mmproj `
+            -Gpu 0 -VisionDevice gpu -DryRun | ConvertFrom-Json
+        Check ($gpuVision.argv -contains '--mmproj-offload') 'explicit GPU vision override'
+        Check ($gpuVision.argv -notcontains '--no-mmproj-offload') 'no conflicting CPU vision flag'
         $mixed = & (Join-Path $PSScriptRoot "start-$recipe.ps1") -BuildDir $temp -Model $model -Mmproj $mmproj `
             -Gpu 0 -CacheTypeK q8_0 -CacheTypeV q4_0 -DryRun | ConvertFrom-Json
         $a = $mixed.argv
