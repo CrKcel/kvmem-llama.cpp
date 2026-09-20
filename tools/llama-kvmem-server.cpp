@@ -124,7 +124,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
-            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: match K, or K=q8_0 V=q4_0)\n"
+            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
@@ -1817,7 +1817,7 @@ int main(int argc, char ** argv) {
 #endif
     // Validate before backend initialization and loading a potentially large model.
     if (!kvmem_cache_types_ok(st.cache_type_k, st.cache_type_v)) {
-        fprintf(stderr, "incompatible KV cache types: K=%s, V=%s; quantized K/V must match or use K=q8_0 V=q4_0; "
+        fprintf(stderr, "incompatible KV cache types: K=%s, V=%s; quantized K/V must both use q8_0, q5_0 or q4_0; "
                 "set both -ctk and -ctv, or use --kv-dtype TYPE to set both\n",
                 ggml_type_name(st.cache_type_k), ggml_type_name(st.cache_type_v));
         return 1;

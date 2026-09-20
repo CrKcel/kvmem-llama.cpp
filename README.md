@@ -158,11 +158,17 @@ to each component wins. Setting only `-ctk` does not change V (both default to
 `q8_0`), so specify both when changing precision.
 
 Supported types are `f16`, `f32`, `q8_0`, `q5_0` and `q4_0`.
-Valid quantized K/V pairs are `q8_0/q8_0`, `q5_0/q5_0`, `q4_0/q4_0` and
-**`q8_0/q4_0`**. Other mixed quantized pairs, including `q4_0/q8_0` and
-`q8_0/f16`, are rejected before loading the model. The CUDA build enables
-`GGML_CUDA_FA_ALL_QUANTS`, which includes the Q8/Q4 FlashAttention kernels.
-Models that require shared K/V types still cannot use mixed precision.
+K and V may independently select `q8_0`, `q5_0` or `q4_0`: all nine
+quantized pairs are accepted. Float/quantized pairs such as `q8_0/f16` remain
+rejected before model loading. Models that require shared K/V types still
+cannot use mixed precision; execution also depends on backend kernel support.
+
+GPU validation covers the common `q8_0/q8_0`, `q5_0/q5_0`, `q4_0/q4_0`
+pairs and mixed **`q8_0/q4_0`**. Q8/Q4 additionally passed cache save/restore,
+MTP replay and long-context checks on CUDA. The other five mixed quantized
+pairs are enabled with argument-parsing checks only; they have not received
+full inference, quality or performance validation. ROCm/Vulkan combinations
+have not been validated here.
 
 ```text
 llama-kvmem-server -m model.gguf -ctk q8_0 -ctv q4_0
