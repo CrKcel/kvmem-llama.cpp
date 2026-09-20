@@ -467,8 +467,11 @@ on the LAN, pass `--host 0.0.0.0` to the server or to the launchers
 or set `HOST` / `LLAMA_ARG_HOST` (e.g. `HOST=0.0.0.0 scripts/start-iq3.sh`). Open
 firewall ports for LAN clients. To require a key, pass `--api-key sk-xxx` to the
 server or Linux launchers (`start-iq3.sh --api-key sk-xxx`), or `-ApiKey 'sk-xxx'`
-/ `-ApiKeyFile path` on Windows (mirroring llama-server); every route except
-`/health` then needs `Authorization: Bearer sk-xxx` (or `X-Api-Key: sk-xxx`).
+/ `-ApiKeyFile path` on Windows (mirroring llama-server). Protected routes then
+need `Authorization: Bearer sk-xxx` (or `X-Api-Key: sk-xxx`); `/health`,
+`/v1/health`, OPTIONS requests and mounted UI static assets remain public.
+On Linux, relative `--api-key-file` paths are resolved from the caller's current
+directory and checked for readability before an existing service is stopped.
 Native TLS is not supported. Stream `usage` includes
 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
 

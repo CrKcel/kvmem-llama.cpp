@@ -165,7 +165,8 @@ Other switches include `-Port`, `-ListenHost`, `-ApiKey`, `-Mtp`, `-VisionDevice
 default `127.0.0.1` only serves this machine, so pass `-ListenHost 0.0.0.0` to
 serve the API on your LAN.
 `-ApiKey KEY` (or `-ApiKeyFile PATH`, mirroring llama-server) requires
-`Authorization: Bearer KEY` / `X-Api-Key` on every route except `/health`;
+`Authorization: Bearer KEY` / `X-Api-Key` on protected routes. `/health`,
+`/v1/health`, OPTIONS requests and mounted UI static assets remain public.
 Reasoning effort follows the model template unless explicitly set. Sampling uses
 the same server defaults as Linux and remains configurable per API request.
 

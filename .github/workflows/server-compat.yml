@@ -17,6 +17,7 @@ jobs:
         with:
           submodules: true
       - run: bash scripts/apply-patches.sh
+      - run: python3 tests/test_launcher_key_file.py
       # The full KVMem adapter requires CUDA; this runner validates portable host code.
       - run: cmake -S . -B build -DKVMEM_BUILD_LLAMA=OFF -DKVMEM_ENABLE_NVME=OFF
       - run: cmake --build build --parallel 2
