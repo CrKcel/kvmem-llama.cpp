@@ -8,6 +8,8 @@ param(
     [string]$Gpu = $env:CUDA_VISIBLE_DEVICES,
     [ValidateRange(1, 65535)][int]$Port = 18200,
     [string]$ListenHost = $env:HOST,
+    [string]$ApiKey,
+    [string]$ApiKeyFile = $env:LLAMA_ARG_API_KEY_FILE,
     [ValidateRange(1, 2147483647)][int]$BlockTokens = 128,
     [string]$ReasoningEffort,
     [ValidateSet('f16', 'f32', 'q8_0', 'q5_0', 'q4_0')][string]$CacheTypeK,
@@ -62,6 +64,8 @@ $serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,
     '--enable-thinking', '--reasoning-budget', "$ReasoningBudget")
 if ($CacheTypeK) { $serverArgs += @('--cache-type-k', $CacheTypeK) }
 if ($CacheTypeV) { $serverArgs += @('--cache-type-v', $CacheTypeV) }
+if ($ApiKey) { $serverArgs += @('--api-key', $ApiKey) }
+if ($ApiKeyFile) { $serverArgs += @('--api-key-file', $ApiKeyFile) }
 if ($ReasoningEffort) { $serverArgs += @('--reasoning-effort', $ReasoningEffort) }
 if ($ChatTemplateFile) {
     $template = (Resolve-Path -LiteralPath $ChatTemplateFile).Path

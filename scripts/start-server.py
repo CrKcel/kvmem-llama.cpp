@@ -270,6 +270,10 @@ def main():
         'KVMEM_QUERY_REPLAY, KVMEM_QUERY_POLICY, CUDA_HOME, LD_LIBRARY_PATH.')
     ap.add_argument('--recipe', choices=('iq3', 'iq4'), required=True)
     ap.add_argument('--host', help='bind address (default: HOST or LLAMA_ARG_HOST environment, then 127.0.0.1)')
+    ap.add_argument('--api-key', help='require this key on every route except /health (comma-separated list '
+                    'accepted); passed to the server as --api-key')
+    ap.add_argument('--api-key-file', type=Path, help='file with one API key per line; passed to the server '
+                    'as --api-key-file')
     ap.add_argument('--default-model', required=True)
     ap.add_argument('--default-mmproj', required=True)
     ap.add_argument('--default-vision-device', choices=('cpu', 'gpu'), required=True)
@@ -344,6 +348,10 @@ def main():
     for flag, value in (('--cache-type-k', args.cache_type_k), ('--cache-type-v', args.cache_type_v)):
         if value is not None:
             argv += [flag, value]
+    if args.api_key is not None:
+        argv += ['--api-key', args.api_key]
+    if args.api_key_file is not None:
+        argv += ['--api-key-file', str(args.api_key_file)]
     if args.ui_dir is not None:
         ui = args.ui_dir.resolve()
         if not (ui / 'index.html').is_file():
