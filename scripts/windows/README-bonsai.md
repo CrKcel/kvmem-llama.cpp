@@ -26,8 +26,13 @@ The model defaults to `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0.g
 when `-Model` is omitted. Weights are not included in this ZIP.
 
 解压后按上面命令启动，然后打开浏览器即可聊天。无需编译或安装 CUDA Toolkit。
-默认使用 Q8 KV、32K 上下文、2K 检索预算和 1K 生成预留；这个低显存默认配置
-适合先验证启动，不能保证 32K 历史完整召回（已有三项召回测试只通过一项）。
+默认使用 Q8 KV、128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
+思考预算为 4096 token（可用 `-ReasoningBudget` 覆盖）。思考 token 包含在总生成上限内。
+128K 是启动配置，尚未完成 128K 实际输入验证；下文结果来自此前的 64K 测试。
+
+Defaults: context 131072, retrieval budget 24576, generation reserve 10240,
+thinking enabled with a 4096-token reasoning budget. The 128K default has not
+been validated with an actual 128K input.
 
 ## Tested 64K configuration / 已验证的 64K 配置
 

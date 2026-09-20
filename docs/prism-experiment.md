@@ -39,7 +39,7 @@ From this worktree, with Visual Studio C++ Build Tools and CUDA 12.9.86 installe
 
 The measured build targets SM120a (RTX 50 series); use suitable architecture flags and revalidate for other cards. CUDA runtime DLLs must be on PATH. The launcher accepts a GPU UUID to avoid index ambiguity.
 
-The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 32768-token logical context, 2048-token retrieval budget, 1024-token generation reserve, Q8 KV, batch/ubatch 128, no MTP and no projector. It listens on localhost port 18202. A subsequent 32013-token input and 256-token generation completed on 8GB without OOM, but only one of three historical codes was recalled. This configuration is not validated for reliable 32K recall; see the detailed results below.
+The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 131072-token logical context, 24576-token retrieval budget, 10240-token generation reserve, Q8 KV, batch/ubatch 128, thinking enabled with a 4096-token reasoning budget, no MTP and no projector. It listens on localhost port 18202. These are launch defaults, not a completed 128K-input validation. The earlier 32K test used the old 2048+1024 pool and recalled one of three codes; the 64K test used 24576+10240 and recalled all three. See the measured results for their precise scope.
 
 ```powershell
 python scripts/bonsai-smoke.py --long `

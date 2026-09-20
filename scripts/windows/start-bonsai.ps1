@@ -6,9 +6,10 @@ param(
     [string]$UiDir,
     [string]$Gpu = '0',
     [ValidateRange(1, 65535)][int]$Port = 18202,
-    [ValidateRange(128, 262144)][int]$Context = 32768,
-    [ValidateRange(128, 262144)][int]$Budget = 2048,
-    [ValidateRange(128, 262144)][int]$Reserve = 1024,
+    [ValidateRange(128, 262144)][int]$Context = 131072,
+    [ValidateRange(128, 262144)][int]$Budget = 24576,
+    [ValidateRange(128, 262144)][int]$Reserve = 10240,
+    [ValidateRange(-1, 262144)][int]$ReasoningBudget = 4096,
     [ValidateRange(1, 4096)][int]$Batch = 128,
     [ValidateSet('q8_0', 'q5_0', 'q4_0')][string]$KvType = 'q8_0',
     [switch]$DryRun
@@ -33,7 +34,8 @@ $serverArgs = @('-m', $Model, '-ngl', '99', '--host', '127.0.0.1', '--port', "$P
     '-c', "$Context", '-b', "$Batch", '--ubatch-size', "$Batch", '-n', "$Reserve",
     '--kvmem-budget', "$Budget", '--kvmem-gen-reserve', "$Reserve", '--kvmem-block-tokens', '128',
     '--kv-dtype', $KvType, '--spec-type', 'none', '--kvmem-mtp-state', 'snapshots',
-    '--kvmem-query-policy', 'user', '--kvmem-query-replay', 'auto', '--flash-attn', 'on')
+    '--kvmem-query-policy', 'user', '--kvmem-query-replay', 'auto', '--flash-attn', 'on',
+    '--enable-thinking', '--reasoning-budget', "$ReasoningBudget")
 if ($UiDir) { $serverArgs += @('--ui-dir', (Resolve-Path -LiteralPath $UiDir).Path) }
 if ($DryRun) {
     @{ argv = @($binary) + $serverArgs; environment = @{ CUDA_VISIBLE_DEVICES = $Gpu; CUDA_DEVICE_ORDER = 'PCI_BUS_ID' } } |
