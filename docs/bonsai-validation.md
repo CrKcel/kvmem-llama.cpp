@@ -103,6 +103,8 @@ Evidence: `logs/bonsai-64k-24k-10k/results.json`, `archive-request.json`, `kvmem
 
 ## Evidence and limits
 
+A subsequent [unmodified Prism 32K performance comparison](prism-performance.md) measured 135.23 token/s prefill and 8.77 token/s decode with full KV. It is a performance comparison, not a logits equivalence check.
+
 Local evidence is retained in `logs/bonsai-smoke/` and `logs/bonsai-long-smoke/` (`results.json`, `plain.log`, `kvmem.log`), with CTest output in `build-win-bonsai/Testing/Temporary/LastTest.log`. The reproducible runner is `scripts/bonsai-smoke.py --long`.
 
 The plain/KVMem comparison uses the same patched binary with KVMem disabled/enabled. It is not a comparison against pristine Prism, nor a token-logit equivalence test. Coverage consists of simple text, a passing 4K retrieval case, a failed 32K/2K-budget recall case, and a passing 64K/24K-budget recall case. No claims are made for general long-context quality, tool use, vision, ordinary Qwen regressions, other GPUs, Linux, or long-duration stability. Installed rc3 runtime files and the existing app were not changed.
