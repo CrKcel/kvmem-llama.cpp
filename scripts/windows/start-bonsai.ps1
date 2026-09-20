@@ -3,6 +3,7 @@
 param(
     [string]$Model = (Join-Path $env:LOCALAPPDATA 'KVMem/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf'),
     [string]$BuildDir,
+    [string]$UiDir,
     [string]$Gpu = '0',
     [ValidateRange(1, 65535)][int]$Port = 18202,
     [ValidateRange(128, 262144)][int]$Context = 32768,
@@ -16,7 +17,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'native-process.ps1')
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-if (!$BuildDir) { $BuildDir = Join-Path $root 'build-win-bonsai' }
+if (!$BuildDir) {
+    if (Test-Path -LiteralPath (Join-Path $root 'bin/llama-kvmem-server.exe')) { $BuildDir = $root }
+    else { $BuildDir = Join-Path $root 'build-win-bonsai' }
+}
 $binary = Join-Path $BuildDir 'bin/llama-kvmem-server.exe'
 foreach ($path in @($binary, $Model)) {
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing file: $path" }
@@ -30,6 +34,7 @@ $serverArgs = @('-m', $Model, '-ngl', '99', '--host', '127.0.0.1', '--port', "$P
     '--kvmem-budget', "$Budget", '--kvmem-gen-reserve', "$Reserve", '--kvmem-block-tokens', '128',
     '--kv-dtype', $KvType, '--spec-type', 'none', '--kvmem-mtp-state', 'snapshots',
     '--kvmem-query-policy', 'user', '--kvmem-query-replay', 'auto', '--flash-attn', 'on')
+if ($UiDir) { $serverArgs += @('--ui-dir', (Resolve-Path -LiteralPath $UiDir).Path) }
 if ($DryRun) {
     @{ argv = @($binary) + $serverArgs; environment = @{ CUDA_VISIBLE_DEVICES = $Gpu; CUDA_DEVICE_ORDER = 'PCI_BUS_ID' } } |
         ConvertTo-Json -Depth 5

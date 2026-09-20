@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory)][string]$OutputDir,
     [string]$CudaPath = $env:CUDA_PATH,
     [switch]$ExperimentalCuda129,
+    [switch]$Bonsai,
     [string]$CudaLicense,
     [string]$UiDir,
     [string]$ValidationReport,
@@ -89,11 +90,14 @@ while ($queue.Count) {
     }
 }
 if ($Component -eq 'Runtime') {
-foreach ($name in 'native-process.ps1', 'start-server.ps1', 'start-iq3.ps1', 'start-iq4.ps1') {
+$launchers = @('native-process.ps1', 'start-server.ps1', 'start-iq3.ps1', 'start-iq4.ps1')
+if ($Bonsai) { $launchers = @('native-process.ps1', 'start-bonsai.ps1') }
+foreach ($name in $launchers) {
     Copy-Item -LiteralPath (Join-Path $SourceDir "scripts/windows/$name") -Destination (Join-Path $OutputDir 'scripts/windows')
 }
 }
 $readme = 'README.md'
+if ($Bonsai) { $readme = 'README-bonsai.md' }
 if ($Component -eq 'Quantizer') { $readme = 'README-quantizer.md' }
 Copy-Item -LiteralPath (Join-Path $SourceDir ('scripts/windows/' + $readme)) -Destination (Join-Path $OutputDir 'README.md')
 Copy-Item -LiteralPath (Join-Path $SourceDir 'llama.cpp/LICENSE') -Destination (Join-Path $OutputDir 'licenses/llama.cpp-MIT.txt')

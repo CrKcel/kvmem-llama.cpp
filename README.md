@@ -2,7 +2,9 @@
 
 > **Experimental Bonsai branch (`0.16.0-rc3-prism.1`):** llama.cpp is pinned to Prism `9a9394a895b9`. The no-MTP adapter builds and runs Bonsai PTQ1 on an RTX 5050 8GB. Synthetic recall found 1/3 codes at 32K with a 2K retrieval budget, and 3/3 at 64K with a 24K budget plus 10K reserve (7454 MiB peak). Start with `scripts/windows/start-bonsai.ps1`; the older MTP recipes do not apply to this branch. See [scope and build instructions](docs/prism-experiment.md) and [measured results and remaining validation](docs/bonsai-validation.md). The rc3 benchmarks below describe the previous baseline.
 
-**Prebuilt downloads:** [Windows x64 (rc2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
+**Bonsai experimental download:** [Windows RTX 30/40/50, CUDA 12.9](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3-prism.1). See the [Bonsai quick start](scripts/windows/README-bonsai.md). This is a separate no-MTP runtime; RTX 5050 is the hardware validation target.
+
+**Other prebuilt downloads:** [Windows x64 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
 
 **QQ community / QQ 交流群：1040777853**
 
