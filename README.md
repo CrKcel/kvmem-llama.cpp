@@ -1,5 +1,7 @@
 # KVMem + llama.cpp
 
+> **Experimental rc3 + Prism baseline (`0.16.0-rc3-prism.1`):** llama.cpp is pinned to Prism `9a9394a895b9`. KVMem adapter migration is pending; this branch is not a runnable, validated KVMem release. See [experiment status and migration checklist](docs/prism-experiment.md). The rc3 results below describe the previous baseline.
+
 **Prebuilt downloads:** [Windows x64 (rc2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
 
 **QQ community / QQ 交流群：1040777853**

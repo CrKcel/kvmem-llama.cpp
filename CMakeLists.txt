@@ -18,6 +18,11 @@ add_subdirectory(kvmem)
 
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 if (KVMEM_BUILD_LLAMA)
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/src/llama-kvmem-factory.h")
+        message(FATAL_ERROR
+            "Prism experimental baseline: KVMem adapter patches are not ported yet. "
+            "See docs/prism-experiment.md. Use KVMEM_BUILD_LLAMA=OFF for host-only work.")
+    endif()
     if (NOT CMAKE_CUDA_COMPILER AND EXISTS "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc")
         set(CMAKE_CUDA_COMPILER "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc" CACHE FILEPATH "nvcc")
     endif()
