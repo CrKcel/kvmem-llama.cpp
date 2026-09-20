@@ -325,7 +325,15 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
 
-No auth or TLS. Binds `127.0.0.1` by default. To serve on the LAN, pass `--host 0.0.0.0` to the server or to the launchers (`scripts/start-iq3.sh --host 0.0.0.0`; Windows: `start-iq3.ps1 -ListenHost 0.0.0.0`), or set `HOST` / `LLAMA_ARG_HOST` (e.g. `HOST=0.0.0.0 scripts/start-iq3.sh`). Open firewall ports for LAN clients. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+No auth or TLS unless an API key is set. Binds `127.0.0.1` by default. To serve
+on the LAN, pass `--host 0.0.0.0` to the server or to the launchers
+(`scripts/start-iq3.sh --host 0.0.0.0`; Windows: `start-iq3.ps1 -ListenHost 0.0.0.0`),
+or set `HOST` / `LLAMA_ARG_HOST` (e.g. `HOST=0.0.0.0 scripts/start-iq3.sh`). Open
+firewall ports for LAN clients. To require a key, pass `--api-key sk-xxx` to the
+server or Linux launchers (`start-iq3.sh --api-key sk-xxx`), or `-ApiKey 'sk-xxx'`
+/ `-ApiKeyFile path` on Windows (mirroring llama-server); every route except
+`/health` then needs `Authorization: Bearer sk-xxx` (or `X-Api-Key: sk-xxx`).
+Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
 
 ## Documentation
 
