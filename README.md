@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **This is a fork version of kvmem-llama.cpp using PrismML fork of llama.cpp, providing the fork's low-bit formats and runtime features.**
+> 
+>  See [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo for further information about  ternary model.
+> 
+>  And do not mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+---
 # KVMem + llama.cpp
 
 **Prebuilt downloads:** [Windows x64 (rc2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
