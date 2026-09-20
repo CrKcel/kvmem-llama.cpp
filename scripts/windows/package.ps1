@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory)][string]$SourceArchive,
     [Parameter(Mandatory)][string]$OutputDir,
     [string]$CudaPath = $env:CUDA_PATH,
+    [switch]$ExperimentalCuda129,
     [string]$CudaLicense,
     [string]$UiDir,
     [string]$ValidationReport,
@@ -138,7 +139,10 @@ if ($cuda) {
     $versionText = $version -join "`n"
     if ($versionText -notmatch 'V(\d+\.\d+\.\d+)') { throw 'Unknown nvcc version' }
     $nvccVersion = $Matches[1]
-    if ([version]$nvccVersion -lt [version]'13.2.86') { throw 'nvcc 13.2.86 or newer is required' }
+    if ($ExperimentalCuda129) {
+        if ($nvccVersion -ne '12.9.86') { throw 'Experimental CUDA 12.9 package requires nvcc 12.9.86' }
+    } elseif ([version]$nvccVersion -lt [version]'13.2.86') { throw 'nvcc 13.2.86 or newer is required' }
+    $info.experimental_cuda129 = [bool]$ExperimentalCuda129
     $compilerRecords = @(Get-ChildItem -LiteralPath (Join-Path $BuildDir 'CMakeFiles') -Filter CMakeCUDACompiler.cmake -Recurse -File)
     if (!$compilerRecords.Count) { throw 'Missing recorded CUDA compiler version' }
     foreach ($record in $compilerRecords) {
