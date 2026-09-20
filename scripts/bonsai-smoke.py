@@ -17,11 +17,18 @@ ap.add_argument('--long', action='store_true', help='Exercise host spill and ret
 ap.add_argument('--records', type=int, default=240)
 ap.add_argument('--kvmem-only', action='store_true')
 ap.add_argument('--decode-tokens', type=int, default=0, help='Also request a sustained prose response')
+ap.add_argument('--context', type=int, default=32768)
+ap.add_argument('--budget', type=int, default=2048)
+ap.add_argument('--reserve', type=int, default=1024)
 ap.add_argument('--out', type=Path, default=Path('logs/bonsai-smoke'))
 ap.add_argument('--cuda', default=r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9')
 args = ap.parse_args()
-if args.records < 8 or not 0 <= args.decode_tokens <= 1024:
-    ap.error('records must be at least 8; decode-tokens must be in 0..1024')
+if args.records < 8 or not 0 <= args.decode_tokens <= args.reserve:
+    ap.error('records must be at least 8; decode-tokens must fit the generation reserve')
+if min(args.budget, args.reserve) < 128 or args.budget % 128 or args.reserve % 128:
+    ap.error('budget and reserve must be positive multiples of 128')
+if args.budget + args.reserve > args.context:
+    ap.error('budget + reserve must fit the context')
 args.out.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
 env['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -59,9 +66,10 @@ simple = [
 ]
 for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
     command = [exe,'-m',str(args.model),'-ngl','99','--host','127.0.0.1','--port',str(args.port),
-        '-c','32768' if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on','--kv-dtype','q8_0','--spec-type','none',
-        '--kvmem-budget','2048','--kvmem-gen-reserve','1024','--kvmem-block-tokens','128',
+        '-c',str(args.context) if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on','--kv-dtype','q8_0','--spec-type','none',
+        '--kvmem-budget',str(args.budget),'--kvmem-gen-reserve',str(args.reserve),'--kvmem-block-tokens','128',
         '--no-ui','--no-kvmem' if mode=='plain' else '--kvmem']
+    results[mode] = {'command':command}
     peak = [0]
     samples = []
     stop = threading.Event()
@@ -94,7 +102,7 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
             contents = [r['choices'][0]['message'].get('content','') for r in responses]
             assert '42' in contents[0], contents
             assert '竹' in contents[1], contents
-            results[mode] = {'short_responses':responses, 'answers':contents}
+            results[mode].update({'short_responses':responses, 'answers':contents})
             print(mode, contents, flush=True)
             if mode == 'kvmem':
                 history = [{'role':'user','content':'Remember this identifier: BAMBOO-7429. Reply OK.'}]
@@ -119,6 +127,7 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
                     history = [{'role':'user','content':'Read this archive and remember its facts. Reply only OK.\n'+'\n'.join(records)}]
                     (args.out/'archive-request.json').write_text(json.dumps(history,indent=2),encoding='utf-8')
                     first = chat(history)
+                    results[mode]['long_retrieval'] = [first]
                     print('archive', first['usage'], 'seconds', round(first['test_wall_seconds'],2), flush=True)
                     history.append(first['choices'][0]['message'])
                     history.append({'role':'user','content':question})
@@ -127,7 +136,7 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
                     answer = second['choices'][0]['message'].get('content','')
                     results[mode]['needle_matches'] = {code:code in answer for code in expected}
                     print('retrieval', json.dumps(results[mode]['needle_matches']), flush=True)
-                    assert first['usage']['prompt_tokens'] > 3072, first['usage']
+                    assert first['usage']['prompt_tokens'] > args.budget + args.reserve, first['usage']
                     if args.decode_tokens:
                         history.append(second['choices'][0]['message'])
                         history.append({'role':'user','content':'Write a detailed 1000-word essay about how astronomical observatories work. Use complete paragraphs and keep writing until the explanation is finished.'})
@@ -135,6 +144,9 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
                         print('sustained', results[mode]['sustained_decode']['usage'], flush=True)
             results[mode]['peak_device_mib'] = peak[0]
             results[mode]['command'] = command
+        except Exception as exc:
+            results[mode]['error'] = repr(exc)
+            raise
         finally:
             if proc.poll() is None:
                 proc.terminate()

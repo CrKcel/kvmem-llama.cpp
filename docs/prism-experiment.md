@@ -1,6 +1,6 @@
 # rc3 Prism baseline experiment
 
-Status: no-MTP adapter port implemented; Windows CUDA build, 11 tests and initial 4K text tests pass. A 32K workload runs on 8GB, but three-code recall fails (1/3 found). This is a local experimental build, not a release. See [validation results](bonsai-validation.md).
+Status: no-MTP adapter port implemented; Windows CUDA build, 11 tests and initial 4K text tests pass. On 8GB, 32K with a 2K retrieval budget recalls 1/3 codes; 64K with a 24K retrieval budget plus 10K reserve recalls 3/3 at a 7454 MiB peak. These are synthetic tests. This is a local experimental build, not a release. See [validation results](bonsai-validation.md).
 
 ## Reproducible baseline
 
