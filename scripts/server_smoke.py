@@ -89,7 +89,7 @@ def main() -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logf = open(log_path, "w")
     cmd = [
-        str(find_server()), "-m", str(args.model),
+        str(find_server()), "--verbosity", "4", "-m", str(args.model),
         "--host", args.host, "--port", str(args.port),
         "-c", "2048", "-b", "128", "-ngl", "99",
         "--kvmem", "--kvmem-budget", "256", "--kvmem-block-tokens", "32",

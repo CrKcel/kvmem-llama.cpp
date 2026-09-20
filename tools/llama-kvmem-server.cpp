@@ -1,3 +1,4 @@
+#include "llama-kvmem-diag.h"
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
@@ -15,6 +16,9 @@
 
 #include "chat.h"
 #include "common.h"
+#include "log.h"
+#include "kvmem-server-log.h"
+#include "mtmd-helper.h"
 #include "arg.h"
 #include "json.h"
 #include "build-info.h"
@@ -55,6 +59,10 @@ static void print_usage(const char * argv0) {
             "  --no-mmproj-offload        place vision encoder on CPU\n"
             "  --image-min-tokens N       native minimum image token count\n"
             "  --image-max-tokens N       native maximum image token count\n"
+            "  -lv, --verbosity N         log level: 0 silent, 1 error, 2 warn, 3 info (default), 4 trace, 5 debug\n"
+            "  --log-verbosity N          alias of --verbosity\n"
+            "  --kvmem-trace              raw KVMEM_* diagnostics (or KVMEM_TRACE=1)\n"
+            "  --no-kvmem-trace           disable diagnostics, overriding the environment\n"
             "  --host HOST                bind address (default 127.0.0.1)\n"
             "  --port N                   port (default 8080)\n"
             "  --ui-dir PATH              serve static chat UI from PATH\n"
@@ -98,6 +106,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem / --no-kvmem       enable KVMem (default on)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx\n"
             "  --kvmem-block-tokens N     block size (default 128)\n"
+            "  --kvmem-sink-tokens N      always-kept prefix; default 0 = one block; rounds down, minimum one block\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
@@ -115,7 +124,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
-            "  -ctv, --cache-type-v TYPE  GPU V cache type (must match K when quantized)\n"
+            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: match K, or K=q8_0 V=q4_0)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
@@ -204,6 +213,7 @@ struct MultimodalQuery {
 struct ServerState {
     std::mutex mu;
     kvmem_server_progress progress;
+    kvmem_server_log log;
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -383,7 +393,7 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
         }
     }
     rmax = llama_kvmem_recr_pos_max();
-    fprintf(stderr, "KVMEM_TRACE gdn_sync ckpt_pos=%d from=%d n_past=%d rmax=%d\n",
+    kvmem_diag("KVMEM_TRACE gdn_sync ckpt_pos=%d from=%d n_past=%d rmax=%d\n",
             ckpt_pos, from, n_past, (int) rmax);
     return rmax == want;
 }
@@ -444,7 +454,7 @@ static void persist_gdn_ckpt_gen_start(ServerState & st, int eval_end) {
     const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     const size_t sz = llama_state_seq_get_size_ext(st.ctx, 0, fl);
     if (sz == 0) {
-        fprintf(stderr, "KVMEM_TRACE gdn_ckpt gen_start skipped size=0 eval_end=%d\n", eval_end);
+        kvmem_diag("KVMEM_TRACE gdn_ckpt gen_start skipped size=0 eval_end=%d\n", eval_end);
         return;
     }
     std::vector<uint8_t> buf(sz);
@@ -455,8 +465,7 @@ static void persist_gdn_ckpt_gen_start(ServerState & st, int eval_end) {
     st.gdn_ckpt.swap(buf);
     if (st.spec.ok) common_speculative_get_state(st.spec.spec, 0, st.gdn_carry);
     st.gdn_ckpt_pos = eval_end - 1;
-    fprintf(stderr,
-            "KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu ckpt_pos=%d what=gen_start\n",
+    kvmem_diag("KVMEM_TRACE gdn_ckpt pos_end=%d bytes=%zu ckpt_pos=%d what=gen_start\n",
             eval_end, sz, st.gdn_ckpt_pos);
 }
 
@@ -467,7 +476,7 @@ static void commit_cached(ServerState & st, const std::vector<llama_token> & pro
     st.last_n_gen = (int) gen.size();
     if (st.vision || st.query_policy_user) multimodal_commit(st, gen);
     else st.cached_prompt = st.active_prompt->with_generated(gen);
-    fprintf(stderr, "KVMEM_TRACE cache_commit n_prompt=%d n_gen=%d n_cached=%d stored=%u\n",
+    kvmem_diag("KVMEM_TRACE cache_commit n_prompt=%d n_gen=%d n_cached=%d stored=%u\n",
             (int) prompt.size(), (int) gen.size(), (int) st.cached_tokens.size(),
             llama_kvmem_store_n_tokens());
 }
@@ -487,7 +496,7 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
     int n_pos = pos0;
     while (n_pos < pos1) {
         if (!stream_heartbeat(io)) {
-            fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
+            kvmem_diag("KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
                     n_pos, what ? what : "");
             llama_batch_free(batch);
             return KVMEM_DECODE_ABORT;
@@ -524,7 +533,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                                  StreamIo * io = nullptr, int * n_cache_hit = nullptr) {
     if (st.vision || st.query_policy_user) return run_prefill_multimodal(st, io, n_cache_hit);
     if (!stream_heartbeat(io)) {
-        fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill_start n_prompt=%d\n",
+        kvmem_diag("KVMEM_TRACE stream_abort phase=prefill_start n_prompt=%d\n",
                 (int) prompt.size());
         return false;
     }
@@ -550,8 +559,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                                          : (uint32_t) st.cached_tokens.size();
     if (!st.cached_tokens.empty() && n_prompt > 1) {
         const int lcp = common_token_prefix(st.cached_tokens, prompt);
-        fprintf(stderr,
-                "KVMEM_TRACE prefix_try lcp=%d n_cached=%d stored=%u n_prompt=%d\n",
+        kvmem_diag("KVMEM_TRACE prefix_try lcp=%d n_cached=%d stored=%u n_prompt=%d\n",
                 lcp, (int) st.cached_tokens.size(), stored, n_prompt);
         reused = lcp > 0 && lcp < n_prompt && stored >= (uint32_t) lcp;
         if (reused) {
@@ -582,8 +590,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     const bool suffix_cont = reused
             && (uint32_t) (n_cached - n_past) <= suffix_slack;
     if (reused && !suffix_cont) {
-        fprintf(stderr,
-                "KVMEM_TRACE prefix_rewrite drop_reuse=1 n_past=%d n_cached=%d "
+        kvmem_diag("KVMEM_TRACE prefix_rewrite drop_reuse=1 n_past=%d n_cached=%d "
                 "n_prompt=%d last_n_gen=%d slack=%u same_query=%d\n",
                 n_past, n_cached, n_prompt, st.last_n_gen, suffix_slack,
                 (int) same_query);
@@ -653,8 +660,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     // a mandatory catch-up.
     const bool recr_ckpt = do_retr && replay_fits && llama_kvmem_has_recurrent() &&
             !warm_skip && !past_query;
-    fprintf(stderr,
-            "KVMEM_TRACE prefix_reuse reused=%d n_past=%d n_prompt=%d n_cached=%d "
+    kvmem_diag("KVMEM_TRACE prefix_reuse reused=%d n_past=%d n_prompt=%d n_cached=%d "
             "n_new=%d stored=%u query=[%d,%d) replay_fits=%d warm_skip=%d "
             "same_query=%d suffix_cont=%d last_n_gen=%d slack=%u "
             "gdn_rmax=%d kv_smax=%d free_slots=%u need_slots=%u\n",
@@ -709,7 +715,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         const llama_perf_context_data p = llama_perf_context(ctx);
         const int d = p.n_p_eval - st.perf_p_eval;
         st.perf_p_eval = p.n_p_eval;
-        fprintf(stderr, "KVMEM_TRACE prefix_prefill n_p_eval=%d reused=%d n_past=%d n_new=%d\n",
+        kvmem_diag("KVMEM_TRACE prefix_prefill n_p_eval=%d reused=%d n_past=%d n_new=%d\n",
                 d, (int) reused, n_past, eval_end - n_past);
     };
     auto commit_last_query = [&](bool ok) {
@@ -725,8 +731,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     };
 
     if (warm_skip) {
-        fprintf(stderr,
-                "KVMEM_TRACE query_replay_skip_same query=[%d,%d) n_past=%d n_new=%d\n",
+        kvmem_diag("KVMEM_TRACE query_replay_skip_same query=[%d,%d) n_past=%d n_new=%d\n",
                 q0, q1, n_past, eval_end - n_past);
         if (!dec(n_past, eval_end, "prefill-tail")) {
             return false;
@@ -734,7 +739,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         if (st.spec.ctx_dft) {
             llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
             if (md) {
-                fprintf(stderr, "KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
+                kvmem_diag("KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
                         llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
             }
         }
@@ -749,8 +754,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     // the window (usually gen-reserve full). Reuse the captured Q for top-k;
     // do not llama_decode at q0 (M-RoPE requires seq_pos_max < q0).
     if (do_retr && reused && suffix_cont && same_query && past_query) {
-        fprintf(stderr,
-                "KVMEM_TRACE query_reuse_q reselect=1 query=[%d,%d) n_past=%d n_new=%d\n",
+        kvmem_diag("KVMEM_TRACE query_reuse_q reselect=1 query=[%d,%d) n_past=%d n_new=%d\n",
                 q0, q1, n_past, eval_end - n_past);
         llama_kvmem_apply_retrieval(ctx);
         if (!dec(n_past, eval_end, "prefill-tail")) {
@@ -759,7 +763,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         if (st.spec.ctx_dft) {
             llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
             if (md) {
-                fprintf(stderr, "KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
+                kvmem_diag("KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
                         llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
             }
         }
@@ -787,7 +791,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     std::vector<uint8_t> gdn_ckpt;
     if (recr_ckpt) {
         if (n_past > q0 && !gdn_sync_to(st, prompt, q0, io)) {
-            fprintf(stderr, "KVMEM_TRACE gdn_sync to query_begin failed\n");
+            LOG_ERR("srv    KVMEM_TRACE gdn_sync to query_begin failed\n");
             return false;
         }
         llama_synchronize(ctx);
@@ -805,8 +809,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         st.gdn_ckpt_query = gdn_ckpt;
         if (st.spec.ok) common_speculative_get_state(st.spec.spec, 0, st.gdn_query_carry);
         st.gdn_ckpt_query_pos = q0 > 0 ? q0 - 1 : -1;
-        fprintf(stderr,
-                "KVMEM_TRACE gdn_ckpt_query pos_end=%d bytes=%zu query_begin=%d ckpt_pos=%d\n",
+        kvmem_diag("KVMEM_TRACE gdn_ckpt_query pos_end=%d bytes=%zu query_begin=%d ckpt_pos=%d\n",
                 q0, sz, q0, st.gdn_ckpt_query_pos);
     }
     // Query may already sit inside the reused prefix (T5: last user, then
@@ -824,14 +827,14 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     } else if (!replay(q0, q1, "query-q-capture")) {
         return false;
     }
-    fprintf(stderr, "KVMEM_TRACE query_q_capture n_past=%d query=[%d,%d) recapture=%d\n",
+    kvmem_diag("KVMEM_TRACE query_q_capture n_past=%d query=[%d,%d) recapture=%d\n",
             n_past, q0, q1, (int) (n_past > q0));
     llama_synchronize(ctx);
     {
         const llama_perf_context_data p = llama_perf_context(ctx);
         const int d = p.n_p_eval - st.perf_p_eval;
         st.perf_p_eval = p.n_p_eval;
-        fprintf(stderr, "KVMEM_TRACE prefix_prefill n_p_eval=%d reused=%d n_past=%d n_new=%d\n",
+        kvmem_diag("KVMEM_TRACE prefix_prefill n_p_eval=%d reused=%d n_past=%d n_new=%d\n",
                 d, (int) reused, n_past, eval_end - n_past);
     }
 
@@ -843,8 +846,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     if (tail_fits_gen) {
         llama_kvmem_apply_retrieval(ctx);
         if (!replay_fits) {
-            fprintf(stderr,
-                    "KVMEM_TRACE query_replay_skip query=[%d,%d) eval_end=%d "
+            kvmem_diag("KVMEM_TRACE query_replay_skip query=[%d,%d) eval_end=%d "
                     "(sink+suffix exceeds GPU budget)\n",
                     q0, q1, eval_end);
         } else {
@@ -854,15 +856,15 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                     fprintf(stderr, "GDN restore failed\n");
                     return false;
                 }
-                fprintf(stderr, "KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
+                kvmem_diag("KVMEM_TRACE gdn_restore bytes=%zu\n", gdn_ckpt.size());
             }
             llama_memory_t mem = llama_get_memory(ctx);
             if (mem) {
-                fprintf(stderr, "KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",
+                kvmem_diag("KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",
                         llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
                         q0, q1);
                 llama_memory_seq_rm(mem, 0, q0, q1);
-                fprintf(stderr, "KVMEM_TRACE after_seq_rm seq_pos=[%d,%d] auto_pos0=%d\n",
+                kvmem_diag("KVMEM_TRACE after_seq_rm seq_pos=[%d,%d] auto_pos0=%d\n",
                         llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
                         llama_memory_seq_pos_max(mem, 0) + 1);
             }
@@ -870,7 +872,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                 llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
                 if (md) {
                     llama_memory_seq_rm(md, 0, q0, q1);
-                    fprintf(stderr, "KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
+                    kvmem_diag("KVMEM_TRACE mtp_after_seq_rm seq_pos=[%d,%d]\n",
                             llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
                 }
             }
@@ -878,7 +880,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                 return false;
             }
             llama_synchronize(ctx);
-            fprintf(stderr, "KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
+            kvmem_diag("KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
                     q0, q1 - q0, (int) recr_ckpt);
             if (st.spec.ctx_dft && !past_query) {
                 // First pass of this query: seq_rm left a hole in the draft cache.
@@ -894,7 +896,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                     if (!take_rc(rc)) {
                         return false;
                     }
-                    fprintf(stderr, "KVMEM_TRACE mtp_resync query=[%d,%d) to=%d\n", q0, q1, q1);
+                    kvmem_diag("KVMEM_TRACE mtp_resync query=[%d,%d) to=%d\n", q0, q1, q1);
                 }
             }
         }
@@ -904,8 +906,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     } else {
         // Compact / long history after last-user: tail is not this turn's
         // decode slack. Prefill with spill, then retrieve.
-        fprintf(stderr,
-                "KVMEM_TRACE prefill_tail_offload n=%u gen_reserve=%u query=[%d,%d)\n",
+        kvmem_diag("KVMEM_TRACE prefill_tail_offload n=%u gen_reserve=%u query=[%d,%d)\n",
                 tail_tok, gen_res, q0, q1);
         if (!dec(tail0, eval_end, "prefill-tail")) {
             return false;
@@ -915,7 +916,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     if (st.spec.ctx_dft) {
         llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
         if (md) {
-            fprintf(stderr, "KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
+            kvmem_diag("KVMEM_TRACE mtp_after_query_replay seq_pos=[%d,%d]\n",
                     llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
         }
     }
@@ -1021,8 +1022,7 @@ static void derive_query_span(ServerState & st, const std::string & prompt, cons
         const std::string through = prompt.substr(0, c1);
         qbegin = (int) tokenize_text(st.vocab, prefix, true).size();
         qend = (int) tokenize_text(st.vocab, through, true).size();
-        fprintf(stderr,
-                "KVMEM_TRACE query_loc method=role_block n_user_blocks=%d pick=%d "
+        kvmem_diag("KVMEM_TRACE query_loc method=role_block n_user_blocks=%d pick=%d "
                 "span=[%zu,%zu) tokens=[%d,%d)\n",
                 n_blocks, pick, c0, c1, qbegin, qend);
     }
@@ -1033,7 +1033,7 @@ static void derive_query_span(ServerState & st, const std::string & prompt, cons
         qend = (int) toks.size();
         const int last = std::min(st.query_last_fallback, qend);
         qbegin = qend > last ? qend - last : 0;
-        fprintf(stderr, "KVMEM_TRACE query_loc method=query_last tokens=[%d,%d)\n",
+        kvmem_diag("KVMEM_TRACE query_loc method=query_last tokens=[%d,%d)\n",
                 qbegin, qend);
     }
     if (qbegin >= qend) {
@@ -1082,15 +1082,14 @@ static bool derive_native_query_span(const ServerState & st, const std::string &
     for (int row = begin; row < end; ++row)
         text += common_token_to_piece(st.vocab, prompt.tokens[row], false);
     if (trim_copy(text).empty()) return false;
-    fprintf(stderr, "KVMEM_TRACE query_loc method=native_role pick=%d tokens=[%d,%d)\n", pick, begin, end);
+    kvmem_diag("KVMEM_TRACE query_loc method=native_role pick=%d tokens=[%d,%d)\n", pick, begin, end);
     return true;
 }
 
 static void clamp_query_span(const ServerState & st, int & qbegin, int & qend) {
     const int cap = st.query_max_tokens;
     if (cap > 0 && qend > qbegin && (qend - qbegin) > cap) {
-        fprintf(stderr,
-                "KVMEM_TRACE query_clamp span=[%d,%d) tokens=%d cap=%d -> [%d,%d)\n",
+        kvmem_diag("KVMEM_TRACE query_clamp span=[%d,%d) tokens=%d cap=%d -> [%d,%d)\n",
                 qbegin, qend, qend - qbegin, cap, qend - cap, qend);
         qbegin = qend - cap;
     }
@@ -1224,7 +1223,7 @@ static common_chat_msg parse_assistant_output(
         }
         return msg;
     } catch (const std::exception & e) {
-        fprintf(stderr, "KVMEM_TRACE chat_out_parse_fail %s\n", e.what());
+        LOG_WRN("srv    KVMEM_TRACE chat_out_parse_fail %s\n", e.what());
         common_chat_msg msg;
         msg.role = "assistant";
         msg.content = content;
@@ -1311,7 +1310,7 @@ struct StreamChatOut {
             }
         } catch (const std::exception & e) {
             if (!partial) {
-                fprintf(stderr, "KVMEM_TRACE chat_stream_parse_fail %s\n", e.what());
+                LOG_WRN("srv    KVMEM_TRACE chat_stream_parse_fail %s\n", e.what());
             }
         }
         return chunks;
@@ -1530,6 +1529,8 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 }
 
 int main(int argc, char ** argv) {
+    // Flush asynchronous common logs on every exit, including startup errors.
+    struct log_flush_guard { ~log_flush_guard() { common_log_flush(common_log_main()); } } flush_logs;
     std::string ui_dir;
     bool no_ui = false;
     std::string model_path;
@@ -1559,6 +1560,7 @@ int main(int argc, char ** argv) {
     st.kparams.force_pos = -1;
 
     json config_sources = json::object();
+    std::vector<std::pair<std::string, std::string>> config_inputs;
     std::string argument_source = "environment";
     try {
     kvmem_check_environment(kvmem_process_environment());
@@ -1567,6 +1569,7 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < arguments.size(); ++i) {
         argument_source = arguments[i].source;
         const char * arg = kvmem_server_arg_alias(arguments[i].value.c_str());
+        if (argument_source != "cli") config_inputs.emplace_back(arg, argument_source);
         const auto config_key = kvmem_config_key(arg);
         if (eq(arg, "--api-key") || eq(arg, "--api-key-file")) {
             if (!config_sources.contains(config_key)) config_sources[config_key] = json::array();
@@ -1574,8 +1577,6 @@ int main(int argc, char ** argv) {
         } else {
             config_sources[config_key] = argument_source;
         }
-        if (argument_source != "cli")
-            fprintf(stderr, "KVMEM_CONFIG input=%s source=%s\n", arg, argument_source.c_str());
         auto need = [&](const char * name) -> const char * {
             if (i + 1 >= arguments.size()) throw std::invalid_argument(std::string("missing value for ") + name);
             return arguments[++i].value.c_str();
@@ -1788,6 +1789,22 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    st.kparams.sink_tokens = static_cast<uint32_t>(options.sink_tokens);
+    // Some pinned llama.cpp trace sites test presence rather than the value.
+    // Normalize "0"/empty and CLI-off to an absent variable before loading models.
+    const bool trace = options.trace == -1 ? kvmem_diag_enabled() : options.trace != 0;
+#ifdef _WIN32
+    if (_putenv_s("KVMEM_TRACE", trace ? "1" : "") != 0)
+#else
+    if ((trace ? setenv("KVMEM_TRACE", "1", 1) : unsetenv("KVMEM_TRACE")) != 0)
+#endif
+        throw std::runtime_error("cannot configure KVMEM_TRACE");
+    kvmem_diag_set(trace);
+    common_log_set_verbosity_thold(options.verbosity);
+    for (const auto & input : config_inputs) {
+        // Only option names and sources, never values (which may contain API keys).
+        kvmem_diag("KVMEM_CONFIG input=%s source=%s\n", input.first.c_str(), input.second.c_str());
+    }
     } catch (const std::exception & e) {
         fprintf(stderr, "invalid arguments (source=%s): %s\n", argument_source.c_str(), e.what());
         return 1;
@@ -1800,7 +1817,7 @@ int main(int argc, char ** argv) {
 #endif
     // Validate before backend initialization and loading a potentially large model.
     if (!kvmem_cache_types_ok(st.cache_type_k, st.cache_type_v)) {
-        fprintf(stderr, "incompatible KV cache types: K=%s, V=%s; quantized K/V must match; "
+        fprintf(stderr, "incompatible KV cache types: K=%s, V=%s; quantized K/V must match or use K=q8_0 V=q4_0; "
                 "set both -ctk and -ctv, or use --kv-dtype TYPE to set both\n",
                 ggml_type_name(st.cache_type_k), ggml_type_name(st.cache_type_v));
         return 1;
@@ -1846,10 +1863,7 @@ int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
     common_init();
-    llama_log_set([](enum ggml_log_level, const char * text, void *) {
-        fputs(text, stderr);
-        fflush(stderr);
-    }, nullptr);
+    mtmd_helper_log_set(common_log_default_callback, nullptr);
     ggml_backend_load_all();
 
     // No speculative rollback state is needed without MTP.
@@ -1896,14 +1910,16 @@ int main(int argc, char ** argv) {
         {"context_requested", n_ctx}, {"batch_requested", st.n_batch},
         {"n_predict", st.n_predict_default},
         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
-        {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve}}},
+        {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
+                   {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
         {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
         {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
         {"auth", {{"enabled", !options.api_keys.empty()}, {"key_count", options.api_keys.size()}}},
         {"sources", config_sources}, {"unlisted_sources", "default"}
     };
-    fprintf(stderr, "KVMEM_STARTUP requested=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+    kvmem_diag("KVMEM_STARTUP requested=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+    LOG_INF("srv    loading model %s\n", model_path.c_str());
     st.model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!st.model) {
         fprintf(stderr, "failed to load model\n");
@@ -1939,7 +1955,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
         return 1;
     }
-    fprintf(stderr, "KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
+    kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
             llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
             llama_flash_attn_type_name(cparams.flash_attn_type));
     if (st.spec_mtp) {
@@ -1980,7 +1996,7 @@ int main(int argc, char ** argv) {
         const int n = options.threads_http > 0 ? options.threads_http :
             std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1);
         svr.new_task_queue = [n] { return new httplib::ThreadPool(n, static_cast<size_t>(n) + 1024); };
-        fprintf(stderr, "KVMEM_HTTP threads=%d timeout=%d\n", n, options.timeout);
+        kvmem_diag("KVMEM_HTTP threads=%d timeout=%d\n", n, options.timeout);
     }
     svr.set_idle_interval(0, 100000);
     svr.set_default_headers({
@@ -2234,7 +2250,7 @@ int main(int argc, char ** argv) {
         clamp_query_span(st, qbegin, qend);
         if (st.turn_query_exact && std::find(toks.begin() + qbegin, toks.begin() + qend, LLAMA_TOKEN_NULL) != toks.begin() + qend) {
             st.turn_query_exact = false;
-            fprintf(stderr, "KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
+            kvmem_diag("KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
         }
         try {
             multimodal_validate_capacity(st, *parsed_prompt, st.query_policy_user ? (int) toks.size() : qbegin, (int) toks.size());
@@ -2263,10 +2279,9 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
-        fprintf(stderr, "KVMEM_TRACE n_prompt=%d query=[%d,%d) force_pos=%d last_user_chars=%zu\n",
+        kvmem_diag("KVMEM_TRACE n_prompt=%d query=[%d,%d) force_pos=%d last_user_chars=%zu\n",
                 (int) toks.size(), qbegin, qend, force, cr.last_user.size());
-        fprintf(stderr,
-                "KVMEM_TRACE chat_parse n_msg=%zu n_tools=%zu tool_choice=%s tool_hist=%d "
+        kvmem_diag("KVMEM_TRACE chat_parse n_msg=%zu n_tools=%zu tool_choice=%s tool_hist=%d "
                 "prompt_has_tool=%d grammar_bytes=%zu think=%d reasoning=%s parser_bytes=%zu\n",
                 cr.msgs.size(), cr.tools.size(), tool_choice_cstr(cr.tool_choice),
                 n_tool_hist, (int) prompt_has_tool, formatted.grammar.size(),
@@ -2285,15 +2300,13 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", err}}.dump(), "application/json");
             return;
         }
-        fprintf(stderr,
-                "KVMEM_TRACE sampling thinking=%d temperature=%.6g top_p=%.6g top_k=%d min_p=%.6g "
+        kvmem_diag("KVMEM_TRACE sampling thinking=%d temperature=%.6g top_p=%.6g top_k=%d min_p=%.6g "
                 "presence_penalty=%.6g frequency_penalty=%.6g repetition_penalty=%.6g seed=%u\n",
                 (int) cr.enable_thinking, sparams.temp, sparams.top_p, sparams.top_k, sparams.min_p,
                 sparams.penalty_present, sparams.penalty_freq, sparams.penalty_repeat, sparams.seed);
         std::vector<std::string> stops = cr.stop;
         stops.insert(stops.end(), formatted.additional_stops.begin(), formatted.additional_stops.end());
-        fprintf(stderr,
-                "KVMEM_TRACE chat_sample grammar_type=%s lazy=%d n_trig=%zu gen_prompt_bytes=%zu "
+        kvmem_diag("KVMEM_TRACE chat_sample grammar_type=%s lazy=%d n_trig=%zu gen_prompt_bytes=%zu "
                 "think_start_bytes=%zu think_end_n=%zu rbudget=%d start_toks=%zu end_seqs=%zu forced_toks=%zu\n",
                 grammar_type_cstr(sparams.grammar.type), (int) sparams.grammar_lazy,
                 sparams.grammar_triggers.size(), sparams.generation_prompt.size(),
@@ -2330,6 +2343,8 @@ int main(int argc, char ** argv) {
         request_params["max_tokens"] = cr.max_tokens;
         request_params["temperature"] = sparams.temp;
         st.progress.prompt((int) toks.size(), cr.max_tokens, std::move(request_params));
+        st.log.start();
+        LOG_INF("slot   processing task, n_prompt = %d, n_predict = %d\n", (int) toks.size(), cr.max_tokens);
         auto timings = std::make_shared<json>(json::object());
         // 1:1 upstream timings block (server-context.cpp): prompt/predicted counts, ms, per-token and per-second rates.
         // 中文：对齐上游的 timings 统计块——prompt/predicted 的计数、耗时、每 token 与每秒速率，供 /v1 响应回传
@@ -2340,8 +2355,10 @@ int main(int argc, char ** argv) {
             const int cache_n = std::clamp(n_cache_hit, 0, n_prompt);
             const int prompt_n = n_prompt - cache_n;
             st.progress.prefilled(cache_n);
+            st.log.start_generation();
             return [timings, &st, t_turn0, t_pf1, prefill_ms, n_prompt, prompt_n, cache_n](int n_gen, bool verbose = true) {
                 st.progress.generated(n_gen);
+                st.log.generated(n_gen);
                 const auto now = std::chrono::steady_clock::now();
                 const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
                 const double prompt_per_second = prefill_ms > 0.0 ? 1000.0 * (double) prompt_n / prefill_ms : 0.0;
@@ -2360,11 +2377,15 @@ int main(int argc, char ** argv) {
                 if (!verbose) {
                     return;
                 }
+                LOG_INF("slot   prompt eval time = %10.2f ms / %5d tokens (%8.2f tokens per second), cache = %d\n",
+                        prefill_ms, prompt_n, prompt_per_second, cache_n);
+                LOG_INF("slot          eval time = %10.2f ms / %5d tokens (%8.2f tokens per second)\n",
+                        gen_ms, n_gen, predicted_per_second);
+                LOG_INF("slot         total time = %10.2f ms / %5d tokens\n", prefill_ms + gen_ms, prompt_n + n_gen);
                 const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
                 const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
-                fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
-                fprintf(stderr,
-                        "KVMEM_CHAT_TURN n_prompt=%d n_gen=%d prefill_ms=%.2f gen_ms=%.2f "
+                kvmem_diag("KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
+                kvmem_diag("KVMEM_CHAT_TURN n_prompt=%d n_gen=%d prefill_ms=%.2f gen_ms=%.2f "
                         "wall_ms=%.2f gen_toks=%.2f\n",
                         n_prompt, n_gen, prefill_ms, gen_ms, wall_ms, tps);
             };
@@ -2390,7 +2411,7 @@ int main(int argc, char ** argv) {
             } catch (const std::exception &) {
                 message = json{{"role", "assistant"}, {"content", content}};
             }
-            fprintf(stderr, "KVMEM_TRACE chat_out n_tool_calls=%zu finish=%s content_chars=%zu reasoning_chars=%zu\n",
+            kvmem_diag("KVMEM_TRACE chat_out n_tool_calls=%zu finish=%s content_chars=%zu reasoning_chars=%zu\n",
                     msg.tool_calls.size(), finish.c_str(),
                     msg.content.size(), msg.reasoning_content.size());
             json out = {
@@ -2447,7 +2468,7 @@ int main(int argc, char ** argv) {
                     const auto t_pf1 = std::chrono::steady_clock::now();
                     const double prefill_ms =
                             std::chrono::duration<double, std::milli>(t_pf1 - t_turn0).count();
-                    fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
+                    kvmem_diag("KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
                             prefill_ms, (int) toks.size());
                     llama_kvmem_end_prefill_capture();
                     st.mm_live_checkpoint.reset();
@@ -2544,8 +2565,7 @@ int main(int argc, char ** argv) {
                             send(stream_choice_chunk(cid, st.model_name, created, flush_deltas[i], nullptr, ts).dump());
                         }
                         const char * finish = sco.finish_reason(hit_limit);
-                        fprintf(stderr,
-                                "KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s "
+                        kvmem_diag("KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s "
                                 "content_chars=%zu reasoning_chars=%zu\n",
                                 sco.n_tc_delta, finish,
                                 sco.prev.content.size(), sco.prev.reasoning_content.size());
@@ -2576,8 +2596,7 @@ int main(int argc, char ** argv) {
                         send(stream_choice_chunk(cid, st.model_name, created, flush_deltas[i], nullptr, ts).dump());
                     }
                     const char * finish = sco.finish_reason(hit_limit);
-                    fprintf(stderr,
-                            "KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s "
+                    kvmem_diag("KVMEM_TRACE chat_stream n_tc_delta=%d finish=%s "
                             "content_chars=%zu reasoning_chars=%zu\n",
                             sco.n_tc_delta, finish,
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
@@ -2605,7 +2624,7 @@ int main(int argc, char ** argv) {
         const auto t_turn0 = std::chrono::steady_clock::now();
         if (!run_prefill_retrieval(st, toks, &io, &n_cache_hit)) {
             if (io.aborted) {
-                fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill n_prompt=%d\n",
+                kvmem_diag("KVMEM_TRACE stream_abort phase=prefill n_prompt=%d\n",
                         (int) toks.size());
                 return;
             }
@@ -2616,7 +2635,7 @@ int main(int argc, char ** argv) {
         const auto t_pf1 = std::chrono::steady_clock::now();
         const double prefill_ms =
                 std::chrono::duration<double, std::milli>(t_pf1 - t_turn0).count();
-        fprintf(stderr, "KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
+        kvmem_diag("KVMEM_CHAT_PREFILL ms=%.2f n_prompt=%d\n",
                 prefill_ms, (int) toks.size());
         llama_kvmem_end_prefill_capture();
         st.mm_live_checkpoint.reset();
@@ -2631,6 +2650,7 @@ int main(int argc, char ** argv) {
                         gen.push_back(id);
                         content += piece;
                         st.progress.generated((int) gen.size());
+                        st.log.generated((int) gen.size());
                     }, [&]() { return !stream_heartbeat(&io); },
                     st.active_prompt->model_pos(toks.size()) - (llama_pos) toks.size());
             if (gst.failed) {
@@ -2701,6 +2721,7 @@ int main(int argc, char ** argv) {
             content += piece;
             gen.push_back(id);
             st.progress.generated((int) gen.size());
+            st.log.generated((int) gen.size());
             if (strip_stop(content, stops)) {
                 break;
             }
@@ -2719,8 +2740,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR cannot bind %s:%d; check --host/--port, permissions and port conflicts\n", host.c_str(), port);
         return 1;
     }
-    fprintf(stderr, "KVMEM_STARTUP ready=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
-    fprintf(stderr, "llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
+    kvmem_diag("KVMEM_STARTUP ready=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+    LOG_INF("srv    llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
             st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,

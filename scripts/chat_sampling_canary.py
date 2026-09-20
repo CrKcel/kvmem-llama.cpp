@@ -37,6 +37,7 @@ def main():
     folder.mkdir()
     print('ARTIFACTS', folder, flush=True)
     env = os.environ.copy()
+    env['KVMEM_TRACE'] = '1'  # Sampling records are opt-in diagnostics.
     env['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
     env['CUDA_VISIBLE_DEVICES'] = 'GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29'
     env['LD_LIBRARY_PATH'] = str(ROOT / 'build/bin') + ':/home/leye/kvmem_qw3/.cu13-env/lib'

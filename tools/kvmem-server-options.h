@@ -60,6 +60,9 @@ inline int kvmem_cli_gpu_layers(const char * option, const char * value) {
 }
 
 struct kvmem_server_options {
+    int sink_tokens = 0; // Zero keeps one block; positive values round down to whole blocks.
+    int verbosity = 3; // Same default and levels as llama-server.
+    int trace = -1; // -1 inherits KVMEM_TRACE; CLI overrides only after parsing.
     int threads = -1;
     int threads_batch = -1;
     int ubatch = 0; // Omission preserves the existing batch-size default.
@@ -148,7 +151,13 @@ struct kvmem_server_options {
 
     template<typename Need>
     bool parse(const std::string & arg, const Need & need) {
-        if (arg == "-to" || arg == "--timeout") {
+        if (arg == "--kvmem-sink-tokens") {
+            sink_tokens = kvmem_cli_int(arg.c_str(), need(arg.c_str()));
+        } else if (arg == "--kvmem-trace" || arg == "--no-kvmem-trace") {
+            trace = arg == "--kvmem-trace" ? 1 : 0;
+        } else if (arg == "-lv" || arg == "--verbosity" || arg == "--log-verbosity") {
+            verbosity = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 0, 5);
+        } else if (arg == "-to" || arg == "--timeout") {
             timeout = kvmem_cli_int(arg.c_str(), need(arg.c_str()));
         } else if (arg == "--threads-http") {
             threads_http = kvmem_cli_int(arg.c_str(), need(arg.c_str()), std::numeric_limits<int>::min(),

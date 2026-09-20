@@ -49,6 +49,13 @@ public class ArgvEcho {
         Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq $budget) 'retrieval budget'
         Check ($a[[Array]::IndexOf($a, '--kv-dtype') + 1] -eq $kv) 'KV type'
         Check ($a -contains $vision) 'vision placement'
+        $mixed = & (Join-Path $PSScriptRoot "start-$recipe.ps1") -BuildDir $temp -Model $model -Mmproj $mmproj `
+            -Gpu 0 -CacheTypeK q8_0 -CacheTypeV q4_0 -DryRun | ConvertFrom-Json
+        $a = $mixed.argv
+        Check ($a[[Array]::IndexOf($a, '--cache-type-k') + 1] -eq 'q8_0') 'mixed K type'
+        Check ($a[[Array]::IndexOf($a, '--cache-type-v') + 1] -eq 'q4_0') 'mixed V type'
+        Check ([Array]::IndexOf($a, '--cache-type-k') -gt [Array]::IndexOf($a, '--kv-dtype')) 'K overrides recipe'
+        Check ([Array]::IndexOf($a, '--cache-type-v') -gt [Array]::IndexOf($a, '--kv-dtype')) 'V overrides recipe'
     }
     $failed = $false
     try { & (Join-Path $PSScriptRoot 'start-server.ps1') -Recipe iq3 -BuildDir $temp -Model $model -Mmproj $mmproj -Gpu 0 -ChatTemplateKwargs '[]' -DryRun }

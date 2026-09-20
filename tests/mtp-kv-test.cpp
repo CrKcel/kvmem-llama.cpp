@@ -50,7 +50,7 @@ static void compare(ggml_tensor * tensor, const std::vector<uint8_t> & expected)
     require(actual == expected, "MTP KV bytes differ (including untouched rows)");
 }
 
-static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type) {
+static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type_k, ggml_type type_v) {
     auto * kv = mtp.get_kv();
     require(kv->get_layer_ids().size() == 1, "test requires one MTP layer");
     const int il = kv->get_layer_ids().front();
@@ -82,7 +82,7 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type) {
     std::vector<uint8_t> original[2];
     for (int i = 0; i < 2; ++i) {
         auto * t = tensors[i];
-        require(t && t->type == type, "draft did not inherit requested KV type");
+        require(t && t->type == (i == 0 ? type_k : type_v), "draft did not inherit requested KV type");
         require(!ggml_backend_buffer_is_host(t->buffer), "test requires GPU KV");
         original[i] = pattern(ggml_nbytes(t), 42 + i);
         ggml_backend_tensor_set(t, original[i].data(), 0, original[i].size());
@@ -99,7 +99,7 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type) {
     for (int i = 0; i < 2; ++i) {
         expected[i].assign(original[i].size(), 0xa5);
         ggml_backend_tensor_set(tensors[i], expected[i].data(), 0, expected[i].size());
-        const size_t row = ggml_row_size(type, tensors[i]->ne[0]);
+        const size_t row = ggml_row_size(tensors[i]->type, tensors[i]->ne[0]);
         for (uint32_t id = 0; id < 3; ++id) {
             const size_t size = store.blocks()[id].n_tokens * row;
             std::copy_n(original[i].data() + id * block * row, size,
@@ -129,7 +129,7 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type) {
     };
     for (int i = 0; i < 2; ++i) {
         const auto before = expected[i];
-        const size_t row = ggml_row_size(type, tensors[i]->ne[0]);
+        const size_t row = ggml_row_size(tensors[i]->type, tensors[i]->ne[0]);
         for (const auto & move : moves) {
             std::copy_n(before.data() + move.src_slot * block * row, move.n_tokens * row,
                         expected[i].data() + move.dst_slot * block * row);
@@ -141,7 +141,7 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type) {
     }
 }
 
-static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type) {
+static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type_k, ggml_type type_v) {
     auto * kv = mem.get_kv();
     auto & store = mem.runtime().store();
     const uint32_t block = mem.block_tokens();
@@ -166,7 +166,9 @@ static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type) {
     require(!mem.query_contains(10), "frozen Q can still accumulate");
     mem.freeze_query(false);
     mem.set_query_span(-1, -1);
-    for (auto * tensor : tensors) {
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        auto * tensor = tensors[i];
+        require(tensor->type == (i % 2 == 0 ? type_k : type_v), "target KV type differs");
         original.push_back(pattern(ggml_nbytes(tensor), 123 + tensors.size()));
         ggml_backend_tensor_set(tensor, original.back().data(), 0, original.back().size());
     }
@@ -175,7 +177,7 @@ static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type) {
     for (size_t i = 0; i < tensors.size(); ++i) {
         expected.emplace_back(original[i].size(), 0x5a);
         ggml_backend_tensor_set(tensors[i], expected[i].data(), 0, expected[i].size());
-        const size_t row = ggml_row_size(type, tensors[i]->ne[0]);
+        const size_t row = ggml_row_size(tensors[i]->type, tensors[i]->ne[0]);
         for (uint32_t id = 0; id < 3; ++id) {
             std::copy_n(original[i].data() + (3 + 2*id)*block*row, store.blocks()[id].n_tokens*row,
                         expected[i].data() + (2 + 2*id)*block*row);
@@ -192,7 +194,7 @@ static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type) {
     for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], expected[i]);
     for (size_t i = 0; i < tensors.size(); ++i) {
         const auto before = expected[i];
-        const size_t row = ggml_row_size(type, tensors[i]->ne[0]);
+        const size_t row = ggml_row_size(tensors[i]->type, tensors[i]->ne[0]);
         for (uint32_t id = 0; id < 3; ++id) {
             std::copy_n(before.data() + (2 + 2*id)*block*row, store.blocks()[id].n_tokens*row,
                         expected[i].data() + id*block*row);
@@ -275,7 +277,7 @@ static void check_batch_inputs(llama_model * model) {
     std::puts("PASS visual batch split: logical rows, M-RoPE, separate hidden input");
 }
 
-static void check_replay_logits(llama_model * model, ggml_type type, int mtp_state = 0) {
+static void check_replay_logits(llama_model * model, ggml_type type, int mtp_state = 0, ggml_type type_v = GGML_TYPE_COUNT) {
     llama_kvmem_params kp{};
     kp.enabled = true;
     kp.method = 1;
@@ -290,7 +292,8 @@ static void check_replay_logits(llama_model * model, ggml_type type, int mtp_sta
     cp.n_batch = cp.n_ubatch = 128;
     cp.n_seq_max = 1;
     cp.n_rs_seq = 2;
-    cp.type_k = cp.type_v = type;
+    cp.type_k = type;
+    cp.type_v = type_v == GGML_TYPE_COUNT ? type : type_v;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
     require(bool(ctx), "logits test context init failed");
@@ -368,8 +371,8 @@ static void check_replay_logits(llama_model * model, ggml_type type, int mtp_sta
         const double rmse = std::sqrt(sum / a.size());
         const auto top_a = std::max_element(a.begin(), a.end()) - a.begin();
         const auto top_b = std::max_element(b.begin(), b.end()) - b.begin();
-        std::printf("LOGITS type=%s comparison=%s rmse=%.9f maxabs=%.9f top=%td/%td\n",
-                    ggml_type_name(type), label, rmse, maxabs, top_a, top_b);
+        std::printf("LOGITS K=%s V=%s comparison=%s rmse=%.9f maxabs=%.9f top=%td/%td\n",
+                    ggml_type_name(type), ggml_type_name(cp.type_v), label, rmse, maxabs, top_a, top_b);
         require(rmse < .0001 && maxabs < .001 && top_a == top_b, "replay logits exceed numerical tolerance");
     };
     compare_logits(repeated[0], repeated[1], "replay_repeat");
@@ -392,7 +395,7 @@ static void check_replay_logits(llama_model * model, ggml_type type, int mtp_sta
     same_sparse.blocks = sparse_after.blocks;
     require(llama_kvmem_commit_unchanged(sparse_before, same_sparse), "unchanged sparse attention view rejected");
     require(sparse_after.blocks.size() < (uint32_t) (end / 32), "test did not create sparse history");
-    std::printf("PASS type=%s: unchanged view, explicit Q, stale plan rejection, replay logits\n", ggml_type_name(type));
+    std::printf("PASS K=%s V=%s: unchanged view, explicit Q, stale plan rejection, replay logits\n", ggml_type_name(type), ggml_type_name(cp.type_v));
 }
 
 struct gdn_model_result {
@@ -400,7 +403,7 @@ struct gdn_model_result {
     std::vector<uint64_t> states;
 };
 
-static gdn_model_result run_gdn_transactions(llama_model * model, ggml_type type, bool replay, int drafts) {
+static gdn_model_result run_gdn_transactions(llama_model * model, ggml_type type, bool replay, int drafts, ggml_type type_v) {
     llama_kvmem_params kp{};
     kp.enabled = true;
     kp.block_tokens = 32;
@@ -415,7 +418,8 @@ static gdn_model_result run_gdn_transactions(llama_model * model, ggml_type type
     cp.n_seq_max = 1;
     cp.n_rs_seq = drafts;
     cp.n_outputs_max = cp.n_outputs_max_per_seq = drafts + 1;
-    cp.type_k = cp.type_v = type;
+    cp.type_k = type;
+    cp.type_v = type_v == GGML_TYPE_COUNT ? type : type_v;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
     require(bool(ctx), "GDN transaction context init failed");
@@ -489,9 +493,9 @@ static gdn_model_result run_gdn_transactions(llama_model * model, ggml_type type
     return result;
 }
 
-static void check_gdn_transactions(llama_model * model, ggml_type type, int drafts = 2) {
-    const auto baseline = run_gdn_transactions(model, type, false, drafts);
-    const auto replay = run_gdn_transactions(model, type, true, drafts);
+static void check_gdn_transactions(llama_model * model, ggml_type type, int drafts = 2, ggml_type type_v = GGML_TYPE_COUNT) {
+    const auto baseline = run_gdn_transactions(model, type, false, drafts, type_v);
+    const auto replay = run_gdn_transactions(model, type, true, drafts, type_v);
     require(baseline.logits.size() == replay.logits.size(), "GDN logits dimensions differ");
     double squared = 0, maximum = 0;
     for (size_t i = 0; i < baseline.logits.size(); ++i) {
@@ -506,16 +510,17 @@ static void check_gdn_transactions(llama_model * model, ggml_type type, int draf
         const auto a = baseline.logits.begin() + i, b = replay.logits.begin() + i;
         require(std::max_element(a, a + n_vocab) - a == std::max_element(b, b + n_vocab) - b, "GDN top-1 differs");
     }
-    std::printf("GDN_LOGITS type=%s mtp=%d rmse=%.9f maxabs=%.9f exact_states=%d\n", ggml_type_name(type), drafts, rmse, maximum,
+    std::printf("GDN_LOGITS K=%s V=%s mtp=%d rmse=%.9f maxabs=%.9f exact_states=%d\n", ggml_type_name(type), ggml_type_name(type_v == GGML_TYPE_COUNT ? type : type_v), drafts, rmse, maximum,
             baseline.states == replay.states);
     require(rmse < .0001 && maximum < .001, "GDN model logits exceed numerical tolerance");
     require(baseline.states == replay.states, "GDN model committed states differ");
-    std::printf("PASS GDN type=%s mtp=%d: zero/partial/full commit, all-layer states, restore, duplicate commit\n", ggml_type_name(type), drafts);
+    std::printf("PASS GDN K=%s V=%s mtp=%d: zero/partial/full commit, all-layer states, restore, duplicate commit\n", ggml_type_name(type), ggml_type_name(type_v == GGML_TYPE_COUNT ? type : type_v), drafts);
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 2) {
-        std::fprintf(stderr, "Usage: %s model-mtp.gguf (requires CUDA)\n", argv[0]);
+    const bool target_only = argc == 3 && std::string(argv[2]) == "--target-only";
+    if (argc != 2 && !target_only) {
+        std::fprintf(stderr, "Usage: %s model.gguf [--target-only] (requires CUDA; full suite requires Qwen 27B MTP weights)\n", argv[0]);
         return argc == 1 ? 77 : 1;
     }
     try {
@@ -523,7 +528,7 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = 99;
-        mp.load_mtp = true;
+        mp.load_mtp = !target_only;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
                 llama_model_load_from_file(argv[1], mp), llama_model_free);
         require(bool(model), "model load failed");
@@ -536,7 +541,7 @@ int main(int argc, char ** argv) {
         kp.gen_reserve = 256;
         kp.query_begin = kp.query_end = kp.force_pos = -1;
         llama_kvmem_set_params(&kp);
-        struct cache_case { ggml_type target; ggml_type draft; };
+        struct cache_case { ggml_type target; ggml_type draft; ggml_type value = GGML_TYPE_COUNT; };
         const cache_case cases[] = {
             {GGML_TYPE_Q8_0, GGML_TYPE_COUNT},
             {GGML_TYPE_Q5_0, GGML_TYPE_COUNT},
@@ -545,17 +550,24 @@ int main(int argc, char ** argv) {
             {GGML_TYPE_Q5_0, GGML_TYPE_F16},
             {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0},
             {GGML_TYPE_Q5_0, GGML_TYPE_Q5_0},
+            {GGML_TYPE_Q8_0, GGML_TYPE_COUNT, GGML_TYPE_Q4_0},
+            {GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_Q4_0},
+            {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
         };
         for (const auto & test : cases) {
+            if (target_only) break;
             const auto type = test.target;
-            const auto draft_type = test.draft == GGML_TYPE_COUNT ? type : test.draft;
+            const auto type_v = test.value == GGML_TYPE_COUNT ? type : test.value;
+            const auto draft_k = test.draft == GGML_TYPE_COUNT ? type : test.draft;
+            const auto draft_v = test.draft == GGML_TYPE_COUNT ? type_v : test.draft;
             auto cp = llama_context_default_params();
             cp.n_ctx = 1024;
             cp.n_batch = cp.n_ubatch = 128;
             cp.n_seq_max = 1;
             cp.n_rs_seq = 2;
             cp.n_outputs_max = cp.n_outputs_max_per_seq = 3;
-            cp.type_k = cp.type_v = type;
+            cp.type_k = type;
+            cp.type_v = type_v;
             cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
             std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
                     llama_init_from_model(model.get(), cp), llama_free);
@@ -564,29 +576,35 @@ int main(int argc, char ** argv) {
             opts.kvmem_enabled = true;
             opts.n_ctx = cp.n_ctx;
             opts.n_batch = opts.n_ubatch = cp.n_batch;
-            opts.type_k = opts.type_v = type;
+            opts.type_k = type;
+            opts.type_v = type_v;
             opts.draft_type = test.draft;
             // Stop the follower before freeing its target, including on failure.
             test_spec_session sess;
             require(kvmem_spec_start(sess, model.get(), ctx.get(), opts), "MTP init failed");
             auto * mtp = dynamic_cast<llama_memory_kvmem_mtp *>(llama_get_memory(sess.ctx_dft));
             require(mtp != nullptr, "missing KVMem MTP follower");
-            require(mtp->target()->get_kv()->type_k() == type && mtp->target()->get_kv()->type_v() == type,
+            require(mtp->target()->get_kv()->type_k() == type && mtp->target()->get_kv()->type_v() == type_v,
                     "draft override changed target KV types");
-            check_transfers(*mtp, draft_type);
-            check_target_transfers(*mtp->target(), type);
-            std::printf("PASS target=%s draft=%s override=%d: GPU save/restore, cycle, partial block\n",
-                        ggml_type_name(type), ggml_type_name(draft_type), test.draft != GGML_TYPE_COUNT);
+            check_transfers(*mtp, draft_k, draft_v);
+            check_target_transfers(*mtp->target(), type, type_v);
+            std::printf("PASS target=%s/%s draft=%s/%s override=%d: GPU save/restore, cycle, partial block\n",
+                        ggml_type_name(type), ggml_type_name(type_v), ggml_type_name(draft_k), ggml_type_name(draft_v), test.draft != GGML_TYPE_COUNT);
         }
         check_replay_logits(model.get(), GGML_TYPE_Q8_0);
         check_replay_logits(model.get(), GGML_TYPE_Q5_0);
-        for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0}) {
-            check_gdn_transactions(model.get(), type);
+        check_replay_logits(model.get(), GGML_TYPE_Q8_0, 0, GGML_TYPE_Q4_0);
+        if (!target_only) {
+            for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0}) {
+                check_gdn_transactions(model.get(), type);
+            }
+            for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}) {
+                for (int drafts : {3, 4, 5}) check_gdn_transactions(model.get(), type, drafts);
+            }
+            check_replay_logits(model.get(), GGML_TYPE_Q5_0, 2);
+            check_replay_logits(model.get(), GGML_TYPE_Q8_0, 2, GGML_TYPE_Q4_0);
+            for (int drafts : {2, 3, 4, 5}) check_gdn_transactions(model.get(), GGML_TYPE_Q8_0, drafts, GGML_TYPE_Q4_0);
         }
-        for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}) {
-            for (int drafts : {3, 4, 5}) check_gdn_transactions(model.get(), type, drafts);
-        }
-        check_replay_logits(model.get(), GGML_TYPE_Q5_0, 2);
         llama_kvmem_set_params(nullptr);
     } catch (const std::exception & e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
