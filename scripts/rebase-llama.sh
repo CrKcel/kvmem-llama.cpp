@@ -4,7 +4,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA="$ROOT/llama.cpp"
-TARGET="${1:-origin/master}"
+TARGET="${1:-origin/kvmem/prism-merge}"
 
 cd "$LLAMA"
 git fetch --tags origin
