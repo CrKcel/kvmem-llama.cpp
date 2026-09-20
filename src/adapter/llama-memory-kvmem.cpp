@@ -39,22 +39,6 @@
 
 static llama_kvmem_params g_kvmem_params = {};
 
-struct llama_memory_kvmem::GdnReplay {
-    ggml_backend_buffer_ptr descriptors;
-    cudaStream_t stream = nullptr;
-    int layers = 0;
-    int device = 0;
-    uint64_t folds = 0;
-    int64_t fold_us = 0;
-    ~GdnReplay() {
-        if (stream) {
-            cudaSetDevice(device);
-            cudaStreamSynchronize(stream);
-            cudaStreamDestroy(stream);
-        }
-    }
-};
-
 void llama_memory_kvmem::set_recurrent(llama_memory_recurrent * recr) {
     recr_ = recr;
     if (!recr) return;
@@ -63,67 +47,10 @@ void llama_memory_kvmem::set_recurrent(llama_memory_recurrent * recr) {
         if (recr->r_l[il]) conv_bytes += ggml_nbytes(recr->r_l[il]);
         if (recr->s_l[il]) recurrent_bytes += ggml_nbytes(recr->s_l[il]);
     }
-    const size_t planes = recr->n_rs_seq + 1;
-    kvmem_diag("KVMEM_GDN_ALLOCATION mode=%s recurrent_bytes=%zu conv_bytes=%zu rollback_bytes=%zu\n",
-            recr->replay_capacity ? "replay" : "snapshots", recurrent_bytes / planes, conv_bytes / planes,
-            (recurrent_bytes + conv_bytes) / planes * (planes - 1));
-    if (!recr->replay_capacity) return;
-    auto replay = std::make_unique<GdnReplay>();
-    std::vector<ggml_cuda_gdn_replay_layer> layers;
-    size_t records = 0, states = 0;
-    ggml_backend_buffer_type_t buft = nullptr;
-    for (size_t il = 0; il < recr->r_l.size(); ++il) {
-        if (!recr->r_l[il]) continue;
-        const auto & r = recr->replay_l[il];
-        layers.push_back({static_cast<float *>(recr->s_l[il]->data), static_cast<float *>(recr->r_l[il]->data),
-                static_cast<float *>(r[0]->data), static_cast<float *>(r[1]->data), static_cast<float *>(r[2]->data),
-                static_cast<float *>(r[3]->data), static_cast<float *>(r[4]->data)});
-        for (auto * t : r) records += ggml_nbytes(t);
-        states += ggml_nbytes(recr->r_l[il]) + ggml_nbytes(recr->s_l[il]);
-        buft = ggml_backend_buffer_get_type(recr->s_l[il]->buffer);
-    }
-    if (layers.empty()) throw std::runtime_error("GDN replay has no recurrent layers");
-    cudaPointerAttributes attrs{};
-    if (cudaPointerGetAttributes(&attrs, layers.front().state) != cudaSuccess ||
-            cudaSetDevice(attrs.device) != cudaSuccess) throw std::runtime_error("cannot select GDN replay device");
-    replay->device = attrs.device;
-    replay->layers = layers.size();
-    replay->descriptors.reset(ggml_backend_buft_alloc_buffer(buft, layers.size() * sizeof(layers[0])));
-    if (!replay->descriptors || cudaStreamCreateWithFlags(&replay->stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaMemcpy(ggml_backend_buffer_get_base(replay->descriptors.get()), layers.data(), layers.size() * sizeof(layers[0]), cudaMemcpyHostToDevice) != cudaSuccess) {
-        throw std::runtime_error("cannot allocate GDN replay descriptors");
-    }
-    kvmem_diag("KVMEM_GDN_MEMORY mode=replay layers=%d capacity=%u state_bytes=%zu record_bytes=%zu descriptor_bytes=%zu\n",
-            replay->layers, recr->replay_capacity, states, records, layers.size() * sizeof(layers[0]));
-    gdn_replay_ = std::move(replay);
+    kvmem_diag("KVMEM_GDN_ALLOCATION mode=plain recurrent_bytes=%zu conv_bytes=%zu rollback_bytes=0\n",
+            recurrent_bytes, conv_bytes);
 }
 
-bool llama_memory_kvmem::gdn_replay_enabled() const {
-    return gdn_replay_ != nullptr;
-}
-
-bool llama_memory_kvmem::gdn_replay_begin(llama_pos start, uint32_t width) {
-    return gdn_replay_ && recr_->replay_begin(start, width);
-}
-
-bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep) {
-    if (!gdn_replay_ || !recr_->replay_recording || n_keep > recr_->replay_width) return false;
-    llama_synchronize(ctx);
-    auto & replay = *gdn_replay_;
-    const int64_t started = ggml_time_us();
-    const auto * layers = static_cast<const ggml_cuda_gdn_replay_layer *>(ggml_backend_buffer_get_base(replay.descriptors.get()));
-    if (cudaSetDevice(replay.device) != cudaSuccess ||
-            !ggml_backend_cuda_gdn_fold(layers, replay.layers, n_keep, recr_->replay_capacity, replay.stream) ||
-            cudaStreamSynchronize(replay.stream) != cudaSuccess) {
-        recr_->replay_poisoned = true;
-        recr_->replay_finish(0);
-        return false;
-    }
-    recr_->replay_finish(n_keep);
-    replay.fold_us += ggml_time_us() - started;
-    replay.folds += n_keep != 0;
-    return true;
-}
 static std::atomic<uint64_t> transfer_bytes[3]{};
 static std::atomic<uint64_t> transfer_calls[3]{};
 
@@ -440,19 +367,7 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-        llama_memory_kvmem * tgt = nullptr;
-        if (cparams.ctx_other) {
-            llama_memory_t mem = llama_get_memory(cparams.ctx_other);
-            if (auto * hyb = dynamic_cast<llama_memory_kvmem_hybrid *>(mem)) {
-                tgt = hyb->attn_kvmem();
-            } else {
-                tgt = dynamic_cast<llama_memory_kvmem *>(mem);
-            }
-        }
-        if (!tgt) {
-            return nullptr;
-        }
-        return new llama_memory_kvmem_mtp(model, params, cparams, tgt);
+        throw std::runtime_error("MTP is disabled in the Bonsai experimental build");
     }
     if (llm_arch_is_recurrent(model.arch)) {
         LLAMA_LOG_WARN("%s: KVMem skips purely recurrent arch %s\n",
@@ -525,8 +440,7 @@ llama_memory_kvmem::llama_memory_kvmem(
                 nullptr,
                 nullptr,
                 nullptr,
-                nullptr,
-                "kvmem");
+                nullptr);
         kv_ = kv_owned_.get();
     }
 
@@ -1518,12 +1432,10 @@ void llama_memory_kvmem::capture_on_new_graph() {
     pending_capture_.clear();
     graph_has_q_ = false;
     graph_has_k_ = false;
-    graph_has_record_ = recr_ && recr_->replay_recording;
 }
 
 bool llama_memory_kvmem::capture_can_reuse(uint32_t n_tokens, uint32_t n_pos,
                                            const llama_pos * pos) const {
-    if (graph_has_record_ != bool(recr_ && recr_->replay_recording)) return false;
     // After pin, n=1 decode must not reuse a graph built without K capture
     // (last prefill ubatch of 1 token, or query replay with capture off).
     if (want_decode_mean() && !graph_has_k_) {
@@ -3548,20 +3460,7 @@ bool llama_kvmem_has_recurrent(void) {
     return mem && mem->has_recurrent();
 }
 
-bool llama_kvmem_gdn_replay_enabled(void) {
-    auto * mem = kvmem_capture_active();
-    return mem && mem->gdn_replay_enabled();
-}
 
-bool llama_kvmem_gdn_replay_begin(llama_pos start, uint32_t width) {
-    auto * mem = kvmem_capture_active();
-    return mem && mem->gdn_replay_begin(start, width);
-}
-
-bool llama_kvmem_gdn_replay_commit(llama_context * ctx, uint32_t n_keep) {
-    auto * mem = kvmem_capture_active();
-    return mem && mem->gdn_replay_commit(ctx, n_keep);
-}
 
 bool llama_kvmem_want_decode_mean(void) {
     llama_memory_kvmem * mem = kvmem_capture_active();

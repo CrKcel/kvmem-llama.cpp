@@ -1,6 +1,7 @@
 #include "llama-kvmem-diag.h"
 #include "kvmem-vision.h"
 #include "server-common.h"
+#include "mtmd-helper.h"
 
 #include <algorithm>
 #include <chrono>
@@ -102,7 +103,7 @@ kvmem_vision::~kvmem_vision() { mtmd_free(ctx_); }
 
 std::shared_ptr<kvmem_prompt> kvmem_vision::tokenize(const std::string & prompt,
                                                  const std::vector<std::vector<uint8_t>> & files) {
-    auto native = std::make_shared<server_tokens>(process_mtmd_prompt(ctx_, prompt, files, mtmd_helper_init_opt_default()));
+    auto native = std::make_shared<server_tokens>(process_mtmd_prompt(ctx_, prompt, files, false));
     return std::make_shared<kvmem_prompt>(std::move(native));
 }
 

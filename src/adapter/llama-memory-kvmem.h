@@ -158,9 +158,6 @@ public:
     void decode_mean_flush();
     void set_recurrent(llama_memory_recurrent * recr);
     bool has_recurrent() const { return recr_ != nullptr; }
-    bool gdn_replay_enabled() const;
-    bool gdn_replay_begin(llama_pos start, uint32_t width);
-    bool gdn_replay_commit(llama_context * ctx, uint32_t n_keep);
     void set_query_span(int32_t begin, int32_t end) {
         harvest_flush();
         explicit_spans_ = false;
@@ -340,8 +337,6 @@ private:
     std::unique_ptr<llama_kv_cache> kv_owned_;
     llama_kv_cache * kv_ = nullptr;
     llama_memory_recurrent * recr_ = nullptr;
-    struct GdnReplay;
-    std::unique_ptr<GdnReplay> gdn_replay_;
     llama_memory_kvmem_mtp * mtp_ = nullptr;
     SlotBackend backend_;
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
@@ -407,7 +402,6 @@ private:
     DecodeMeanStats decode_mean_stats_;
     bool graph_has_q_ = false;
     bool graph_has_k_ = false;
-    bool graph_has_record_ = false;
     struct CaptureD2hPipe;
     std::unique_ptr<CaptureD2hPipe> d2h_;
     struct HarvestWorker {

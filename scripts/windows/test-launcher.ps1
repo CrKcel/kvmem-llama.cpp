@@ -57,6 +57,21 @@ public class ArgvEcho {
         Check ([Array]::IndexOf($a, '--cache-type-k') -gt [Array]::IndexOf($a, '--kv-dtype')) 'K overrides recipe'
         Check ([Array]::IndexOf($a, '--cache-type-v') -gt [Array]::IndexOf($a, '--kv-dtype')) 'V overrides recipe'
     }
+    $bonsai = & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -DryRun | ConvertFrom-Json
+    $a = $bonsai.argv
+    Check ($a[[Array]::IndexOf($a, '--spec-type') + 1] -eq 'none') 'Bonsai disables MTP'
+    Check (!($a -contains '--mmproj')) 'Bonsai text mode does not load a projector'
+    Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq '2048') 'Bonsai budget'
+    Check ($a[[Array]::IndexOf($a, '--kvmem-gen-reserve') + 1] -eq '1024') 'Bonsai reserve'
+    Check ($a[[Array]::IndexOf($a, '--ubatch-size') + 1] -eq '128') 'Bonsai prefill batch'
+    $failed = $false
+    try { & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -Budget 129 -DryRun }
+    catch { $failed = $true }
+    Check $failed 'Bonsai rejects unaligned budget'
+    $failed = $false
+    try { & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -Context 2048 -DryRun }
+    catch { $failed = $true }
+    Check $failed 'Bonsai rejects pool larger than context'
     $failed = $false
     try { & (Join-Path $PSScriptRoot 'start-server.ps1') -Recipe iq3 -BuildDir $temp -Model $model -Mmproj $mmproj -Gpu 0 -ChatTemplateKwargs '[]' -DryRun }
     catch { $failed = $true }

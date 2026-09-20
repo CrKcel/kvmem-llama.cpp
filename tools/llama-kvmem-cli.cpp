@@ -48,7 +48,7 @@ static void print_usage(const char * argv0) {
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
-            "  --spec-type TYPE           none | draft-mtp (default none)\n"
+            "  --spec-type TYPE           none (MTP disabled in this Bonsai build)\n"
             "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
@@ -252,6 +252,10 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (spec_mtp) {
+        fprintf(stderr, "MTP is disabled in this Bonsai build; use --spec-type none\n");
+        return 1;
+    }
     ggml_backend_load_all();
 
     llama_model_params model_params = llama_model_default_params();
@@ -346,6 +350,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch = static_cast<uint32_t>(n_batch);
     ctx_params.n_ubatch = static_cast<uint32_t>(n_ubatch);
     ctx_params.n_seq_max = 1;
+    ctx_params.n_rs_seq = 0;
     ctx_params.no_perf = false;
     ctx_params.type_k = cache_type_k;
     ctx_params.type_v = cache_type_v;

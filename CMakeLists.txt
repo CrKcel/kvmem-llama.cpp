@@ -20,8 +20,8 @@ option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 if (KVMEM_BUILD_LLAMA)
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/src/llama-kvmem-factory.h")
         message(FATAL_ERROR
-            "Prism experimental baseline: KVMem adapter patches are not ported yet. "
-            "See docs/prism-experiment.md. Use KVMEM_BUILD_LLAMA=OFF for host-only work.")
+            "Apply patches/llama-kvmem-current.patch to the pinned Prism source first. "
+            "See patches/README.md. Use KVMEM_BUILD_LLAMA=OFF for host-only work.")
     endif()
     if (NOT CMAKE_CUDA_COMPILER AND EXISTS "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc")
         set(CMAKE_CUDA_COMPILER "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc" CACHE FILEPATH "nvcc")
@@ -70,18 +70,6 @@ if (KVMEM_BUILD_LLAMA)
     foreach(tool llama-kvmem-cli llama-kvmem-server)
         target_compile_definitions(${tool} PRIVATE KVMEM_ENABLE_NVME=$<BOOL:${KVMEM_ENABLE_NVME}>)
     endforeach()
-
-    # Run manually with an MTP GGUF path; no model is downloaded by CTest.
-    add_executable(kvmem-mtp-kv-test tests/mtp-kv-test.cpp tools/kvmem-spec.cpp)
-    target_include_directories(kvmem-mtp-kv-test PRIVATE src/adapter tools llama.cpp/src)
-    target_link_libraries(kvmem-mtp-kv-test PRIVATE llama llama-common kvmem)
-    add_test(NAME kvmem-mtp-kv-test COMMAND kvmem-mtp-kv-test)
-    set_tests_properties(kvmem-mtp-kv-test PROPERTIES SKIP_RETURN_CODE 77)
-
-    add_executable(kvmem-gdn-replay-test tests/gdn-replay-test.cpp)
-    target_link_libraries(kvmem-gdn-replay-test PRIVATE ggml)
-    add_test(NAME kvmem-gdn-replay-test COMMAND kvmem-gdn-replay-test)
-    set_tests_properties(kvmem-gdn-replay-test PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(kvmem-reasoning-budget-test tests/reasoning-budget-test.cpp)
     target_include_directories(kvmem-reasoning-budget-test PRIVATE tools)

@@ -115,7 +115,7 @@ static void print_usage(const char * argv0) {
             "                            from the end of the span (default 512; qw3-style)\n"
             "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
             "  --kvmem-query-policy MODE  legacy or user (default user)\n"
-            "  --kvmem-mtp-state MODE     snapshots, auto or replay (default replay with MTP)\n"
+            "  --kvmem-mtp-state MODE     snapshots only; speculative state is disabled\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -125,7 +125,7 @@ static void print_usage(const char * argv0) {
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
-            "  --spec-type TYPE           none | draft-mtp (default none)\n"
+            "  --spec-type TYPE           none (MTP disabled in this Bonsai build)\n"
             "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
@@ -1549,7 +1549,7 @@ int main(int argc, char ** argv) {
     kvmem_server_devices device_config;
     ServerState st;
     kvmem_server_options options;
-    st.kparams.mtp_state = 2; // ReplaySSM by default when MTP is enabled.
+    st.kparams.mtp_state = 0; // No speculative state in the Bonsai build.
     st.kparams.block_tokens = 128;
     st.kparams.gen_reserve = 256;
     st.kparams.recent_tokens = 0;
@@ -1674,11 +1674,11 @@ int main(int argc, char ** argv) {
             st.query_policy_user = mode == "user";
         } else if (eq(arg, "--kvmem-mtp-state")) {
             const std::string mode = need(arg);
-            if (mode != "snapshots" && mode != "auto" && mode != "replay") {
-                fprintf(stderr, "invalid MTP state mode\n");
+            if (mode != "snapshots") {
+                fprintf(stderr, "MTP/Record-Fold is disabled in this Bonsai build; use snapshots\n");
                 return 1;
             }
-            st.kparams.mtp_state = mode == "replay" ? 2 : mode == "auto" ? 1 : 0;
+            st.kparams.mtp_state = 0;
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = kvmem_cli_int(arg, need(arg));
             if (st.query_max_tokens <= 0) {
@@ -1826,6 +1826,10 @@ int main(int argc, char ** argv) {
         common_print_available_devices();
         return 0;
     }
+    if (st.spec_mtp) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR MTP is disabled in this Bonsai build; use --spec-type none\n");
+        return 1;
+    }
     if (model_path.empty()) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR missing model; set --model PATH or LLAMA_ARG_MODEL\n");
         print_usage(argv[0]);
@@ -1942,6 +1946,7 @@ int main(int argc, char ** argv) {
     else if (options.threads > 0) cparams.n_threads_batch = options.threads;
     if (options.flash_attn_set) cparams.flash_attn_type = options.flash_attn;
     cparams.n_seq_max = 1;
+    cparams.n_rs_seq = 0;
     cparams.type_k = st.cache_type_k;
     cparams.type_v = st.cache_type_v;
     if (st.spec_mtp) {

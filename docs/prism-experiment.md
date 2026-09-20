@@ -1,6 +1,6 @@
 # rc3 Prism baseline experiment
 
-Status: source baseline switched; KVMem adapter migration pending. This branch is not a validated KVMem runtime release.
+Status: no-MTP adapter port implemented; Windows CUDA build, 11 tests and Bonsai PTQ1 text smoke tests pass. This is a local experimental build, not a release. See [validation results](bonsai-validation.md).
 
 ## Reproducible baseline
 
@@ -16,31 +16,39 @@ Status: source baseline switched; KVMem adapter migration pending. This branch i
 
 The gitlink pins the exact revision. Do not use `git submodule update --remote` for reproducible builds.
 
-## Integration check
+## Implemented scope
 
-`git -C llama.cpp apply --check ../patches/llama-kvmem-current.patch` fails on these 10 files:
+- KVMem memory factory, Q/K/V capture, logical token positions, sparse KV selection, host spill and stage-in.
+- Prism's native recurrent state and host checkpoints for KVMem query replay.
+- No MTP draft context, no rollback planes (`n_rs_seq=0`), no GDN Record/Fold buffers or kernels. CLI/server reject `--spec-type draft-mtp` before loading weights. Shared MTP adapter glue remains compiled but is not instantiated.
+- Prism PTQ1, weight Hadamard transforms and CPU/CUDA GDN computations remain unchanged.
+- KV constructor and mtmd helper calls adapted to the pinned Prism interfaces. Vision is not validated by this experiment.
 
-- `ggml/src/ggml-cpu/ops.cpp`
-- `ggml/src/ggml-cuda/gated_delta_net.cu`
-- `ggml/src/ggml-cuda/ggml-cuda.cu`
-- `src/llama-context.cpp`
-- `src/llama-kv-cache.cpp`
-- `src/llama-kv-cache.h`
-- `src/llama-kv-cells.h`
-- `src/llama-memory-recurrent.cpp`
-- `src/llama-model.cpp`
-- `src/models/delta-net-base.cpp`
+`patches/llama-kvmem-current.patch` is the regenerated 22-file Prism patch. The old rc3 cumulative patch is retained as `llama-kvmem-rc3-reference.patch`. Historical numbered patches must not be applied to this baseline. Patch replay was checked on a fresh export of the pinned revision, including repeat application.
 
-The check did not modify the submodule. The original rc3 patches remain intact as migration inputs; they are not Prism-compatible patches. No rejected hunks or partial patch application are included.
+## Build and run
 
-## Next integration steps
+From this worktree, with Visual Studio C++ Build Tools and CUDA 12.9.86 installed:
 
-1. Port the memory factory and Q/K/V capture hooks, then KV storage/retrieval.
-2. Port ReplaySSM record/fold and the CPU/CUDA GDN interfaces.
-3. Regenerate the maintained patch against the exact Prism pin and update patch replay instructions.
-4. Compile and compare plain model logits with unmodified Prism, then test retrieval, recurrent replay and ordinary Qwen regressions.
-5. Validate MTP separately before enabling it in this experimental runtime.
+```powershell
+./scripts/windows/build.ps1 -BuildDir "$PWD/build-win-bonsai" `
+  -CudaPath 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9' `
+  -ExperimentalCuda129 -CudaArchitectures '120a-real' -Jobs 4
+./scripts/windows/start-bonsai.ps1 -Gpu 0
+```
 
-Top-level inference configuration stops when the KVMem factory header is absent. Host-only configuration remains available with `-DKVMEM_BUILD_LLAMA=OFF`. Unmodified Prism can be built independently from `llama.cpp`, but that does not provide KVMem features.
+The measured build targets SM120a (RTX 50 series); use suitable architecture flags and revalidate for other cards. CUDA runtime DLLs must be on PATH. The launcher accepts a GPU UUID to avoid index ambiguity.
 
-No model inference, CUDA build or runtime deployment has been performed for this baseline switch. Existing rc3 validation results do not validate this branch.
+The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 32768-token logical context, 2048-token retrieval budget, 1024-token generation reserve, Q8 KV, batch/ubatch 128, no MTP and no projector. It listens on localhost port 18202. The 32768 setting is capacity, not a claim of validated 32K quality; the actual long smoke input was 4115 tokens.
+
+```powershell
+python scripts/bonsai-smoke.py --long `
+  --model "$env:LOCALAPPDATA/KVMem/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf" `
+  --gpu GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29
+```
+
+Replace the UUID for another machine. Results and server traces are written under `logs/bonsai-smoke`. Existing installed runtime files are not replaced. Host-only configuration remains available with `-DKVMEM_BUILD_LLAMA=OFF`.
+
+## Remaining validation
+
+Compare logits against an independently built, unmodified Prism runtime; extend long-context and tool-use coverage; run ordinary Qwen regressions and validate other GPUs/platforms. MTP remains outside this branch's supported scope. The earlier compatibility analyses are planning records, not test results.

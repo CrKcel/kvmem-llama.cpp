@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-> **Experimental rc3 + Prism baseline (`0.16.0-rc3-prism.1`):** llama.cpp is pinned to Prism `9a9394a895b9`. KVMem adapter migration is pending; this branch is not a runnable, validated KVMem release. See [experiment status and migration checklist](docs/prism-experiment.md). The rc3 results below describe the previous baseline.
+> **Experimental Bonsai branch (`0.16.0-rc3-prism.1`):** llama.cpp is pinned to Prism `9a9394a895b9`. The no-MTP adapter builds and passes Bonsai PTQ1 text smoke tests on an RTX 5050 8GB, including KV spill/retrieval. Start with `scripts/windows/start-bonsai.ps1`; the older MTP recipes do not apply to this branch. See [scope and build instructions](docs/prism-experiment.md) and [measured results and remaining validation](docs/bonsai-validation.md). The rc3 benchmarks below describe the previous baseline.
 
 **Prebuilt downloads:** [Windows x64 (rc2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc2) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
 

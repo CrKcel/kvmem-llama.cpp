@@ -1,28 +1,14 @@
-# llama.cpp patch replay
+# Prism patch replay
 
-`llama-kvmem-current.patch` is the cumulative diff against pinned `b81c99b`.
-It includes the existing KVMem hooks, multimodal batch, MTP, media
-parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
-It also fixes reasoning-budget initialization from a template's generation prefix.
-`scripts/apply-patches.sh` applies it
-without creating commits and checks for an already applied tree.
+`llama-kvmem-current.patch` targets Prism commit `9a9394a895b96003ca842a6041cb28ac49a108f7`.
+It adds the KVMem memory factory, capture hooks, logical positions, sparse KV handling and rc3 server/template fixes.
+It does not add GDN Record/Fold or modify Prism's quantization and Hadamard kernels.
 
-`reasoning-budget-upgrade.patch` upgrades the v0.15.0 ReplaySSM tree.
-`replayssm-upgrade.patch` upgrades the preceding multimodal/query-replay tree.
-`multimodal-upgrade.patch` upgrades the KVMem working tree recorded before
-the 2026-09-14 implementation to the same current code. The script checks applicability before
-changing files. Unrelated local changes are preserved; conflicting changes
-require review.
+Run `scripts/apply-patches.sh` after `git submodule update --init`.
+The script checks the full patch before changing files and accepts an already patched tree.
+The Windows build script performs the same checks.
 
-The numbered `0001` through `0004` files are historical patches, retained for
-reference. They are superseded by the cumulative diff: the old series did
-not cleanly replay on the current pin and must not be applied together with it.
+`llama-kvmem-rc3-reference.patch` preserves the original rc3 patch for reference.
+The numbered patches and `*-upgrade.patch` files also target earlier baselines; do not apply them to Prism.
 
-To check a clean extraction without changing the active submodule:
-
-```bash
-mkdir -p /tmp/kvmem-llama-patch-check
-git -C llama.cpp archive b81c99b | tar -x -C /tmp/kvmem-llama-patch-check
-KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
-KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
-```
+The submodule stays pinned to the upstream Prism commit. Commit adapter changes as a regenerated patch here, not as an unpublished submodule commit.
