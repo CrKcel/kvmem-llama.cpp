@@ -38,8 +38,9 @@ Core flags (what the 16 GiB recipes still pass):
 |---|---|
 | `-c` | Logical workspace, including history stored off GPU. 256K is the tested default; larger is experimental. |
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
+| `--kvmem-sink-tokens N` | Server and CLI: always keep the prefix in the GPU working set. Default `0` keeps one block (not disabled). Positive values round down to whole blocks, with a minimum of one block. For example, with block size 128, `1024` keeps 1024 tokens and `129` keeps 128. These blocks count toward `--kvmem-budget`. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
-| `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Quantized K/V must use the same type; mixed quantization is not supported. |
+| `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
@@ -157,15 +158,27 @@ to each component wins. Setting only `-ctk` does not change V (both default to
 `q8_0`), so specify both when changing precision.
 
 Supported types are `f16`, `f32`, `q8_0`, `q5_0` and `q4_0`.
-**Currently, quantized K and V must use the same cache type. Mixed K/V
-quantization is not supported.** Valid quantized pairs are `q8_0/q8_0`,
-`q5_0/q5_0` and `q4_0/q4_0`. If either side is quantized, pairs such as
-`q8_0/q4_0` or `q8_0/f16` are rejected before loading the model, with an error
-showing the selected K and V types. Use `--kv-dtype TYPE` to set both together.
+Valid quantized K/V pairs are `q8_0/q8_0`, `q5_0/q5_0`, `q4_0/q4_0` and
+**`q8_0/q4_0`**. Other mixed quantized pairs, including `q4_0/q8_0` and
+`q8_0/f16`, are rejected before loading the model. The CUDA build enables
+`GGML_CUDA_FA_ALL_QUANTS`, which includes the Q8/Q4 FlashAttention kernels.
+Models that require shared K/V types still cannot use mixed precision.
+
+```text
+llama-kvmem-server -m model.gguf -ctk q8_0 -ctv q4_0
+```
+
+The Linux recipes accept `--cache-type-k q8_0 --cache-type-v q4_0`;
+Windows recipes accept `-CacheTypeK q8_0 -CacheTypeV q4_0`. These optional
+settings override the recipe defaults for each component independently.
+Existing recipe defaults are unchanged.
 
 Flag compatibility does not imply support for every llama.cpp cache type or
 mixed K/V combination. These flags affect the main model; MTP cache precision
-is configured separately with `--spec-kv-dtype`.
+is configured separately with `--spec-kv-dtype`. The server and recipes default
+to `f16`; the CLI inherits the main K/V types unless overridden. Inherited
+mixed K/V types are preserved independently; an explicit `--spec-kv-dtype`
+sets both draft types together.
 
 ### Thinking and chat templates
 
@@ -275,6 +288,30 @@ Initial computation measures the first processing of new input. Overall includes
 | Runtime host RAM (Task 1 / Task 2) | 4308.21 / 13483.52 MiB RSS | 4846.82 / 11244.75 MiB RSS |
 
 **Use IQ3 for the recommended setup.** IQ4 is retained only as an optional experimental comparison; the figures above are historical Linux/WSL2 measurements.
+
+### Server logging
+
+The server uses llama.cpp's timestamped logger. Normal output shows startup,
+prompt processing, generation progress and a final timing summary. Prompt rates
+exclude cached tokens; replay work remains included in elapsed prefill time.
+Warnings and errors remain visible without enabling KVMem diagnostics.
+
+- `-lv N`, `--verbosity N`, `--log-verbosity N`: `0` silent, `1` errors,
+  `2` warnings, `3` normal output (default), `4` llama.cpp trace, `5` debug.
+  Argument validation errors are always printed.
+- `--kvmem-trace` or `KVMEM_TRACE=1`: additionally emit the raw `KVMEM_*`
+  diagnostic records on stderr, preserving their benchmark/script format.
+  This switch is independent of `--verbosity`.
+- `--no-kvmem-trace`: override the environment and disable those diagnostics.
+  An unset, empty or `0` environment value also disables them.
+
+Scripts that parse KVMem records must explicitly set `KVMEM_TRACE=1`.
+The existing `KVMEM_PERF=1` performance counters remain independently available;
+they do not require full tracing. Tracing adds overhead, so compare benchmark
+results using the same diagnostic settings.
+For a detailed bug report, use `--verbosity 4 --kvmem-trace` and capture both
+stdout and stderr. This logging integration adapts the diagnostic gate and
+progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cpp/pull/9).
 
 ## APIs
 

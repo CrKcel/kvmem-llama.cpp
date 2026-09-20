@@ -36,6 +36,16 @@ def main():
                     check(binary, args, 'failed to load model', missing)
                     count += 1
             cases = [
+                (['-ctk', 'q8_0', '-ctv', 'q4_0'], 'failed to load model'),
+                (['--cache-type-k', 'q8_0', '--cache-type-v', 'q4_0'], 'failed to load model'),
+                (['-ctk', 'q8', '-ctv', 'q4'], 'failed to load model'),
+                (['-ctv', 'q4_0'], 'failed to load model'),
+                (['--kv-dtype', 'q4_0', '-ctk', 'q8_0'], 'failed to load model'),
+                (['--kv-dtype', 'q8_0', '-ctv', 'q4_0'], 'failed to load model'),
+                (['-ctk', 'q8_0', '-ctv', 'q4_0', '--kv-dtype', 'q5_0'], 'failed to load model'),
+                (['-ctk', 'q4_0', '-ctv', 'q8_0'], 'incompatible KV cache types: K=q4_0, V=q8_0'),
+                (['-ctk', 'q8_0', '-ctv', 'q5_0'], 'incompatible KV cache types: K=q8_0, V=q5_0'),
+                (['-ctk', 'q5_0', '-ctv', 'q4_0'], 'incompatible KV cache types: K=q5_0, V=q4_0'),
                 (['-ctk', 'q5_0'], 'incompatible KV cache types: K=q5_0, V=q8_0'),
                 (['-ctv', 'f16'], 'incompatible KV cache types: K=q8_0, V=f16'),
                 (['--kv-dtype', 'q5_0', '-ctv', 'q8_0'], 'incompatible KV cache types'),

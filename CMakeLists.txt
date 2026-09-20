@@ -104,7 +104,7 @@ if (KVMEM_BUILD_LLAMA)
     add_test(NAME kvmem-server-progress-test COMMAND kvmem-server-progress-test)
 
     add_executable(kvmem-output-limit-test tests/output-limit-test.cpp)
-    target_include_directories(kvmem-output-limit-test PRIVATE tools)
+    target_include_directories(kvmem-output-limit-test PRIVATE tools llama.cpp/vendor/cpp-httplib)
     target_link_libraries(kvmem-output-limit-test PRIVATE llama-common cpp-httplib)
     add_test(NAME kvmem-output-limit-test COMMAND kvmem-output-limit-test)
 endif()

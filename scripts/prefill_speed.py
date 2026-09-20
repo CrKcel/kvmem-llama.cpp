@@ -57,7 +57,7 @@ def run_once(cli: Path, model: Path, extra: list[str], prompt: str, n_ctx: int,
              n_predict: int, gpu: str = "small",
              n_batch: int = 256, n_ubatch: int = 0) -> dict:
     env = gpu_env.apply_gpu(os.environ.copy(), gpu)
-    env.pop("KVMEM_TRACE", None)
+    env["KVMEM_TRACE"] = "1"  # Preserve the parsed MTP statistics; includes tracing overhead.
     with tempfile.NamedTemporaryFile("w", prefix="kvmem_prefill_", suffix=".txt",
                                      delete=False) as fh:
         fh.write(prompt)

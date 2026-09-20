@@ -32,6 +32,11 @@ $env:CUDA_VISIBLE_DEVICES = '0'
 Open http://127.0.0.1:18200/ after loading. Keep the terminal open; Ctrl+C stops
 the server. The command uses default block size 128.
 
+For K=Q8 and V=Q4, replace the cache flags with `-ctk q8_0 -ctv q4_0`.
+The PowerShell recipe scripts also accept `-CacheTypeK q8_0 -CacheTypeV q4_0`.
+These options override the recipe K/V defaults independently; MTP KV remains
+F16 by default. Other mixed quantized pairs are not enabled.
+
 ### Ready-made vision projector (no local quantization)
 
 Download **`mmproj-Qwen3.8-27B-Q5_K-MIX.gguf`** from

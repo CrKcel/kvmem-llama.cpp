@@ -14,7 +14,7 @@ static void multimodal_validate_capacity(const ServerState & st, const kvmem_pro
         if (!groups.empty() && lo < groups.back().second) groups.back().second = hi;
         else groups.emplace_back(lo, hi);
     }
-    const uint32_t sink = st.kparams.sink_tokens ? (st.kparams.sink_tokens + block - 1) / block : 1;
+    const uint32_t sink = std::max(1u, st.kparams.sink_tokens / block);
     for (const auto & group : groups) {
         if (group.second - group.first + std::min(group.first, sink) > budget)
             throw std::invalid_argument("image group exceeds KV budget; reduce --image-max-tokens or increase --kvmem-budget");
@@ -124,13 +124,13 @@ static void multimodal_finish_request(ServerState & st) {
         st.cached_tokens = st.cached_prompt ? st.cached_prompt->tokens : std::vector<llama_token>{};
         st.cached_tokens.resize(std::min(st.cached_tokens.size(), (size_t) st.mm_live_row));
         multimodal_remember(st, *st.mm_rollback);
-        fprintf(stderr, "KVMEM_TRACE multimodal_rollback context=%p row=%d\n", (void *) st.ctx, st.mm_live_row);
-        fprintf(stderr, "KVMEM_CHECKPOINT_ROLLBACK live_bytes=%zu peak_bytes=%zu\n",
+        kvmem_diag("KVMEM_TRACE multimodal_rollback context=%p row=%d\n", (void *) st.ctx, st.mm_live_row);
+        kvmem_diag("KVMEM_CHECKPOINT_ROLLBACK live_bytes=%zu peak_bytes=%zu\n",
                 st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
         st.mm_committed = true;
     } catch (const std::exception & e) {
         st.mm_error = e.what();
-        fprintf(stderr, "KVMEM_TRACE multimodal_rollback_failed error=%s\n", e.what());
+        LOG_ERR("srv    KVMEM_TRACE multimodal_rollback_failed error=%s\n", e.what());
     }
     st.mm_rollback.reset();
     st.mm_rollback_prompt.reset();
@@ -140,7 +140,7 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
     const auto & prompt = *st.active_prompt;
     auto dispatch = [&](llama_batch batch) -> int {
         if (!stream_heartbeat(io)) return KVMEM_DECODE_ABORT;
-        fprintf(stderr, "KVMEM_TRACE multimodal_decode context=%p rows=[%d,%d) model_pos=%d image=%d replay=%d\n",
+        kvmem_diag("KVMEM_TRACE multimodal_decode context=%p rows=[%d,%d) model_pos=%d image=%d replay=%d\n",
                 (void *) st.ctx, batch.logical_pos[0], batch.logical_pos[batch.n_tokens - 1] + 1,
                 batch.pos[0], batch.token == nullptr, replay);
         const auto start = std::chrono::steady_clock::now();
@@ -160,7 +160,7 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
         llama_synchronize(st.ctx);
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         (replay ? st.mm_perf.replay_ms : st.mm_perf.first_ms) += elapsed;
-        fprintf(stderr, "KVMEM_TRACE multimodal_compute rows=%d elapsed_ms=%.3f image=%d replay=%d\n",
+        kvmem_diag("KVMEM_TRACE multimodal_compute rows=%d elapsed_ms=%.3f image=%d replay=%d\n",
                 batch.n_tokens, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
                 batch.token == nullptr, replay);
         if (rc == 0) {
@@ -171,6 +171,9 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
                 st.mm_tail_replayed += tail;
                 if (batch.token) st.mm_new_text += batch.n_tokens - tail;
                 else st.mm_new_image += batch.n_tokens - tail;
+                // Count actual first-pass work, including reconstruction after the
+                // reused checkpoint; exclude the later retrieval query replay.
+                st.log.prefilled(batch.n_tokens, (int) prompt.tokens.size() - batch.logical_pos[0]);
             }
         }
         return rc;
@@ -228,7 +231,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         st.mm_error.clear();
         st.mm_error_status = 500;
         if (st.mm_reset_requested) {
-            fprintf(stderr, "KVMEM_TRACE multimodal_reset context=%p reason=explicit_cache_reset\n", (void *) st.ctx);
+            kvmem_diag("KVMEM_TRACE multimodal_reset context=%p reason=explicit_cache_reset\n", (void *) st.ctx);
             memory_clear_all(st);
             st.mm_reset_requested = false;
         }
@@ -255,7 +258,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         if (!found) {
             // Shared template tokens do not identify a conversation. Like llama-server,
             // treat a missing recurrent checkpoint as a cache miss and evaluate the supplied prompt.
-            fprintf(stderr, "KVMEM_TRACE multimodal_reset context=%p reason=%s lcp=%d keep=%d cached_rows=%zu live_rows=%d oldest_checkpoint=%d checkpoint_count=%zu\n",
+            kvmem_diag("KVMEM_TRACE multimodal_reset context=%p reason=%s lcp=%d keep=%d cached_rows=%zu live_rows=%d oldest_checkpoint=%d checkpoint_count=%zu\n",
                     (void *) st.ctx, st.cached_prompt ? "no_recurrent_checkpoint" : "new_conversation",
                     lcp, keep, st.cached_tokens.size(), st.mm_live_row,
                     st.mm_checkpoints.empty() ? -1 : st.mm_checkpoints.front().row, st.mm_checkpoints.size());
@@ -392,7 +395,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
                 path = "query_replay_skipped";
                 reason = "replay_exceeds_budget";
                 replay = false;
-                fprintf(stderr, "KVMEM_TRACE replay_skipped reason=over_budget query=[%d,%d) replay_rows=%d budget_tokens=%u\n",
+                kvmem_diag("KVMEM_TRACE replay_skipped reason=over_budget query=[%d,%d) replay_rows=%d budget_tokens=%u\n",
                         query, eval_end, eval_end - query, st.kparams.budget);
             }
             if (replay) {
@@ -421,7 +424,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         const char * source = !st.query_policy_user ? "legacy_suffix" : reused_query ? "cached_user" :
             capture_user ? "user" : "bootstrap_suffix";
         if (!retrieve && !reused_query) reason = "no_query_suffix";
-        fprintf(stderr, "KVMEM_PREFILL_DECISION path=%s reason=%s reuse_fallback=%s append=[%d,%d) query=[%d,%d) feature=[%d,%d) query_source=%s query_reused=%d q_rows=%u replay_rows=%u decision_ms=%.3f\n",
+        kvmem_diag("KVMEM_PREFILL_DECISION path=%s reason=%s reuse_fallback=%s append=[%d,%d) query=[%d,%d) feature=[%d,%d) query_source=%s query_reused=%d q_rows=%u replay_rows=%u decision_ms=%.3f\n",
                 path.c_str(), reason.c_str(), reuse_fallback.c_str(), base.row, eval_end, query, eval_end,
                 spans.query.front().begin, spans.query.back().end, source, reused_query, q_rows, st.mm_replayed, st.mm_perf.decision_ms);
         llama_kvmem_pin_working_set();
@@ -434,7 +437,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
             std::memcpy(&synced, carry.data(), sizeof(synced));
             if (synced != eval_end) throw std::runtime_error("MTP has unsynchronized visual rows");
         }
-        fprintf(stderr, "KVMEM_TRACE multimodal_prefill context=%p prefix_hit_rows=%d lcp=%d new_text_rows=%u new_image_rows=%u replayed_rows=%u vision_encode_calls=%u encoder_ms=%.2f logical_cursor=%d model_cursor=%d mtp_synced_rows=%d cached_tail_rows=%u replay_reason=%s embedding_cache_bytes=%zu checkpoint_bytes=%zu\n",
+        kvmem_diag("KVMEM_TRACE multimodal_prefill context=%p prefix_hit_rows=%d lcp=%d new_text_rows=%u new_image_rows=%u replayed_rows=%u vision_encode_calls=%u encoder_ms=%.2f logical_cursor=%d model_cursor=%d mtp_synced_rows=%d cached_tail_rows=%u replay_reason=%s embedding_cache_bytes=%zu checkpoint_bytes=%zu\n",
                 (void *) st.ctx, base.row, lcp, st.mm_new_text, st.mm_new_image, st.mm_replayed,
                 st.vision ? st.vision->encode_calls : 0, st.vision ? st.vision->encode_ms : 0.0,
                 eval_end, prompt.model_pos(eval_end), synced, st.mm_tail_replayed, st.mm_replayed ? reason.c_str() : "none",
@@ -455,11 +458,11 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         count(base);
         count(query_checkpoint);
         const auto & p = st.mm_perf;
-        fprintf(stderr, "KVMEM_PREFILL_PERF total_ms=%.3f first_ms=%.3f replay_ms=%.3f retrieval_ms=%.3f checkpoint_select_ms=%.3f checkpoint_save_ms=%.3f checkpoint_restore_ms=%.3f mean_nested_ms=%.3f carry_nested_ms=%.3f saves=%u restores=%u shared=%u restore_skips=%u checkpoint_unique_bytes=%zu\n",
+        kvmem_diag("KVMEM_PREFILL_PERF total_ms=%.3f first_ms=%.3f replay_ms=%.3f retrieval_ms=%.3f checkpoint_select_ms=%.3f checkpoint_save_ms=%.3f checkpoint_restore_ms=%.3f mean_nested_ms=%.3f carry_nested_ms=%.3f saves=%u restores=%u shared=%u restore_skips=%u checkpoint_unique_bytes=%zu\n",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-started).count(),
                 p.first_ms, p.replay_ms, p.retrieval_ms, p.select_checkpoint_ms, p.save_ms, p.restore_ms,
                 p.mean_ms, p.carry_ms, p.saves, p.restores, p.shared, p.restore_skips, unique_bytes);
-        fprintf(stderr, "KVMEM_CHECKPOINT_MEMORY ref_bytes=%zu unique_bytes=%zu live_bytes=%zu peak_bytes=%zu\n",
+        kvmem_diag("KVMEM_CHECKPOINT_MEMORY ref_bytes=%zu unique_bytes=%zu live_bytes=%zu peak_bytes=%zu\n",
                 ref_bytes, unique_bytes, st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
         if (copies_before.enabled) {
             const auto copies = llama_kvmem_get_transfer_stats();
@@ -476,7 +479,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
     } catch (const std::exception & e) {
         st.mm_error = e.what();
         if (dynamic_cast<const std::invalid_argument *>(&e)) st.mm_error_status = 400;
-        fprintf(stderr, "KVMEM_TRACE multimodal_error error=%s\n", e.what());
+        LOG_ERR("srv    KVMEM_TRACE multimodal_error error=%s\n", e.what());
         multimodal_finish_request(st);
         return false;
     }
@@ -492,7 +495,7 @@ static void multimodal_commit(ServerState & st, const std::vector<llama_token> &
     st.mm_committed = true;
     st.mm_rollback.reset();
     st.mm_rollback_prompt.reset();
-    fprintf(stderr, "KVMEM_CHECKPOINT_COMMIT live_bytes=%zu peak_bytes=%zu\n",
+    kvmem_diag("KVMEM_CHECKPOINT_COMMIT live_bytes=%zu peak_bytes=%zu\n",
             st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
 }
 

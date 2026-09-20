@@ -33,7 +33,7 @@ struct kvmem_spec_opts {
 // Supported cache types: f16, f32, q8_0, q5_0, q4_0.
 // q5_0 requires GGML_CUDA_FA_ALL_QUANTS (enabled by this project's build).
 ggml_type kvmem_parse_cache_type(const char * s, bool * ok);
-// Quantized K/V must match in the supported configurations.
+// Quantized K/V must match, except for K=q8_0, V=q4_0.
 bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v);
 
 struct kvmem_spec_session {

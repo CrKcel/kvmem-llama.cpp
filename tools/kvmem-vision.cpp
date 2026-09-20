@@ -1,3 +1,4 @@
+#include "llama-kvmem-diag.h"
 #include "kvmem-vision.h"
 #include "server-common.h"
 
@@ -93,7 +94,7 @@ kvmem_vision::kvmem_vision(llama_model * model, const std::string & path, bool g
     ctx_ = mtmd_init_from_file(path.c_str(), model, params);
     if (!ctx_) throw std::runtime_error("failed to load mmproj: " + path);
     n_embd_ = llama_model_n_embd_inp(model);
-    fprintf(stderr, "KVMEM_TRACE vision_load device=%s embedding_width=%d min_tokens=%d max_tokens=%d\n",
+    kvmem_diag("KVMEM_TRACE vision_load device=%s embedding_width=%d min_tokens=%d max_tokens=%d\n",
             gpu ? "GPU" : "CPU", n_embd_, min_tokens, max_tokens);
 }
 
