@@ -14,9 +14,14 @@ ap.add_argument('--build', type=Path, default=Path('build-win-bonsai'))
 ap.add_argument('--gpu', required=True, help='GPU UUID')
 ap.add_argument('--port', type=int, default=18332)
 ap.add_argument('--long', action='store_true', help='Exercise host spill and retrieval beyond the KV pool')
+ap.add_argument('--records', type=int, default=240)
+ap.add_argument('--kvmem-only', action='store_true')
+ap.add_argument('--decode-tokens', type=int, default=0, help='Also request a sustained prose response')
 ap.add_argument('--out', type=Path, default=Path('logs/bonsai-smoke'))
 ap.add_argument('--cuda', default=r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9')
 args = ap.parse_args()
+if args.records < 8 or not 0 <= args.decode_tokens <= 1024:
+    ap.error('records must be at least 8; decode-tokens must be in 0..1024')
 args.out.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
 env['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -32,13 +37,15 @@ creation = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 def request(path, data=None):
     body = None if data is None else json.dumps(data).encode()
     req = urllib.request.Request(base+path, data=body, headers={'Content-Type':'application/json'})
-    with opener.open(req, timeout=300) as response:
+    with opener.open(req, timeout=1800) as response:
         return json.load(response)
 
-def chat(messages):
+def chat(messages, max_tokens=96):
+    started = time.monotonic()
     result = request('/v1/chat/completions', {'model':'bonsai', 'messages':messages,
-        'temperature':0, 'seed':42, 'max_tokens':96,
+        'temperature':0, 'seed':42, 'max_tokens':max_tokens,
         'chat_template_kwargs':{'enable_thinking':False}, 'enable_thinking':False})
+    result['test_wall_seconds'] = time.monotonic() - started
     return result
 
 reject = subprocess.run([exe, '-m', str(args.model), '--spec-type', 'draft-mtp'], env=env,
@@ -50,12 +57,13 @@ simple = [
     [{'role':'user','content':'Reply with just the number: 17 + 25 = ?'}],
     [{'role':'user','content':'Translate the English word bamboo into Chinese. Reply with only the translation.'}],
 ]
-for mode in ['plain', 'kvmem']:
+for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
     command = [exe,'-m',str(args.model),'-ngl','99','--host','127.0.0.1','--port',str(args.port),
         '-c','32768' if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on','--kv-dtype','q8_0','--spec-type','none',
         '--kvmem-budget','2048','--kvmem-gen-reserve','1024','--kvmem-block-tokens','128',
         '--no-ui','--no-kvmem' if mode=='plain' else '--kvmem']
     peak = [0]
+    samples = []
     stop = threading.Event()
     def sample():
         while not stop.is_set():
@@ -63,6 +71,7 @@ for mode in ['plain', 'kvmem']:
                 v = subprocess.check_output(['nvidia-smi','-i',args.gpu,'--query-gpu=memory.used',
                     '--format=csv,noheader,nounits'], text=True, creationflags=creation, timeout=10)
                 peak[0] = max(peak[0], int(v.strip()))
+                samples.append({'time':time.time(), 'device_mib':int(v.strip())})
             except (subprocess.SubprocessError, ValueError):
                 pass
             stop.wait(1)
@@ -97,16 +106,33 @@ for mode in ['plain', 'kvmem']:
                 results[mode]['multi_turn'] = [first, second]
                 if args.long:
                     records = [f'Archive entry {i:04d}: the warehouse stores ordinary green bamboo crates.'
-                               for i in range(240)]
+                               for i in range(args.records)]
                     records[7] = 'Archive entry 0007: the secret access code for the lunar observatory is ORCHID-5831.'
+                    expected = ['ORCHID-5831']
+                    question = 'What is the secret access code for the lunar observatory? Reply only with the code.'
+                    if args.records > 240:
+                        middle, late = args.records//2, args.records*9//10
+                        records[middle] = f'Archive entry {middle:04d}: the secret access code for the coral laboratory is MAPLE-2964.'
+                        records[late] = f'Archive entry {late:04d}: the secret access code for the desert telescope is CEDAR-8172.'
+                        expected += ['MAPLE-2964', 'CEDAR-8172']
+                        question = 'List the secret access codes for the lunar observatory, coral laboratory, and desert telescope. Reply with each facility and its code.'
                     history = [{'role':'user','content':'Read this archive and remember its facts. Reply only OK.\n'+'\n'.join(records)}]
+                    (args.out/'archive-request.json').write_text(json.dumps(history,indent=2),encoding='utf-8')
                     first = chat(history)
+                    print('archive', first['usage'], 'seconds', round(first['test_wall_seconds'],2), flush=True)
                     history.append(first['choices'][0]['message'])
-                    history.append({'role':'user','content':'What is the secret access code for the lunar observatory? Reply only with the code.'})
+                    history.append({'role':'user','content':question})
                     second = chat(history)
                     results[mode]['long_retrieval'] = [first, second]
+                    answer = second['choices'][0]['message'].get('content','')
+                    results[mode]['needle_matches'] = {code:code in answer for code in expected}
+                    print('retrieval', json.dumps(results[mode]['needle_matches']), flush=True)
                     assert first['usage']['prompt_tokens'] > 3072, first['usage']
-                    assert 'ORCHID-5831' in second['choices'][0]['message'].get('content',''), second
+                    if args.decode_tokens:
+                        history.append(second['choices'][0]['message'])
+                        history.append({'role':'user','content':'Write a detailed 1000-word essay about how astronomical observatories work. Use complete paragraphs and keep writing until the explanation is finished.'})
+                        results[mode]['sustained_decode'] = chat(history, args.decode_tokens)
+                        print('sustained', results[mode]['sustained_decode']['usage'], flush=True)
             results[mode]['peak_device_mib'] = peak[0]
             results[mode]['command'] = command
         finally:
@@ -115,8 +141,13 @@ for mode in ['plain', 'kvmem']:
                 proc.wait(timeout=30)
             stop.set()
             monitor.join(timeout=15)
+            results.setdefault(mode, {})['peak_device_mib'] = peak[0]
+            (args.out/f'{mode}-memory.json').write_text(json.dumps(samples),encoding='utf-8')
             (args.out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
-results['short_greedy_answers_match'] = results['plain']['answers'] == results['kvmem']['answers']
-assert results['short_greedy_answers_match'], results
+if not args.kvmem_only:
+    results['short_greedy_answers_match'] = results['plain']['answers'] == results['kvmem']['answers']
+    assert results['short_greedy_answers_match'], results
 (args.out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
-print(json.dumps({'passed':True,'peaks_mib':{m:results[m]['peak_device_mib'] for m in ['plain','kvmem']} }),flush=True)
+if args.long:
+    assert all(results['kvmem']['needle_matches'].values()), results['kvmem']['needle_matches']
+print(json.dumps({'passed':True,'peaks_mib':{m:results[m]['peak_device_mib'] for m in ['plain','kvmem'] if m in results} }),flush=True)

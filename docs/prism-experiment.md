@@ -1,6 +1,6 @@
 # rc3 Prism baseline experiment
 
-Status: no-MTP adapter port implemented; Windows CUDA build, 11 tests and Bonsai PTQ1 text smoke tests pass. This is a local experimental build, not a release. See [validation results](bonsai-validation.md).
+Status: no-MTP adapter port implemented; Windows CUDA build, 11 tests and initial 4K text tests pass. A 32K workload runs on 8GB, but three-code recall fails (1/3 found). This is a local experimental build, not a release. See [validation results](bonsai-validation.md).
 
 ## Reproducible baseline
 
@@ -39,7 +39,7 @@ From this worktree, with Visual Studio C++ Build Tools and CUDA 12.9.86 installe
 
 The measured build targets SM120a (RTX 50 series); use suitable architecture flags and revalidate for other cards. CUDA runtime DLLs must be on PATH. The launcher accepts a GPU UUID to avoid index ambiguity.
 
-The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 32768-token logical context, 2048-token retrieval budget, 1024-token generation reserve, Q8 KV, batch/ubatch 128, no MTP and no projector. It listens on localhost port 18202. The 32768 setting is capacity, not a claim of validated 32K quality; the actual long smoke input was 4115 tokens.
+The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 32768-token logical context, 2048-token retrieval budget, 1024-token generation reserve, Q8 KV, batch/ubatch 128, no MTP and no projector. It listens on localhost port 18202. A subsequent 32013-token input and 256-token generation completed on 8GB without OOM, but only one of three historical codes was recalled. This configuration is not validated for reliable 32K recall; see the detailed results below.
 
 ```powershell
 python scripts/bonsai-smoke.py --long `
