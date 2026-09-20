@@ -4,7 +4,7 @@ Status: source baseline switched; KVMem adapter migration pending. This branch i
 
 ## Reproducible baseline
 
-- Branch: `experiment/rc3-prism`
+- Branch: `kvmem-bonsai-llama.cpp`
 - KVMem parent: `1734a2809bb0422da842d03a4734771ad9439ade`
 - Preserved rc3 snapshot commit: `a0365fd`
 - Snapshot: `rc3-cuda129-stage/source-manifest.json`, version `0.16.0-rc3`
