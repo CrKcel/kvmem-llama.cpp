@@ -9,6 +9,8 @@ param(
     [ValidateRange(1, 65535)][int]$Port = 18200,
     [ValidateRange(1, 2147483647)][int]$BlockTokens = 128,
     [string]$ReasoningEffort,
+    [ValidateSet('f16', 'f32', 'q8_0', 'q5_0', 'q4_0')][string]$CacheTypeK,
+    [ValidateSet('f16', 'f32', 'q8_0', 'q5_0', 'q4_0')][string]$CacheTypeV,
     [ValidateRange(0, 2147483647)][int]$ReasoningBudget = 4096,
     [ValidateRange(1, 5)][int]$Mtp = 3,
     [ValidateSet('cpu', 'gpu')][string]$VisionDevice,
@@ -55,6 +57,8 @@ $serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,
     '--kv-dtype', $kv, '--spec-type', 'draft-mtp', '--spec-draft-n-max', "$Mtp",
     '--kvmem-block-tokens', "$BlockTokens", '--kvmem-query-policy', 'user',
     '--enable-thinking', '--reasoning-budget', "$ReasoningBudget")
+if ($CacheTypeK) { $serverArgs += @('--cache-type-k', $CacheTypeK) }
+if ($CacheTypeV) { $serverArgs += @('--cache-type-v', $CacheTypeV) }
 if ($ReasoningEffort) { $serverArgs += @('--reasoning-effort', $ReasoningEffort) }
 if ($ChatTemplateFile) {
     $template = (Resolve-Path -LiteralPath $ChatTemplateFile).Path

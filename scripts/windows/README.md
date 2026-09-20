@@ -32,6 +32,13 @@ $env:CUDA_VISIBLE_DEVICES = '0'
 Open http://127.0.0.1:18200/ after loading. Keep the terminal open; Ctrl+C stops
 the server. The command uses default block size 128.
 
+For K=Q8 and V=Q4, replace the cache flags with `-ctk q8_0 -ctv q4_0`.
+The PowerShell recipe scripts also accept `-CacheTypeK q8_0 -CacheTypeV q4_0`.
+These options override the recipe K/V defaults independently; MTP KV remains
+F16 by default. K and V may independently use Q8, Q5 or Q4. GPU-tested pairs
+are Q8/Q8, Q5/Q5, Q4/Q4 and Q8/Q4 on CUDA; the remaining mixed pairs have only
+argument-parsing coverage, not full inference/quality/performance validation.
+
 ### Ready-made vision projector (no local quantization)
 
 Download **`mmproj-Qwen3.8-27B-Q5_K-MIX.gguf`** from
@@ -152,10 +159,11 @@ the same server defaults as Linux and remains configurable per API request.
 
 When invoking `bin/llama-kvmem-server.exe` or `bin/llama-kvmem-cli.exe` directly,
 llama.cpp-style `-ctk TYPE -ctv TYPE` (or `--cache-type-k` / `--cache-type-v`)
-is supported. **Quantized K and V must use the same cache type**: use
-`-ctk q8_0 -ctv q8_0`, for example. Mixed pairs such as `q8_0/q4_0` or
+is supported. Quantized K and V may independently use `q8_0`, `q5_0` or
+`q4_0`, for example `-ctk q8_0 -ctv q5_0`. Float/quantized pairs such as
 `q8_0/f16` are rejected before model loading. `--kv-dtype TYPE` sets both
-together; the recipe launchers already select matching K/V types.
+together; the recipe defaults still select matching K/V types. See the
+validation scope above before using a newly enabled pair.
 
 ## UI
 

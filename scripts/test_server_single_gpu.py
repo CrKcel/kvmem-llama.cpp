@@ -21,6 +21,7 @@ a = p.parse_args()
 out = Path(a.output).resolve()
 out.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
+env["KVMEM_TRACE"] = "1"
 env.pop('CUDA_VISIBLE_DEVICES', None)
 checks = []
 def check(name, ok):
@@ -50,7 +51,7 @@ try:
         args = [a.server, '-m', a.model, '--host', '127.0.0.1', '--port', str(port),
                 '-c', '2048', '--no-kvmem', '--kv-dtype', 'f16', '--gpu-layers', 'all',
                 '--no-webui', '--predict', '32', '-s', '123', '--threads', '2',
-                '--threads-batch', '2', '--reasoning-effort', 'none', *flags]
+                '--threads-batch', '2', '--reasoning-effort', 'none', '--verbosity', '4', *flags]
         logpath = out / (name + '.log')
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         base = f'http://127.0.0.1:{port}'

@@ -21,6 +21,23 @@ int main() {
     auto parse = [&](const char * flag, const char * value) {
         check(o.parse(flag, [&](const char *) { return value; }));
     };
+    check(o.sink_tokens == 0);
+    for (const char * value : {"0", "1", "128", "129", "1024", "2147483647"}) {
+        parse("--kvmem-sink-tokens", value);
+        check(o.sink_tokens == std::stoi(value));
+    }
+    for (const char * value : {"-1", "1.5", "128x", "", " 128", "2147483648", "9999999999999999999999"})
+        rejects([&] { parse("--kvmem-sink-tokens", value); });
+    rejects([&] { o.parse("--kvmem-sink-tokens", [](const char *) -> const char * {
+        throw std::invalid_argument("missing value");
+    }); });
+    for (const char * flag : {"-lv", "--verbosity", "--log-verbosity"}) {
+        parse(flag, "2"); check(o.verbosity == 2);
+        for (const char * bad : {"-1", "6", "2x", "1.5", "999999999999"})
+            rejects([&] { parse(flag, bad); });
+    }
+    parse("--kvmem-trace", ""); check(o.trace == 1);
+    parse("--no-kvmem-trace", ""); check(o.trace == 0);
     parse("-t", "3"); parse("-tb", "5"); parse("-ub", "64");
     check(o.threads == 3 && o.threads_batch == 5 && o.ubatch == 64);
     parse("--flash-attn", "off"); check(o.flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED);
