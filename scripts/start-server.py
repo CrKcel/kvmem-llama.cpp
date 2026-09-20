@@ -119,9 +119,16 @@ def listener(port):
     return True, {int(pid) for pid in re.findall(r'pid=(\d+)', output)}
 
 
-def healthy(port):
+def health_url(host, port):
+    # Wildcard bindings accept the loopback address; a specific host must be probed directly.
+    if host in ('0.0.0.0', '::', '[::]'):
+        return f'http://127.0.0.1:{port}/health'
+    return f'http://{host}:{port}/health'
+
+
+def healthy(port, host='127.0.0.1'):
     try:
-        with OPENER.open(f'http://127.0.0.1:{port}/health', timeout=1) as response:
+        with OPENER.open(health_url(host, port), timeout=1) as response:
             return response.status == 200
     except OSError:
         return False
@@ -178,7 +185,7 @@ def same_config(info, argv, env):
         return False
 
 
-def launch(args, binary, argv, env, port):
+def launch(args, binary, argv, env, port, host='127.0.0.1'):
     logs = ROOT / 'logs'
     logs.mkdir(exist_ok=True)
     pidfile = logs / f'{args.recipe}_{port}.pid'
@@ -196,9 +203,9 @@ def launch(args, binary, argv, env, port):
             if not owned(info, binary):
                 raise ValueError(f'port {port} belongs to another service; leaving it running, even with --restart')
             if not args.restart:
-                if same_config(info, argv, env) and healthy(port):
+                if same_config(info, argv, env) and healthy(port, host):
                     pidfile.write_text(str(info['pid']) + '\n')
-                    print(f"already up recipe={args.recipe} pid={info['pid']} http://127.0.0.1:{port}/health")
+                    print(f"already up recipe={args.recipe} pid={info['pid']} {health_url(host, port)}")
                     return
                 raise ValueError(f'port {port} has a different configuration or an unhealthy service; use --restart to switch')
             stop_owned(info, binary)
@@ -235,10 +242,10 @@ def launch(args, binary, argv, env, port):
                 if proc.poll() is not None:
                     raise RuntimeError(f'server exited with status {proc.returncode}')
                 busy, pids = listener(port)
-                if busy and pids == {proc.pid} and healthy(port):
+                if busy and pids == {proc.pid} and healthy(port, host):
                     print(f'started recipe={args.recipe} pid={proc.pid} gpu={env["CUDA_VISIBLE_DEVICES"]} '
                           f'vision={env["KVMEM_VISION_DEVICE"]} model={argv[2]} '
-                          f'http://127.0.0.1:{port}/health')
+                          f'{health_url(host, port)}')
                     return
                 time.sleep(.5)
             raise RuntimeError('server startup timed out')
@@ -258,10 +265,11 @@ def launch(args, binary, argv, env, port):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, epilog=
-        'Overrides: MODEL, MMPROJ, MMPROJ_DEVICE, CUDA_VISIBLE_DEVICES, PORT, BUILD_DIR, '
-        'IMAGE_MAX_TOKENS, SPEC_KV_DTYPE, SPEC_DRAFT_N_MAX, KVMEM_MTP_STATE, '
+        'Overrides: MODEL, MMPROJ, MMPROJ_DEVICE, CUDA_VISIBLE_DEVICES, PORT, HOST, LLAMA_ARG_HOST, '
+        'BUILD_DIR, IMAGE_MAX_TOKENS, SPEC_KV_DTYPE, SPEC_DRAFT_N_MAX, KVMEM_MTP_STATE, '
         'KVMEM_QUERY_REPLAY, KVMEM_QUERY_POLICY, CUDA_HOME, LD_LIBRARY_PATH.')
     ap.add_argument('--recipe', choices=('iq3', 'iq4'), required=True)
+    ap.add_argument('--host', help='bind address (default: HOST or LLAMA_ARG_HOST environment, then 127.0.0.1)')
     ap.add_argument('--default-model', required=True)
     ap.add_argument('--default-mmproj', required=True)
     ap.add_argument('--default-vision-device', choices=('cpu', 'gpu'), required=True)
@@ -286,6 +294,7 @@ def main():
     env = os.environ.copy()
     binary = (Path(env.get('BUILD_DIR', str(ROOT / 'build'))) / 'bin/llama-kvmem-server').resolve()
     port = int(env.get('PORT', '18200'))
+    host = args.host or env.get('HOST') or env.get('LLAMA_ARG_HOST') or '127.0.0.1'
     if not 1 <= port <= 65535:
         raise ValueError('invalid PORT')
     if args.stop:
@@ -323,7 +332,7 @@ def main():
     env['KVMEM_VISION_DEVICE'] = vision
     argv = [str(binary), '-m', str(model), '--mmproj', str(mmproj),
             '--mmproj-offload' if vision == 'gpu' else '--no-mmproj-offload',
-            '--image-max-tokens', str(image_tokens), '--host', '127.0.0.1', '--port', str(port),
+            '--image-max-tokens', str(image_tokens), '--host', host, '--port', str(port),
             '-c', '262144', '-n', str(args.reserve),
             '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
             '--kv-dtype', args.kv, '--spec-type', 'draft-mtp',
@@ -374,7 +383,7 @@ def main():
     # Resolve shared-library failures before stopping an existing working service.
     subprocess.run([str(binary), '--help'], env=env, stdout=subprocess.DEVNULL,
                    stderr=subprocess.PIPE, check=True, timeout=30)
-    launch(args, binary, argv, env, port)
+    launch(args, binary, argv, env, port, host)
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ param(
     [string]$BuildDir = $env:BUILD_DIR,
     [string]$Gpu = $env:CUDA_VISIBLE_DEVICES,
     [ValidateRange(1, 65535)][int]$Port = 18200,
+    [string]$ListenHost = $env:HOST,
     [ValidateRange(1, 2147483647)][int]$BlockTokens = 128,
     [string]$ReasoningEffort,
     [ValidateRange(0, 2147483647)][int]$ReasoningBudget = 4096,
@@ -46,11 +47,13 @@ if (!$Gpu) {
 if ([string]::IsNullOrWhiteSpace($Gpu) -or $Gpu -eq '-1') { throw 'Select an enabled GPU' }
 $budget = 36864; $reserve = 16384; $kv = 'q8_0'
 if ($Recipe -eq 'iq4') { $budget = 32768; $reserve = 12288; $kv = 'q5_0' }
+if ([string]::IsNullOrWhiteSpace($ListenHost)) { $ListenHost = $env:LLAMA_ARG_HOST }
+if ([string]::IsNullOrWhiteSpace($ListenHost)) { $ListenHost = '127.0.0.1' }
 if (!$VisionDevice) { if ($Recipe -eq 'iq3') { $VisionDevice = 'gpu' } else { $VisionDevice = 'cpu' } }
 $visionFlag = '--mmproj-offload'
 if ($VisionDevice -eq 'cpu') { $visionFlag = '--no-mmproj-offload' }
 $serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,
-    '--image-max-tokens', '512', '--host', '127.0.0.1', '--port', "$Port",
+    '--image-max-tokens', '512', '--host', $ListenHost, '--port', "$Port",
     '-c', '262144', '-n', "$reserve", '--kvmem-budget', "$budget", '--kvmem-gen-reserve', "$reserve",
     '--kv-dtype', $kv, '--spec-type', 'draft-mtp', '--spec-draft-n-max', "$Mtp",
     '--kvmem-block-tokens', "$BlockTokens", '--kvmem-query-policy', 'user',
@@ -92,8 +95,9 @@ $info.EnvironmentVariables['KVMEM_VISION_DEVICE'] = $VisionDevice
 $child = New-Object System.Diagnostics.Process
 $child.StartInfo = $info
 $started = $false
+$uiHost = if ($ListenHost -in @('0.0.0.0', '::')) { '127.0.0.1' } else { $ListenHost }
 try {
-    Write-Host "Starting $Recipe on http://127.0.0.1:$Port/ (foreground; Ctrl+C to stop)"
+    Write-Host "Starting $Recipe on http://$uiHost`:$Port/ (foreground; Ctrl+C to stop)"
     $started = $child.Start()
     while (!$child.WaitForExit(250)) {}
     $code = $child.ExitCode

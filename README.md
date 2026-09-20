@@ -138,7 +138,7 @@ MODEL=/path/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
   MMPROJ=/path/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf scripts/start-iq3.sh --dry-run
 ```
 
-GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. MTP3 and ReplaySSM are server defaults; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE` if needed. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
+GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE`, `HOST` and `PORT` can override recipe defaults. MTP3 and ReplaySSM are server defaults; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE` if needed. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
 
 ### llama.cpp-compatible KV cache flags
 
@@ -282,7 +282,7 @@ Initial computation measures the first processing of new input. Overall includes
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
 
-No auth or TLS. Bind `127.0.0.1`. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+No auth or TLS. Binds `127.0.0.1` by default. To serve on the LAN, pass `--host 0.0.0.0` to the server or to the launchers (`scripts/start-iq3.sh --host 0.0.0.0`; Windows: `start-iq3.ps1 -ListenHost 0.0.0.0`), or set `HOST` / `LLAMA_ARG_HOST` (e.g. `HOST=0.0.0.0 scripts/start-iq3.sh`). Open firewall ports for LAN clients. Stream `usage` includes `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
 
 ## Documentation
 
