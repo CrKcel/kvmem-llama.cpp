@@ -41,7 +41,9 @@ $env:CUDA_VISIBLE_DEVICES = '0'
 ```
 
 Open http://127.0.0.1:18200/ after loading. Keep the terminal open; Ctrl+C stops
-the server. The command uses default block size 128.
+the server. The command uses default block size 128. To serve the API on your
+LAN, change `--host 127.0.0.1` to `--host 0.0.0.0` (and allow the port in
+Windows Defender Firewall).
 
 For K=Q8 and V=Q4, replace the cache flags with `-ctk q8_0 -ctv q4_0`.
 The PowerShell recipe scripts also accept `-CacheTypeK q8_0 -CacheTypeV q4_0`.
@@ -164,8 +166,14 @@ for testers with prepared files.
 
 IQ3 defaults to CPU vision with `--no-mmproj-offload`, leaving more GPU memory for inference. To use GPU vision explicitly, pass `-VisionDevice gpu`. IQ4 continues to default to CPU vision.
 
-Other switches include `-Port`, `-Mtp`, `-VisionDevice cpu|gpu`,
+Other switches include `-Port`, `-ListenHost`, `-ApiKey`, `-Mtp`, `-VisionDevice cpu|gpu`,
 `-ReasoningBudget`, `-ChatTemplateFile`, `-ChatTemplateKwargs`, `-UiDir`, `-NoUi`.
+`-ListenHost` (or `HOST` / `LLAMA_ARG_HOST`) selects the bind address; the
+default `127.0.0.1` only serves this machine, so pass `-ListenHost 0.0.0.0` to
+serve the API on your LAN.
+`-ApiKey KEY` (or `-ApiKeyFile PATH`, mirroring llama-server) requires
+`Authorization: Bearer KEY` / `X-Api-Key` on protected routes. `/health`,
+`/v1/health`, OPTIONS requests and mounted UI static assets remain public.
 Reasoning effort follows the model template unless explicitly set. Sampling uses
 the same server defaults as Linux and remains configurable per API request.
 
