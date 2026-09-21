@@ -107,6 +107,8 @@ The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested
 
 ## Browser chat
 
+The updated Windows rc3 runtime packages include both UIs: **full UI by default** at `share/kvmem/ui`, plus the lightweight UI at `share/kvmem/ui-lightweight`. The normal IQ3/IQ4 launch scripts enable the full UI automatically. To choose the lightweight UI, append `-UiDir '.\share\kvmem\ui-lightweight'` when running from the extracted package directory; `-NoUi` disables UI. Download the runtime ZIP again if you have the original lightweight-only rc3 package. Full UI does not add server-side tool execution or stream resumption to the KVMem backend.
+
 The optional lightweight UI reuses llama.cpp's Markdown/code renderer, input components and browser-local history. It supports text and images, separate thinking effort/budget controls, stopping generation, and server-measured decode speed. It does not execute tools or manage model loading.
 
 Build the static page once with Node.js 22 and npm:
@@ -114,6 +116,8 @@ Build the static page once with Node.js 22 and npm:
 ```bash
 python3 scripts/build-webui.py
 ```
+
+Add `--full-ui` to build the full upstream UI, including its generated icons and PWA assets. Use separate `--output` directories when keeping both builds.
 
 Then start the rebuilt server with the usual IQ3/IQ4 script and open `http://127.0.0.1:18200/`. The server automatically serves `build/share/kvmem/ui/` when present. Precompiled packages can include the page, so users do not need Node.js. `--ui-dir PATH` selects another static directory; `--no-ui` disables the page.
 

@@ -11,6 +11,13 @@ It contains the server, CLI, matching CUDA DLLs and browser UI. It does **not**
 contain model weights or the quantization tool. The separate **quantizer** ZIP
 is optional; it is unnecessary when your GGUF files are already prepared.
 
+Updated rc3 runtime ZIPs include the full UI (default, `share/kvmem/ui`) and
+lightweight UI (`share/kvmem/ui-lightweight`). Normal IQ3/IQ4 launch scripts
+enable the full UI automatically. From the extracted package directory, append
+`-UiDir '.\share\kvmem\ui-lightweight'` to select the lightweight UI, or `-NoUi`
+to disable UI. Existing rc3 users should download the updated runtime ZIP again.
+Full UI does not add backend tool execution or stream resumption support.
+
 Requirements: Windows x64, a compatible NVIDIA driver, Microsoft Visual C++ x64
 runtime, and an AVX2/FMA/F16C/BMI2 CPU. The package contains CUDA targets `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`
 and `sm_120a`; the CUDA 12.9.86 package additionally contains `sm_70` for Volta.

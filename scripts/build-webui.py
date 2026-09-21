@@ -94,7 +94,8 @@ def main():
         stamp.write_text(lock_hash)
     subprocess.run([node_command('npx'), 'svelte-kit', 'sync'], cwd=work, check=True)
     subprocess.run([node_command('npx'), 'svelte-check', '--threshold', 'error'], cwd=work, check=True)
-    subprocess.run([node_command('npx'), 'vite', 'build'], cwd=work, check=True)
+    command = [node_command('npm'), 'run', 'build'] if args.full_ui else [node_command('npx'), 'vite', 'build']
+    subprocess.run(command, cwd=work, check=True)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     shutil.copytree(work / 'dist', output, dirs_exist_ok=True)
