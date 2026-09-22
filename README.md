@@ -107,7 +107,7 @@ The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested
 
 ## Browser chat
 
-The updated Windows rc3 runtime packages include both UIs: **full UI by default** at `share/kvmem/ui`, plus the lightweight UI at `share/kvmem/ui-lightweight`. The normal IQ3/IQ4 launch scripts enable the full UI automatically. To choose the lightweight UI, append `-UiDir '.\share\kvmem\ui-lightweight'` when running from the extracted package directory; `-NoUi` disables UI. Download the runtime ZIP again if you have the original lightweight-only rc3 package. Full UI does not add server-side tool execution or stream resumption to the KVMem backend.
+The updated Windows rc3 runtime packages include both UIs: **full UI by default** at `share/kvmem/ui`, plus the lightweight UI at `share/kvmem/ui-lightweight`. Their independent `start-iq3.ps1` / `start-iq4.ps1` scripts accept only `-Model`, `-Mmproj` and optional `-Gpu` (default `0`, index or UUID). They directly invoke the server and no longer use shared launch helpers. To choose the lightweight UI, edit `$UiDir` in the script to end in `share\kvmem\ui-lightweight`; to disable UI, replace `--webui` with `--no-ui`. Edit `$Port = 18200` to change the port. Download the runtime ZIP again for these updated scripts. Full UI does not add server-side tool execution or stream resumption to the KVMem backend. See the [Windows runtime guide](scripts/windows/README.md) for a complete launch command.
 
 The optional lightweight UI reuses llama.cpp's Markdown/code renderer, input components and browser-local history. It supports text and images, separate thinking effort/budget controls, stopping generation, and server-measured decode speed. It does not execute tools or manage model loading.
 
@@ -315,9 +315,9 @@ llama-kvmem-server -m model.gguf -ctk q8_0 -ctv q4_0
 ```
 
 The Linux recipes accept `--cache-type-k q8_0 --cache-type-v q4_0`;
-Windows recipes accept `-CacheTypeK q8_0 -CacheTypeV q4_0`. These optional
-settings override the recipe defaults for each component independently.
-Existing recipe defaults are unchanged.
+in the updated Windows rc3 runtime scripts, edit `-ctk q8_0 -ctv q4_0`
+directly in the script. The older source launcher also accepts
+`-CacheTypeK q8_0 -CacheTypeV q4_0`. Existing recipe defaults are unchanged.
 
 Flag compatibility does not imply support for every llama.cpp cache type or
 mixed K/V combination. These flags affect the main model; MTP cache precision
@@ -373,7 +373,7 @@ Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q
 --enable-thinking --reasoning-budget 4096
 ```
 
-IQ3 now defaults to CPU vision (`--no-mmproj-offload`) to leave more GPU memory for inference. Vision remains available. To explicitly use GPU vision, set `MMPROJ_DEVICE=gpu` on Linux/WSL or pass `-VisionDevice gpu` to the Windows launcher. Historical performance tables below retain their original projector placement.
+IQ3 now defaults to CPU vision (`--no-mmproj-offload`) to leave more GPU memory for inference. Vision remains available. To explicitly use GPU vision, set `MMPROJ_DEVICE=gpu` on Linux/WSL; in the updated Windows rc3 runtime script, replace `--no-mmproj-offload` with `--mmproj-offload`. Historical performance tables below retain their original projector placement.
 
 ### IQ4 27B — optional experimental comparison
 
