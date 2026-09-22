@@ -2253,7 +2253,7 @@ int main(int argc, char ** argv) {
             kvmem_diag("KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
         }
         try {
-            multimodal_validate_capacity(st, *parsed_prompt, st.query_policy_user ? (int) toks.size() : qbegin, (int) toks.size());
+            multimodal_validate_capacity(st, *parsed_prompt, (int) toks.size());
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
