@@ -59,12 +59,17 @@ public class ArgvEcho {
     }
     $bonsai = & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -DryRun | ConvertFrom-Json
     $a = $bonsai.argv
-    Check ($a[[Array]::IndexOf($a, '--spec-type') + 1] -eq 'draft-mtp') 'Bonsai enables MTP'
-    Check ($a[[Array]::IndexOf($a, '--spec-kv-dtype') + 1] -eq 'f16') 'Bonsai F16 draft KV'
+    Check ($a[[Array]::IndexOf($a, '--spec-type') + 1] -eq 'none') 'Bonsai defaults to MTP off'
+    Check (!($a -contains '--spec-kv-dtype')) 'Bonsai omits unused draft KV'
     Check (!($a -contains '--mmproj')) 'Bonsai text mode does not load a projector'
     Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq '24576') 'Bonsai budget'
     Check ($a[[Array]::IndexOf($a, '--kvmem-gen-reserve') + 1] -eq '10240') 'Bonsai reserve'
     Check ($a[[Array]::IndexOf($a, '--ubatch-size') + 1] -eq '128') 'Bonsai prefill batch'
+    $bonsaiMtp = & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -Mtp -DryRun | ConvertFrom-Json
+    $a = $bonsaiMtp.argv
+    Check ($a[[Array]::IndexOf($a, '--spec-type') + 1] -eq 'draft-mtp') 'Bonsai explicit MTP'
+    Check ($a[[Array]::IndexOf($a, '--spec-draft-n-max') + 1] -eq '1') 'Bonsai optional MTP1'
+    Check ($a[[Array]::IndexOf($a, '--spec-kv-dtype') + 1] -eq 'f16') 'Bonsai F16 draft KV'
     $failed = $false
     try { & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -Budget 129 -DryRun }
     catch { $failed = $true }

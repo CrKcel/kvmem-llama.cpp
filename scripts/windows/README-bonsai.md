@@ -13,28 +13,31 @@ CUDA Toolkit, Visual Studio, Python and Node.js are not needed to run it.
 2. Download `Ternary-Bonsai-2-27B-PTQ1_0.gguf` (5.95 GB) from
    [ModelScope](https://modelscope.cn/models/prism-ml/Ternary-Bonsai-2-27B-gguf/files)
    or [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/main).
-3. The launcher defaults to **MTP draft=1** and requires the merged r3 model.
-   Prepare it using `docs/bonsai-mtp-validation.md`, then run:
+3. The launcher defaults to **MTP off** and uses the original PTQ1 model:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf' -Gpu 0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf' -Gpu 0
 ```
 
 Open **http://127.0.0.1:18202/** after loading. Keep the terminal open;
 Ctrl+C stops the server. The full chat UI is bundled and enabled automatically.
 Change `-Gpu` if the NVIDIA device selected is not the desired card.
-The model defaults to `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf`
+The model defaults to `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf`
 when `-Model` is omitted. Weights are not included in this ZIP.
-To use the original PTQ1 model without MTP, pass `-NoMtp` (it also selects the
-original filename automatically when `-Model` is omitted). `-Mtp:$false` is supported
-from PowerShell as well. No automatic fallback occurs when the MTP model is missing.
+To enable MTP, pass `-Mtp` with a merged r3 model prepared using
+`docs/bonsai-mtp-validation.md`. With `-Mtp` and no `-Model`, the launcher selects
+`Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf` in the same model directory.
+`-NoMtp` and `-Mtp:$false` remain supported. No automatic fallback occurs when
+the selected model is missing.
 
 解压后按上面命令启动，然后打开浏览器即可聊天。无需编译或安装 CUDA Toolkit。
-默认开启 MTP draft=1，主模型使用 Q8 KV、MTP 草稿使用 F16 KV，128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
+默认关闭 MTP，使用原版 PTQ1 模型、Q8 KV、128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
 思考预算为 4096 token（可用 `-ReasoningBudget` 覆盖）。思考 token 包含在总生成上限内。
 128K 配置已在 5050 上完成 130,103 token 实际输入测试，无 OOM，但检索仅命中 1/3；不能视为长文质量验证通过。
 
-Defaults: MTP draft=1, target K/V Q8_0, draft K/V F16, context 131072, retrieval budget 24576, generation reserve 10240,
+手动加 `-Mtp` 开启时，默认 draft=1、草稿 K/V F16；代码场景可加 `-DraftTokens 2`。
+
+Defaults: MTP off, target K/V Q8_0, context 131072, retrieval budget 24576, generation reserve 10240,
 thinking enabled with a 4096-token reasoning budget. The 128K MTP1 run on RTX 5050
 processed 130,103 input tokens without OOM, but recalled only 1/3 planted codes.
 Prefill was 60.95 token/s (35m35s), sustained decode 4.63 token/s, peak VRAM 7845 MiB.
@@ -64,7 +67,7 @@ See the release validation for checks repeated on the packaged multiarch binary.
 ## Experimental scope
 
 This version includes optimized PTQ1 CUDA decode and optional community r3 MTP.
-MTP draft=1 is on by default; `-NoMtp` disables it. On the measured short decode workload, the new kernels
+MTP is off by default; `-Mtp` enables draft=1 with F16 draft KV. On the measured short decode workload, the new kernels
 improved no-MTP speed by 19-54%; draft=1 added another 15-18% on two RTX 50 GPUs.
 Those measurements used an 8K context and 2K+1K pool; they are not the throughput
 of the default larger pool at near 128K input.

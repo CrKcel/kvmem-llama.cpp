@@ -13,7 +13,7 @@ param(
     [ValidateRange(1, 4096)][int]$Batch = 128,
     [ValidateSet('q8_0', 'q5_0', 'q4_0')][string]$KvType = 'q8_0',
     [ValidateSet('f16', 'q8_0', 'q5_0', 'q4_0')][string]$DraftKvType = 'f16',
-    [switch]$Mtp = $true,
+    [switch]$Mtp,
     [switch]$NoMtp,
     [ValidateRange(1, 2)][int]$DraftTokens = 1,
     [switch]$DryRun
