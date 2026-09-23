@@ -39,6 +39,10 @@ synthetic case; it does not isolate a specific faulty component.
 
 ## Reproduce
 
+Follow-up: the [same-GPU Q8/Q8 control](bonsai-kvmem-128k-q8kv-5060-validation.md)
+also recalled only 1/3 with the identical answer. Raising V precision alone does
+not resolve this failure; MTP and V Q4 are not required to reproduce it.
+
 ```powershell
 python scripts/bonsai-smoke.py --cache-type-k q8_0 --cache-type-v q4_0 --long --records 7650 --kvmem-only --decode-tokens 256 --request-timeout 7200 --context 131072 --budget 24576 --reserve 10240 --build build-win-bonsai-release --out logs/bonsai-128k-nomtp-5060-rerun --model "$env:LOCALAPPDATA/KVMem/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf" --gpu GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c
 ```
