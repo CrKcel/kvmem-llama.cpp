@@ -1,112 +1,96 @@
-# Bonsai 2 experimental Windows runtime — rc3-prism.2
+# Bonsai 2 Windows 实验版 — v0.16.0-rc3-prism.3
 
-Based on KVMem rc3 with Prism llama.cpp. This package is for **Windows x64,
-NVIDIA RTX 30/40/50 series** (SM86/89/120a), using CUDA 12.9.86.
-Kernel and MTP inference validation uses RTX 5050 Laptop 8 GB and RTX 5060 Ti
-16 GB. RTX 30/40 are compiled targets, not hardware-tested. Requires an AVX2/FMA/F16C/BMI2 CPU, a compatible
-NVIDIA driver and the Microsoft Visual C++ x64 Redistributable.
-CUDA Toolkit, Visual Studio, Python and Node.js are not needed to run it.
+Windows x64，CUDA 12.9.86，编译包含 **SM75 / SM86 / SM89 / SM120a**，
+对应 RTX **20 / 30 / 40 / 50** 系。RTX 5050 Laptop、5060 Ti 用于实机验证；
+20/30/40 系仅完成架构编译，未做实机验证。
 
-## Quick start / 快速使用
+本包包含 server、CLI、完整聊天 UI 和 CUDA 运行库，不含模型。
+需要兼容的 NVIDIA 驱动、Microsoft Visual C++ x64 Redistributable，
+以及支持 AVX2/FMA/F16C/BMI2 的 CPU。运行不需要安装 CUDA Toolkit、Python、Node.js 或编译工具。
 
-1. Extract the entire ZIP, keeping `bin`, `scripts` and `share` together.
-2. Download `Ternary-Bonsai-2-27B-PTQ1_0.gguf` (5.95 GB) from
-   [ModelScope](https://modelscope.cn/models/prism-ml/Ternary-Bonsai-2-27B-gguf/files)
-   or [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/main).
-3. The launcher defaults to **MTP off** and uses the original PTQ1 model:
+## 下载和启动
+
+1. 解压整个 `kvmem-v0.16.0-rc3-prism.3-windows-x86_64-cuda12.9-rtx20-30-40-50.zip`，保留目录结构。
+2. 从 [ModelScope](https://modelscope.cn/models/prism-ml/Ternary-Bonsai-2-27B-gguf/files)
+   或 [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/main)
+   下载 `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（约 5.95 GB）。
+3. 在解压目录打开 PowerShell，执行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf' -Gpu 0
 ```
 
-Open **http://127.0.0.1:18202/** after loading. Keep the terminal open;
-Ctrl+C stops the server. The full chat UI is bundled and enabled automatically.
-Change `-Gpu` if the NVIDIA device selected is not the desired card.
-The model defaults to `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf`
-when `-Model` is omitted. Weights are not included in this ZIP.
-To enable MTP, pass `-Mtp` with a merged r3 model prepared using
-`docs/bonsai-mtp-validation.md`. With `-Mtp` and no `-Model`, the launcher selects
-`Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf` in the same model directory.
-`-NoMtp` and `-Mtp:$false` remain supported. No automatic fallback occurs when
-the selected model is missing.
+加载完成后打开 **http://127.0.0.1:18202/**。终端会显示 prefill/decode 时间和速度；
+保持终端开启，Ctrl+C 停止服务。多显卡机器可修改 `-Gpu`，端口可用 `-Port` 修改。
+省略 `-Model` 时，模型路径为 `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf`。
+启动器不会自动下载或转换模型。
 
-解压后按上面命令启动，然后打开浏览器即可聊天。无需编译或安装 CUDA Toolkit。
-默认关闭 MTP，使用原版 PTQ1 模型、Q8 KV、128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
-思考预算为 4096 token（可用 `-ReasoningBudget` 覆盖）。思考 token 包含在总生成上限内。
-128K 配置已在 5050 上完成 130,103 token 实际输入测试，无 OOM，但检索仅命中 1/3；不能视为长文质量验证通过。
+## 默认配置
 
-手动加 `-Mtp` 开启时，默认 draft=1、草稿 K/V F16；代码场景可加 `-DraftTokens 2`。
+| 设置 | 默认值 |
+|---|---|
+| MTP | **关闭**，无需 MTP 头 |
+| 上下文上限 | 131072 tokens（128K） |
+| 检索 KV 预算 | 24576 tokens（24K） |
+| 生成预留 | 10240 tokens（10K） |
+| 主模型 K/V | Q8_0 / Q8_0 |
+| 思考 | 开启，预算 4096 tokens |
+| batch / ubatch | 128 / 128 |
 
-Defaults: MTP off, target K/V Q8_0, context 131072, retrieval budget 24576, generation reserve 10240,
-thinking enabled with a 4096-token reasoning budget. The 128K MTP1 run on RTX 5050
-processed 130,103 input tokens without OOM, but recalled only 1/3 planted codes.
-Prefill was 60.95 token/s (35m35s), sustained decode 4.63 token/s, peak VRAM 7845 MiB.
-Windows shared GPU memory peaked at 706 MiB; that counter alone does not prove paging.
-Those historical 128K measurements used Q8 draft KV. The F16 default was selected
-after a separate RTX 5060 Ti MTP1 test at 4K/16K input: sampled total VRAM fell
-from 7834 to 7766 MiB, with no consistent decode speed improvement.
-Use `-DraftKvType q8_0` to override the launcher default; when running the binary
-directly, use `--spec-kv-dtype q8_0`. `-KvType` controls only the target KV.
-This is a failed recall test, not a 128K quality guarantee. See
-`docs/bonsai-128k-mtp1-validation.md`. Thinking was disabled for benchmark requests;
-only 256 output tokens were tested, not 10K.
+使用 `-Context`、`-Budget`、`-Reserve`、`-ReasoningBudget` 或 `-KvType` 覆盖。
+思考 token 计入生成上限。128K 是可配置上限，**不代表长文召回质量通过验证**。
 
-## Tested 64K configuration / 已验证的 64K 配置
+## 手动启用 MTP
+
+需要额外准备带社区 ProCreations r3 MTP 头的合并 GGUF，见
+`docs/bonsai-mtp-validation.md`；合并脚本在匹配的源码 ZIP 中。
+MTP 头不是 Prism 官方 checkpoint。本版不集成 DSpark。
+
+下面使用已准备好的 Q4_0 MTP 头模型，开启 MTP1：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -NoMtp -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf' -Gpu 0 -Context 65536 -Budget 24576 -Reserve 10240
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q4_0.gguf' -Gpu 0 -Mtp
 ```
 
-Earlier single-SM120a build on RTX 5050 Laptop: actual prompt 64,653 tokens,
-129.36 tokens/s prefill, 9.40 tokens/s decode (256 output tokens), three of
-three planted identifiers recalled. Whole-device VRAM peak 7,454 MiB out of
-8,151 MiB. The 10K generation reserve was allocated, but 10K output was not
-tested. Other GPU/display workloads can change available VRAM.
-See the release validation for checks repeated on the packaged multiarch binary.
+代码生成场景可加 `-DraftTokens 2`。手动开启时默认 draft=1、草稿 K/V **F16**；
+`-DraftKvType q8_0` 可覆盖草稿 KV，`-KvType` 只改变主 KV。
+直接使用 server/CLI 时，手动启用参数为 `--spec-type draft-mtp`，
+草稿类型可用 `--spec-kv-dtype` 覆盖。
 
-## Experimental scope
+如果只传 `-Mtp` 而不传 `-Model`，启动器仍按既有约定选择模型目录中的
+`Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf`；使用 Q4 头请显式指定路径。
+`-NoMtp` 仍可显式关闭。开启 MTP 不会自动缩小 KV 池。
 
-This version includes optimized PTQ1 CUDA decode and optional community r3 MTP.
-MTP is off by default; `-Mtp` enables draft=1 with F16 draft KV. On the measured short decode workload, the new kernels
-improved no-MTP speed by 19-54%; draft=1 added another 15-18% on two RTX 50 GPUs.
-Those measurements used an 8K context and 2K+1K pool; they are not the throughput
-of the default larger pool at near 128K input.
-Prefill was roughly unchanged. See the bundled `docs/milestones/v0.16.0-rc3-prism.2.md`
-and `docs/bonsai-kernel-comparison.md` for conditions and validation boundaries.
+## 性能和验证范围
 
-### MTP model and smaller pool / MTP 模型与小池配置
+此前 5060 Ti、24K+10K、主 KV Q8、草稿 F16、关闭思考的两个 Python 代码任务：
 
-Prepare a merged r3 GGUF following the bundled `docs/bonsai-mtp-validation.md`.
-The original GGUF has no MTP head; the launcher does not download or convert weights.
-Use `-NoMtp` to run the original file.
-For an 8GB GPU, start with the tested smaller pool:
+| 输入长度 | 关闭 MTP | MTP1 | MTP2 |
+|---|---:|---:|---:|
+| 约 4K | 45.84 tok/s | 61.43 tok/s | 68.93 tok/s |
+| 约 16K | 40.82 tok/s | 50.28 tok/s | 58.63 tok/s |
+| 显存峰值 | 7208 MiB | 7766 MiB | 7916 MiB |
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf' -Gpu 0 -Mtp -DraftTokens 1 -Context 8192 -Budget 2048 -Reserve 1024 -ReasoningBudget 256
-```
+这些是 **decode** 速度；prefill 约 398–411 tok/s，整次请求提升较小。
+测试使用 Q4 MTP 头、每项生成 156–352 tokens，未覆盖所有编程任务。
+拓扑排序通过功能检查，区间合并三种模式均有同一边界错误。
+详见 `docs/bonsai-coding-mtp012-5060.md`。历史速度数据来自加入 SM75 前的相同内核实现，
+本次发布包验证以 `VALIDATION.json` 为准。
 
-The merged model adds about 430 MiB on disk; draft=1 added about 0.6 GiB VRAM
-in the small-pool tests. Enabling MTP does not shrink the default 24K + 10K pool.
-The default pool has now been exercised at near 128K input, with the recall failure
-and low memory margin described above. Continuous 10K output remains untested.
-draft=2 was slower than draft=1 in both short-workload GPU comparisons.
+历史 F16/Q8 草稿 KV 对照中，F16 整卡峰值少约 68 MiB，速度没有一致改善。
+长文测试曾出现答案块已选入预算但仍漏答：80K/128K 的部分测试仅召回 1/3；
+本版不宣称修复长文召回，也未验证连续生成 10K。8GB 显存余量会受到显示和其他程序影响，
+可先用 `-Context 8192 -Budget 2048 -Reserve 1024` 检查运行环境。
+只支持主存 KV 外溢，不支持 NVMe 存储。
 
-Server logs, including prefill/decode timing, are forwarded to the launch terminal.
+随包提供 `BUILD-INFO.json`、`VALIDATION.json`、`SHA256SUMS` 和许可证；
+发布附件包含匹配源码 ZIP。升级请解压到新目录，以避免混用旧版 DLL 和脚本。
 
-- Text-only Bonsai PTQ1 is validated; MTP uses a community-trained head, not an
-  official Prism checkpoint. DSpark is not integrated. Do not use rc3 IQ3/IQ4
-  MTP launch recipes with this build.
-- No NVMe KV storage. CPU-memory KV spill and retrieval are enabled.
-- Full UI does not imply backend tool execution or stream resumption support.
-- This is a separate experiment, not a general replacement for the rc3 runtime.
-- `SHA256SUMS`, `BUILD-INFO.json`, `VALIDATION.json` and a matching source ZIP
-  accompany the release. Source includes the applied Prism integration patch.
+## 从源码重新编译
 
-## Rebuild
-
-From the `kvmem-bonsai-llama.cpp` branch with its submodule initialized:
+在 `kvmem-bonsai-llama.cpp` 分支初始化子模块后：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/build.ps1 -BuildDir build-win-bonsai-release -CudaPath 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9' -ExperimentalCuda129 -CudaArchitectures '86-real;89-real;120a-real' -Jobs 4
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/build.ps1 -BuildDir build-win-bonsai-release -CudaPath 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9' -ExperimentalCuda129 -CudaArchitectures '75-real;86-real;89-real;120a-real' -Jobs 4
 python scripts/build-webui.py --full-ui --output build-win-bonsai-release/share/kvmem/ui
 ```

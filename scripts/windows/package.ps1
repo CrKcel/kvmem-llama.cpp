@@ -101,7 +101,7 @@ if ($Bonsai) { $readme = 'README-bonsai.md' }
 if ($Component -eq 'Quantizer') { $readme = 'README-quantizer.md' }
 Copy-Item -LiteralPath (Join-Path $SourceDir ('scripts/windows/' + $readme)) -Destination (Join-Path $OutputDir 'README.md')
 if ($Bonsai -and $Component -eq 'Runtime') {
-    foreach ($name in 'docs/milestones/v0.16.0-rc3-prism.2.md', 'docs/bonsai-kernel-comparison.md', 'docs/bonsai-mtp-validation.md', 'docs/bonsai-128k-mtp1-validation.md', 'docs/bonsai-mtp1-f16-5060-comparison.md') {
+    foreach ($name in 'docs/milestones/v0.16.0-rc3-prism.3.md', 'docs/milestones/v0.16.0-rc3-prism.2.md', 'docs/bonsai-kernel-comparison.md', 'docs/bonsai-mtp-validation.md', 'docs/bonsai-128k-mtp1-validation.md', 'docs/bonsai-mtp1-f16-5060-comparison.md', 'docs/bonsai-coding-mtp012-5060.md', 'docs/bonsai-80k-kv-audit.md') {
         $dest = Join-Path $OutputDir $name
         $null = New-Item -ItemType Directory -Path (Split-Path $dest) -Force
         Copy-Item -LiteralPath (Join-Path $SourceDir $name) -Destination $dest
@@ -143,7 +143,8 @@ $info = @{ component = $Component; status = 'experimental-windows-build'; versio
     external_msvc_runtime_dlls = @($runtimeDlls); gpu_runtime_validation = 'not certified by packaging' }
 if ($Bonsai) {
     $info.mtp_supported = $true
-    $info.mtp_default = $true
+    $info.mtp_default = $false
+    $info.mtp_draft_kv_default = 'f16'
     $info.dspark_supported = $false
     $info.ptq1_optimized_kernels = $true
     $info.ptq1_pdl_sync_fix = $true
