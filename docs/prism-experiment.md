@@ -2,7 +2,7 @@
 
 Historical initial validation: no-MTP adapter port implemented; Windows CUDA build, 11 tests and initial 4K text tests pass. On 8GB, 32K with a 2K retrieval budget recalls 1/3 codes; 64K with a 24K retrieval budget plus 10K reserve recalls 3/3 at a 7454 MiB peak. These are synthetic tests. For current release preparation, see [rc3-prism.2 notes](milestones/v0.16.0-rc3-prism.2.md). See [validation results](bonsai-validation.md).
 
-September 23 update: opt-in snapshot MTP is now implemented and tested separately
+September 23 update: snapshot MTP is now implemented and tested separately
 with the community r3 head. Its smaller-pool results and limitations are in
 [Bonsai MTP validation](bonsai-mtp-validation.md); the 64K measurements above remain no-MTP results.
 
@@ -43,7 +43,7 @@ From this worktree, with Visual Studio C++ Build Tools and CUDA 12.9.86 installe
 
 The measured build targets SM120a (RTX 50 series); use suitable architecture flags and revalidate for other cards. CUDA runtime DLLs must be on PATH. The launcher accepts a GPU UUID to avoid index ambiguity.
 
-The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 131072-token logical context, 24576-token retrieval budget, 10240-token generation reserve, Q8 KV, batch/ubatch 128, thinking enabled with a 4096-token reasoning budget, no MTP and no projector. It listens on localhost port 18202. These are launch defaults, not a completed 128K-input validation. The earlier 32K test used the old 2048+1024 pool and recalled one of three codes; the 64K test used 24576+10240 and recalled all three. See the measured results for their precise scope.
+The launcher uses the downloaded model under `%LOCALAPPDATA%/KVMem/models`, a 131072-token logical context, 24576-token retrieval budget, 10240-token generation reserve, Q8 KV, batch/ubatch 128, thinking enabled with a 4096-token reasoning budget, MTP draft=1 and no projector. It selects the merged r3 model by default; use `-NoMtp` for the original PTQ1 model. It listens on localhost port 18202. The later [128K MTP1 test](bonsai-128k-mtp1-validation.md) completed without OOM but recalled only1/3 codes. It is not a passing long-context quality validation. The earlier 32K test used the old 2048+1024 pool and recalled one of three codes; the 64K test used 24576+10240 and recalled all three. See the measured results for their precise scope.
 
 ```powershell
 python scripts/bonsai-smoke.py --long `

@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-> **Bonsai experimental branch (`0.16.0-rc3-prism.2`, release preparation):** Prism remains pinned to `9a9394a895b9`. This version integrates faster PTQ1 CUDA decode and opt-in snapshot MTP with a community-trained r3 head. MTP remains off by default. See the [new version notes](docs/milestones/v0.16.0-rc3-prism.2.md), [Bonsai quick start](scripts/windows/README-bonsai.md), and [paired kernel measurements](docs/bonsai-kernel-comparison.md).
+> **Bonsai experimental branch (`0.16.0-rc3-prism.2`, release preparation):** Prism remains pinned to `9a9394a895b9`. This version integrates faster PTQ1 CUDA decode and snapshot MTP with a community-trained r3 head. The Bonsai launcher enables MTP draft=1 by default and selects the merged r3 model; use `-NoMtp` with the original PTQ1 model. The [128K MTP1 test](docs/bonsai-128k-mtp1-validation.md) completed without OOM on RTX5050, but recalled only 1/3 codes (60.95 token/s prefill, 4.63 token/s decode); long-context quality is not validated. See the [new version notes](docs/milestones/v0.16.0-rc3-prism.2.md), [Bonsai quick start](scripts/windows/README-bonsai.md), and [paired kernel measurements](docs/bonsai-kernel-comparison.md).
 
 **Release status:** rc3-prism.1 remains a GitHub draft; rc3-prism.2 is in preparation. The older draft package does not include the new kernels or MTP restoration. The rc3 benchmarks and IQ3/IQ4 recipes below describe the previous baseline, not Bonsai.
 

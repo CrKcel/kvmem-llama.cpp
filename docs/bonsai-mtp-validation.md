@@ -43,7 +43,7 @@ an existing output. Keep the original PTQ1 model for no-MTP use.
 - Restore the MTP follower KV pool, sized from the target pool, and preserve logical
   positions, hidden-state carry, accepted-prefix trimming and retrieval synchronization.
 - Distinguish a target-context reference from genuinely shared KV memory.
-- Preserve no-MTP operation; `-Mtp` is opt-in, with one draft token by default.
+- Preserve no-MTP operation via `-NoMtp`; the Bonsai launcher now enables MTP with one draft token by default. The original implementation was opt-in.
 - Record/Fold and DSpark remain outside this implementation.
 
 `patches/llama-kvmem-current.patch` was replayed against pristine files from the
@@ -52,6 +52,11 @@ working tree. The current cumulative patch also includes the later CUDA kernel c
 `patches/prism-bonsai-mtp-embedding.patch`, built with `build-prism-reference.ps1 -Mtp`.
 
 ## Validation
+
+Later default-pool test: the [128K MTP1 run on RTX5050](bonsai-128k-mtp1-validation.md)
+completed without OOM, but recalled only1/3 codes. See that report for the full
+35-minute prefill, 4.63 token/s decode and memory measurements. This is a recall
+failure, not a passing128K quality test. The smaller-pool measurements below are historical.
 
 Follow-up: after the user disabled Smart App Control, the optional optimized
 kernel build passed the previously blocked MTP KV suite. It also made draft=1
@@ -110,8 +115,8 @@ Full responses, commands, timings and logs are under:
 - `logs/bonsai-mtp-kvmem-5050/`
 - `logs/bonsai-mtp-final-5050/` (final build smoke)
 
-MTP with 24K + 10K pools, actual 32K/64K/128K inputs, 10K-token generation,
-vision/tool requests, and RTX 30/40 hardware has not been validated here.
+The later24K+10K/128K run is reported above. Continuous10K generation,
+vision/tool requests, and RTX30/40 hardware remain unvalidated.
 Do not apply the old no-MTP 64K memory result to this snapshot configuration.
 
 ## Start the local experimental build
@@ -126,7 +131,7 @@ Open `http://127.0.0.1:18202/`. This chooses the new local GGUF automatically,
 uses Q8 target/draft KV and one draft token, and forwards server logs to the console.
 Use `-DraftTokens 2` only for comparison. `-Model` can override the model path.
 
-Without `-Mtp`, the original model and defaults remain: context 128K, budget 24K,
+With `-NoMtp`, the original model is selected; context remains 128K, budget 24K,
 reserve 10K, thinking budget 4096. Enabling MTP does not silently shrink those
 defaults, so specify the smaller tested pool explicitly on an 8GB card.
 The command above sets a smaller thinking budget to fit the example's 1K output reserve.
@@ -139,5 +144,4 @@ python scripts/bonsai-mtp-smoke.py --binary build-win-bonsai/bin/llama-kvmem-ser
 
 The later PTQ1 kernel investigation is complete for the measured workload: draft=1
 adds about 15-18% over optimized no-MTP decode on the two tested GPUs. See the
-kernel comparison above. MTP remains off by default because of its memory cost
-and limited long-context validation.
+kernel comparison above. The launcher now defaults to MTP draft=1 at the user's request; explicit `-NoMtp` remains available to reduce memory use.

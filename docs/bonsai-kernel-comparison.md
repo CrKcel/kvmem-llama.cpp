@@ -157,6 +157,6 @@ includes these kernels in its normal build. To reproduce the isolated run:
 ./scripts/windows/start-bonsai.ps1 -BuildDir ./build-win-bonsai-kernel/build -Gpu 0 -Mtp -DraftTokens 1 -Context 8192 -Budget 2048 -Reserve 1024 -ReasoningBudget 256
 ```
 
-Omit `-Mtp` for the original PTQ1 model without the appended head; that is a
+Use `-NoMtp` for the original PTQ1 model without the appended head; that is a
 different model file from the controlled comparison above. These measurements
 precede release packaging; they do not certify a later multiarch release binary.

@@ -1,7 +1,8 @@
-"""Local no-MTP smoke test; needs an existing GGUF and CUDA build."""
+"""Local Bonsai smoke test, optionally with MTP; needs an existing GGUF and CUDA build."""
 import argparse
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import threading
@@ -13,6 +14,9 @@ ap.add_argument('--model', type=Path, required=True)
 ap.add_argument('--build', type=Path, default=Path('build-win-bonsai'))
 ap.add_argument('--gpu', required=True, help='GPU UUID')
 ap.add_argument('--port', type=int, default=18332)
+ap.add_argument('--mtp', action='store_true', help='Enable snapshot MTP with one draft token; requires a model with an MTP head')
+ap.add_argument('--reasoning-budget', type=int, default=4096)
+ap.add_argument('--request-timeout', type=int, default=7200, help='Seconds per request, including long prefill')
 ap.add_argument('--long', action='store_true', help='Exercise host spill and retrieval beyond the KV pool')
 ap.add_argument('--records', type=int, default=240)
 ap.add_argument('--kvmem-only', action='store_true')
@@ -44,7 +48,7 @@ creation = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 def request(path, data=None):
     body = None if data is None else json.dumps(data).encode()
     req = urllib.request.Request(base+path, data=body, headers={'Content-Type':'application/json'})
-    with opener.open(req, timeout=1800) as response:
+    with opener.open(req, timeout=args.request_timeout) as response:
         return json.load(response)
 
 def chat(messages, max_tokens=96):
@@ -61,10 +65,14 @@ simple = [
 ]
 for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
     command = [exe,'-m',str(args.model),'-ngl','99','--host','127.0.0.1','--port',str(args.port),
-        '-c',str(args.context) if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on','--kv-dtype','q8_0','--spec-type','none',
+        '-c',str(args.context) if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on','--kv-dtype','q8_0','--spec-type','draft-mtp' if args.mtp else 'none',
+        '--enable-thinking','--reasoning-budget',str(args.reasoning_budget),
         '--kvmem-budget',str(args.budget),'--kvmem-gen-reserve',str(args.reserve),'--kvmem-block-tokens','128',
         '--no-ui','--no-kvmem' if mode=='plain' else '--kvmem']
-    results[mode] = {'command':command}
+    if args.mtp:
+        command += ['--spec-draft-n-max','1','--spec-kv-dtype','q8_0','--kvmem-mtp-state','snapshots']
+    results[mode] = {'command':command, 'request_thinking':False, 'server_reasoning_budget':args.reasoning_budget}
+    print('starting', mode, 'mtp', args.mtp, 'context', args.context, 'pool', args.budget+args.reserve, flush=True)
     peak = [0]
     samples = []
     stop = threading.Event()
@@ -79,6 +87,8 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
                 pass
             stop.wait(1)
     monitor = threading.Thread(target=sample, daemon=True)
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', args.port))
     with (args.out/f'{mode}.log').open('w',encoding='utf-8') as log:
         proc = subprocess.Popen(command, stdout=log, stderr=log, env=env, creationflags=creation)
         monitor.start()
@@ -121,6 +131,7 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
                         question = 'List the secret access codes for the lunar observatory, coral laboratory, and desert telescope. Reply with each facility and its code.'
                     history = [{'role':'user','content':'Read this archive and remember its facts. Reply only OK.\n'+'\n'.join(records)}]
                     (args.out/'archive-request.json').write_text(json.dumps(history,indent=2),encoding='utf-8')
+                    print('submitting archive:', args.records, 'records', flush=True)
                     first = chat(history)
                     results[mode]['long_retrieval'] = [first]
                     print('archive', first['usage'], 'seconds', round(first['test_wall_seconds'],2), flush=True)

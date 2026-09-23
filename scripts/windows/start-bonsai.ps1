@@ -12,13 +12,18 @@ param(
     [ValidateRange(-1, 262144)][int]$ReasoningBudget = 4096,
     [ValidateRange(1, 4096)][int]$Batch = 128,
     [ValidateSet('q8_0', 'q5_0', 'q4_0')][string]$KvType = 'q8_0',
-    [switch]$Mtp,
+    [switch]$Mtp = $true,
+    [switch]$NoMtp,
     [ValidateRange(1, 2)][int]$DraftTokens = 1,
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'native-process.ps1')
+if ($NoMtp) {
+    if ($PSBoundParameters.ContainsKey('Mtp') -and $Mtp) { throw 'Choose either -Mtp or -NoMtp' }
+    $Mtp = $false
+}
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if (!$BuildDir) {
     if (Test-Path -LiteralPath (Join-Path $root 'bin/llama-kvmem-server.exe')) { $BuildDir = $root }

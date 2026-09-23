@@ -13,31 +13,40 @@ CUDA Toolkit, Visual Studio, Python and Node.js are not needed to run it.
 2. Download `Ternary-Bonsai-2-27B-PTQ1_0.gguf` (5.95 GB) from
    [ModelScope](https://modelscope.cn/models/prism-ml/Ternary-Bonsai-2-27B-gguf/files)
    or [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/main).
-3. Open PowerShell in the extracted directory and run:
+3. The launcher defaults to **MTP draft=1** and requires the merged r3 model.
+   Prepare it using `docs/bonsai-mtp-validation.md`, then run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf' -Gpu 0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf' -Gpu 0
 ```
 
 Open **http://127.0.0.1:18202/** after loading. Keep the terminal open;
 Ctrl+C stops the server. The full chat UI is bundled and enabled automatically.
 Change `-Gpu` if the NVIDIA device selected is not the desired card.
-The model defaults to `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf`
+The model defaults to `%LOCALAPPDATA%\KVMem\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf`
 when `-Model` is omitted. Weights are not included in this ZIP.
+To use the original PTQ1 model without MTP, pass `-NoMtp` (it also selects the
+original filename automatically when `-Model` is omitted). `-Mtp:$false` is supported
+from PowerShell as well. No automatic fallback occurs when the MTP model is missing.
 
 解压后按上面命令启动，然后打开浏览器即可聊天。无需编译或安装 CUDA Toolkit。
-默认使用 Q8 KV、128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
+默认开启 MTP draft=1，使用 Q8 KV、128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
 思考预算为 4096 token（可用 `-ReasoningBudget` 覆盖）。思考 token 包含在总生成上限内。
-128K 是启动配置，尚未完成 128K 实际输入验证；下文结果来自此前的 64K 测试。
+128K 配置已在 5050 上完成 130,103 token 实际输入测试，无 OOM，但检索仅命中 1/3；不能视为长文质量验证通过。
 
-Defaults: context 131072, retrieval budget 24576, generation reserve 10240,
-thinking enabled with a 4096-token reasoning budget. The 128K default has not
-been validated with an actual 128K input.
+Defaults: MTP draft=1, context 131072, retrieval budget 24576, generation reserve 10240,
+thinking enabled with a 4096-token reasoning budget. The 128K MTP1 run on RTX 5050
+processed 130,103 input tokens without OOM, but recalled only 1/3 planted codes.
+Prefill was 60.95 token/s (35m35s), sustained decode 4.63 token/s, peak VRAM 7845 MiB.
+Windows shared GPU memory peaked at 706 MiB; that counter alone does not prove paging.
+This is a failed recall test, not a 128K quality guarantee. See
+`docs/bonsai-128k-mtp1-validation.md`. Thinking was disabled for benchmark requests;
+only 256 output tokens were tested, not 10K.
 
 ## Tested 64K configuration / 已验证的 64K 配置
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf' -Gpu 0 -Context 65536 -Budget 24576 -Reserve 10240
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -NoMtp -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf' -Gpu 0 -Context 65536 -Budget 24576 -Reserve 10240
 ```
 
 Earlier single-SM120a build on RTX 5050 Laptop: actual prompt 64,653 tokens,
@@ -50,15 +59,18 @@ See the release validation for checks repeated on the packaged multiarch binary.
 ## Experimental scope
 
 This version includes optimized PTQ1 CUDA decode and optional community r3 MTP.
-MTP is off by default. On the measured short decode workload, the new kernels
+MTP draft=1 is on by default; `-NoMtp` disables it. On the measured short decode workload, the new kernels
 improved no-MTP speed by 19-54%; draft=1 added another 15-18% on two RTX 50 GPUs.
+Those measurements used an 8K context and 2K+1K pool; they are not the throughput
+of the default larger pool at near 128K input.
 Prefill was roughly unchanged. See the bundled `docs/milestones/v0.16.0-rc3-prism.2.md`
 and `docs/bonsai-kernel-comparison.md` for conditions and validation boundaries.
 
-### Optional MTP / 可选 MTP
+### MTP model and smaller pool / MTP 模型与小池配置
 
 Prepare a merged r3 GGUF following the bundled `docs/bonsai-mtp-validation.md`.
-The original GGUF has no MTP head; `-Mtp` does not download or convert weights.
+The original GGUF has no MTP head; the launcher does not download or convert weights.
+Use `-NoMtp` to run the original file.
 For an 8GB GPU, start with the tested smaller pool:
 
 ```powershell
@@ -67,8 +79,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bons
 
 The merged model adds about 430 MiB on disk; draft=1 added about 0.6 GiB VRAM
 in the small-pool tests. Enabling MTP does not shrink the default 24K + 10K pool.
-That default pool, long actual inputs (32K+), and 10K output have not been tested
-with MTP. draft=2 was slower than draft=1 in both tested GPUs.
+The default pool has now been exercised at near 128K input, with the recall failure
+and low memory margin described above. Continuous 10K output remains untested.
+draft=2 was slower than draft=1 in both short-workload GPU comparisons.
 
 Server logs, including prefill/decode timing, are forwarded to the launch terminal.
 
