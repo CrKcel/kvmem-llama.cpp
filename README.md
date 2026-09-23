@@ -1,6 +1,6 @@
 # KVMem + llama.cpp
 
-**Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1)
+**Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 (rc1)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) · [Windows / Linux ROCm (beta)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta)
 
 **QQ community / QQ 交流群：1040777853**
 
@@ -69,6 +69,8 @@ The project builds on llama.cpp's CUDA backend, with the platform above used for
 | Windows x64 — CUDA 13.2.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Recommended **runtime** ZIP; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
 | Windows x64 — CUDA 12.9.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Alternative **runtime** ZIP; GPU targets 70/75/80/86/89/90/120a, including Volta. Quantizer is a separate optional ZIP. |
 | Linux / WSL2 x86_64 | [v0.16.0-rc1](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc1) | Existing Linux CUDA package; no rc3 Linux/WSL rebuild is included. |
+| Windows x64 — ROCm (beta) | [rc3-rocm-beta](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta) | Native HIP runtime ZIP for gfx1100/gfx1200/gfx1201 (RX 7900 / 9060 XT / 9070 series). |
+| Linux / WSL2 x86_64 — ROCm (beta) | [rc3-rocm-beta](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta) | Runtime tar.gz built on Ubuntu 24.04 with ROCm 7.2.x; other distributions may need a source build. |
 
 No model weights are bundled. For a Windows text-only setup, download the
 ready-made IQ3 `-mtp` model linked in the [Windows quick start](scripts/windows/README.md).
