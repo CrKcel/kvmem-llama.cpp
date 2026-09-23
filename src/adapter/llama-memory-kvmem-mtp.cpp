@@ -424,8 +424,15 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     const uint64_t vspan = (uint64_t) block_tokens_ * vrow;
     const uint64_t stride = kspan + vspan;
     uint8_t * scratch = nullptr;
-    if (cudaMalloc(reinterpret_cast<void **>(&scratch),
-                   n_moves * (size_t) stride) != cudaSuccess) {
+    const size_t scratch_bytes = n_moves * (size_t) stride;
+    const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch), scratch_bytes);
+    if (alloc_error != cudaSuccess) {
+        if (alloc_error == cudaErrorMemoryAllocation) {
+            // The caller restores packed host KV; do not leak this handled OOM to the next kernel.
+            (void) cudaGetLastError();
+            LLAMA_LOG_WARN("%s: %zu-byte layout scratch unavailable; using host KV fallback\n",
+                           __func__, scratch_bytes);
+        }
         return false;
     }
     kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),

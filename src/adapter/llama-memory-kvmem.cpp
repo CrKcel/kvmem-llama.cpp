@@ -991,8 +991,13 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
     bool d2d_ok = n_res > 0;
     uint8_t * scratch = nullptr;
     if (d2d_ok) {
-        if (cudaMalloc(reinterpret_cast<void **>(&scratch),
-                       static_cast<size_t>(n_res) * scratch_stride) != cudaSuccess) {
+        const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch),
+                                                   static_cast<size_t>(n_res) * scratch_stride);
+        if (alloc_error != cudaSuccess) {
+            if (alloc_error == cudaErrorMemoryAllocation) {
+                // Host fallback handles this allocation failure before any layout copies start.
+                (void) cudaGetLastError();
+            }
             scratch = nullptr;
             d2d_ok = false;
             LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);

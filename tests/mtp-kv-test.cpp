@@ -8,6 +8,10 @@
 
 #include "ggml-backend.h"
 
+#ifdef KVMEM_TEST_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -127,6 +131,20 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type_k, ggml
     const llama_memory_kvmem_mtp::LayoutMove moves[] = {
         {3, 5, block}, {5, 7, block}, {7, 3, 13},
     };
+#ifdef KVMEM_TEST_CUDA
+    // A failed optional scratch allocation must leave KV and CUDA state intact.
+    size_t free_bytes = 0, total_bytes = 0;
+    require(cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess, "CUDA memory query failed");
+    const size_t stride = block * (ggml_row_size(type_k, tensors[0]->ne[0]) +
+                                   ggml_row_size(type_v, tensors[1]->ne[0]));
+    std::vector<llama_memory_kvmem_mtp::LayoutMove> oversized(total_bytes / stride + 1, moves[0]);
+    require(cudaGetLastError() == cudaSuccess, "CUDA error before layout OOM test");
+    require(!mtp.layout_d2d(oversized.data(), oversized.size()), "oversized layout allocation succeeded");
+    require(cudaGetLastError() == cudaSuccess, "layout OOM leaked into the next CUDA operation");
+    for (int i = 0; i < 2; ++i) {
+        compare(tensors[i], expected[i]);
+    }
+#endif
     for (int i = 0; i < 2; ++i) {
         const auto before = expected[i];
         const size_t row = ggml_row_size(tensors[i]->type, tensors[i]->ne[0]);
