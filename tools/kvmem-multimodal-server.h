@@ -3,7 +3,7 @@
 #include <set>
 #include <numeric>
 
-static void multimodal_validate_capacity(const ServerState & st, const kvmem_prompt & prompt, int query, int end) {
+static void multimodal_validate_capacity(const ServerState & st, const kvmem_prompt & prompt, int end) {
     if (!st.kparams.enabled || !st.kparams.budget || !prompt.has_media()) return;
     const uint32_t block = st.kparams.block_tokens ? st.kparams.block_tokens : 32;
     const uint32_t budget = st.kparams.budget / block;
@@ -19,12 +19,8 @@ static void multimodal_validate_capacity(const ServerState & st, const kvmem_pro
         if (group.second - group.first + std::min(group.first, sink) > budget)
             throw std::invalid_argument("image group exceeds KV budget; reduce --image-max-tokens or increase --kvmem-budget");
     }
-    std::set<uint32_t> required;
-    for (uint32_t i = 0; i < sink; ++i) required.insert(i);
-    for (uint32_t i = groups.back().first; i < groups.back().second; ++i) required.insert(i);
-    for (uint32_t i = std::max(0, query) / block; i < ((uint32_t) end + block - 1) / block; ++i) required.insert(i);
-    if (required.size() > budget)
-        throw std::invalid_argument("latest image and text query exceed KV budget; reduce the image size or query span");
+    // Text suffixes may be trimmed after the first pass. Only an image group
+    // that cannot fit intact with the sink is a hard capacity error.
 }
 
 // Included after the single-slot server state and stream helpers.
@@ -356,9 +352,6 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
                 llama_kvmem_can_append(eval_end, st.turn_generation_rows, true, reason);
         }
         if (all_resident) llama_kvmem_keep_selected();
-        if (st.query_policy_user && retrieve && !reused_query && !all_resident) {
-            multimodal_validate_capacity(st, prompt, query, eval_end);
-        }
         if (n_cache_hit) *n_cache_hit = base.row;
         if (multimodal_decode_span(st, base.row, query, false, io) != 0) throw std::runtime_error("multimodal prefill failed or cancelled");
         auto query_checkpoint = multimodal_checkpoint(st, query);
@@ -369,6 +362,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
             if (!llama_kvmem_commit_resident(false)) throw std::runtime_error("incomplete KV after query continuation");
         } else if (retrieve) {
             bool replay = true;
+            bool replay_fits = true;
             {
                 kvmem_scoped_ms timer(st.mm_perf.retrieval_ms);
                 if (all_resident && llama_kvmem_commit_resident()) {
@@ -383,11 +377,20 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
                     } else {
                         path = "query_replay";
                         if (st.query_replay_auto) reason = "selection_or_attention_view_changed";
+                        // Check the actual selection: complete image groups also
+                        // consume slots, so a text-only budget estimate is insufficient.
+                        const uint32_t block = st.kparams.block_tokens ? st.kparams.block_tokens : 32;
+                        for (uint32_t id = query / block; id < ((uint32_t) eval_end + block - 1) / block; ++id) {
+                            if (!std::binary_search(selection.blocks.begin(), selection.blocks.end(), id)) {
+                                replay_fits = false;
+                                break;
+                            }
+                        }
                         llama_kvmem_apply_selection(selection);
                     }
                 }
             }
-            if (replay && !prompt.has_media() && !llama_kvmem_query_replay_fits(query, eval_end)) {
+            if (replay && !replay_fits) {
                 // Selection may trim the mandatory suffix when a long tool history
                 // exceeds the retrieval budget. Keep the completed first-pass
                 // recurrent state, logits and MTP carry; restoring the query

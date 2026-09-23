@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -388,9 +389,15 @@ std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected
         count += need;
     };
     for (uint32_t i = 0; i < std::min(n, cfg_.sink_blocks); ++i) keep(i, true);
-    for (auto id : mandatory) keep(id, true);
     // Keep the latest image as a whole, including its boundary blocks.
     if (!groups.empty()) keep(groups.back().first, true);
+    // Retrieval suffixes are best effort when they exceed the budget. Preserve
+    // the newest rows after reserving the sink and latest complete image; the
+    // caller must skip query replay if any replay block was dropped.
+    // During prefill these are incoming rows, which must all have slots.
+    auto newest = mandatory;
+    std::sort(newest.begin(), newest.end(), std::greater<uint32_t>());
+    for (auto id : newest) keep(id, recency);
     auto better = [&](uint32_t a, uint32_t b) {
         if (!recency && blocks_[a].attn_score != blocks_[b].attn_score) return blocks_[a].attn_score > blocks_[b].attn_score;
         return a > b;

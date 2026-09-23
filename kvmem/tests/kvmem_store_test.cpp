@@ -1089,10 +1089,12 @@ static void test_media_groups_with_shared_boundary() {
         CHECK((selected == std::vector<uint32_t>{0, 4, 5, 6, 7, 8}));
         bool threw = false;
         try {
-            if (prefill) store.pick_prefill_pressure_blocks({11});
-            else store.pick_topk_blocks({11});
+            selected = prefill ? store.pick_prefill_pressure_blocks({11}) : store.pick_topk_blocks({11});
         } catch (const std::runtime_error &) { threw = true; }
-        CHECK(threw);
+        // Incoming prefill rows are hard requirements. Retrieval can drop the
+        // suffix and let the server continue from the completed first pass.
+        CHECK(threw == prefill);
+        if (!prefill) CHECK((selected == std::vector<uint32_t>{0, 4, 5, 6, 7, 8}));
     }
     // A historical image is either entirely selected or absent.
     store.set_media_ranges({{2*32+1, 4*32}, {9*32, 11*32}});
@@ -1102,7 +1104,32 @@ static void test_media_groups_with_shared_boundary() {
     CHECK(std::binary_search(selected.begin(), selected.end(), 10));
 }
 
+static void test_media_suffix_over_budget() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = cfg.prefill_budget = 6*32;
+    cfg.sink_blocks = 1;
+    KvMemStore store(cfg);
+    store.register_append(12*32);
+    store.set_media_ranges({{2*32+1, 4*32}, {6*32+1, 8*32}});
+    // Text alone fits, but sink + image + suffix do not. Keep newest text.
+    CHECK((store.pick_topk_blocks({8, 9, 10, 11}) == std::vector<uint32_t>{0, 6, 7, 9, 10, 11}));
+    // An unsorted/duplicated mandatory list cannot change recency priority.
+    CHECK((store.pick_topk_blocks({11, 8, 10, 9, 8}) == std::vector<uint32_t>{0, 6, 7, 9, 10, 11}));
+    // Exact fit including a shared image/text boundary block.
+    CHECK((store.pick_topk_blocks({7, 9, 10, 11}) == std::vector<uint32_t>{0, 6, 7, 9, 10, 11}));
+    // Older image groups remain atomic even when the suffix intersects them.
+    CHECK((store.pick_topk_blocks({3, 8, 9, 10, 11}) == std::vector<uint32_t>{0, 6, 7, 9, 10, 11}));
+    // A single image that cannot fit intact is still rejected.
+    store.set_media_ranges({{2*32, 8*32}});
+    bool threw = false;
+    try { store.pick_topk_blocks({11}); }
+    catch (const std::runtime_error &) { threw = true; }
+    CHECK(threw);
+}
+
 int main() {
+    test_media_suffix_over_budget();
     test_media_groups_with_shared_boundary();
     test_register_append();
     test_selection_diff_and_remap();
