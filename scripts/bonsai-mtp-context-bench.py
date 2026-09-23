@@ -19,6 +19,7 @@ p.add_argument('--out', type=Path, required=True)
 p.add_argument('--repeats', type=int, default=2)
 p.add_argument('--port', type=int, default=18346)
 p.add_argument('--drafts', type=int, nargs='+', default=[0, 1, 2, 3])
+p.add_argument('--draft-kv', choices=['q8_0'], help='Explicit draft KV for servers whose default does not inherit target KV')
 a = p.parse_args()
 assert a.repeats > 0 and all(d in range(4) for d in a.drafts)
 a.out.mkdir(parents=True, exist_ok=True)
@@ -61,6 +62,8 @@ for draft in a.drafts:
         '--spec-type','draft-mtp' if draft else 'none']
     if draft:
         cmd += ['--spec-draft-n-max',str(draft),'--spec-draft-p-min','0','--kvmem-mtp-state','snapshots']
+        if a.draft_kv:
+            cmd += ['--spec-kv-dtype',a.draft_kv]
     entry = {'draft':draft,'command':cmd,'measurements':[]}
     report['runs'].append(entry)
     stop = threading.Event()
