@@ -34,6 +34,11 @@ recalled 3/3 on this GPU with K Q8 / V Q4. Results cover one synthetic archive;
 
 ## Reproduce
 
+Follow-up: [the same binary with KVMem disabled](bonsai-same-binary-128k-fullkv-validation.md)
+recalls 3/3. The command differs only by `--no-kvmem`; GPU, model, binary and
+Q8/Q8 types match. This narrows the failure to behavior enabled by KVMem, while
+the precise prefill/retrieval/state stage remains unresolved.
+
 ```powershell
 python scripts/bonsai-smoke.py --cache-type-k q8_0 --cache-type-v q8_0 --long --records 7650 --kvmem-only --decode-tokens 256 --request-timeout 7200 --context 131072 --budget 24576 --reserve 10240 --build build-win-bonsai-release --out logs/bonsai-128k-q8kv-5060-rerun --model "$env:LOCALAPPDATA/KVMem/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf" --gpu GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c
 ```

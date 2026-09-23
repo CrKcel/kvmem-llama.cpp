@@ -23,6 +23,7 @@ ap.add_argument('--request-timeout', type=int, default=7200, help='Seconds per r
 ap.add_argument('--long', action='store_true', help='Exercise host spill and retrieval beyond the KV pool')
 ap.add_argument('--records', type=int, default=240)
 ap.add_argument('--kvmem-only', action='store_true')
+ap.add_argument('--plain-only', action='store_true', help='Run the same workload at --context with KVMem disabled')
 ap.add_argument('--decode-tokens', type=int, default=0, help='Also request a sustained prose response')
 ap.add_argument('--context', type=int, default=32768)
 ap.add_argument('--budget', type=int, default=2048)
@@ -30,6 +31,8 @@ ap.add_argument('--reserve', type=int, default=1024)
 ap.add_argument('--out', type=Path, default=Path('logs/bonsai-smoke'))
 ap.add_argument('--cuda', default=r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9')
 args = ap.parse_args()
+if args.kvmem_only and args.plain_only:
+    ap.error('Choose either --kvmem-only or --plain-only')
 if args.records < 8 or not 0 <= args.decode_tokens <= args.reserve:
     ap.error('records must be at least 8; decode-tokens must fit the generation reserve')
 if min(args.budget, args.reserve) < 128 or args.budget % 128 or args.reserve % 128:
@@ -66,9 +69,9 @@ simple = [
     [{'role':'user','content':'Reply with just the number: 17 + 25 = ?'}],
     [{'role':'user','content':'Translate the English word bamboo into Chinese. Reply with only the translation.'}],
 ]
-for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
+for mode in (['plain'] if args.plain_only else ['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
     command = [exe,'-m',str(args.model),'-ngl','99','--host','127.0.0.1','--port',str(args.port),
-        '-c',str(args.context) if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on',
+        '-c',str(args.context) if mode=='kvmem' or args.plain_only else '8192','-b','128','-ub','128','-fa','on',
         '--cache-type-k',args.cache_type_k,'--cache-type-v',args.cache_type_v,'--spec-type','draft-mtp' if args.mtp else 'none',
         '--enable-thinking','--reasoning-budget',str(args.reasoning_budget),
         '--kvmem-budget',str(args.budget),'--kvmem-gen-reserve',str(args.reserve),'--kvmem-block-tokens','128',
@@ -111,7 +114,9 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
             startup = (args.out/f'{mode}.log').read_text(encoding='utf-8', errors='replace')
             ready = re.search(r'KVMEM_STARTUP ready=(.+)', startup)
             assert ready, 'Missing startup configuration'
-            actual_kv = json.loads(ready.group(1))['kv']
+            ready_config = json.loads(ready.group(1))
+            assert ready_config['kvmem']['enabled'] == (mode == 'kvmem'), ready_config
+            actual_kv = ready_config['kv']
             assert actual_kv == {'k':args.cache_type_k, 'v':args.cache_type_v}, actual_kv
             if args.mtp:
                 pool = re.search(r'KVMEM_TRACE mtp_pool [^\r\n]+', startup)
@@ -122,7 +127,7 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
             assert '竹' in contents[1], contents
             results[mode].update({'short_responses':responses, 'answers':contents})
             print(mode, contents, flush=True)
-            if mode == 'kvmem':
+            if mode == 'kvmem' or args.plain_only:
                 history = [{'role':'user','content':'Remember this identifier: BAMBOO-7429. Reply OK.'}]
                 first = chat(history)
                 history.append(first['choices'][0]['message'])
@@ -175,10 +180,11 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
             results.setdefault(mode, {})['peak_device_mib'] = peak[0]
             (args.out/f'{mode}-memory.json').write_text(json.dumps(samples),encoding='utf-8')
             (args.out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
-if not args.kvmem_only:
+if not args.kvmem_only and not args.plain_only:
     results['short_greedy_answers_match'] = results['plain']['answers'] == results['kvmem']['answers']
     assert results['short_greedy_answers_match'], results
 (args.out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
 if args.long:
-    assert all(results['kvmem']['needle_matches'].values()), results['kvmem']['needle_matches']
+    long_mode = 'plain' if args.plain_only else 'kvmem'
+    assert all(results[long_mode]['needle_matches'].values()), results[long_mode]['needle_matches']
 print(json.dumps({'passed':True,'peaks_mib':{m:results[m]['peak_device_mib'] for m in ['plain','kvmem'] if m in results} }),flush=True)
