@@ -31,6 +31,11 @@ The original model with full KV recalls all three codes in this case. The earlie
 
 ## Needle position check
 
+Follow-up: [KVMem without MTP on the same 5060 Ti](bonsai-kvmem-128k-nomtp-5060-validation.md)
+still recalled only 1/3 with a 24K + 10K pool and the same K Q8 / V Q4 types.
+MTP is therefore not required to reproduce the failure. Sparse-history/state
+handling and remaining kernel/server differences need further isolation.
+
 With the original model tokenizer and chat template, the code tokens occupy
 blocks 1 (ORCHID-5831), 508 (MAPLE-2964), and 914 (CEDAR-8172), using 128-token
 blocks. Both earlier KVMem recall selections include all three blocks among
