@@ -1,0 +1,57 @@
+{
+  "upstream_pr": "https://github.com/PrismML-Eng/llama.cpp/pull/218",
+  "baseline": "9a9394a895b96003ca842a6041cb28ac49a108f7",
+  "patch_sha256": "f1211aed95b54739c49974a6730ef19860cb0b77cbf81a3abda39d75448e6291",
+  "source_patches": [
+    {
+      "name": "0001-Add-planar-transposed-activation-layout-for-the-PTQ1.patch",
+      "commit": "98ea4108097bc345baf3970178f7927a5b77011d",
+      "sha256": "b4ae90b2cd7aed27a67be28cb81cfd8f5f8edc88a43c7f16c632313560783dcf"
+    },
+    {
+      "name": "0002-Add-dedicated-PTQ1_0-mat-vec-kernel-with-full-lane-u.patch",
+      "commit": "c7551241a12bef59adc4fe6adf0928a28f0fcf25",
+      "sha256": "5a3f395107b00d8556dbe0ba6ab70ef9d5196ed7f19b8e48e3a1e5162c439c07"
+    },
+    {
+      "name": "0003-Test-add-Bonsai-2-projection-shapes-to-the-mul_mat-p.patch",
+      "commit": "a4344b545eb9dc4d889c50da8d52500954b2993f",
+      "sha256": "f02ff7d900e426ba3c380ba1816bc98b24b43af2add12ed8bfb043bac552cf15"
+    },
+    {
+      "name": "0004-Add-GGML_CUDA_BATCH_INVARIANT-for-batch-invariant-sm.patch",
+      "commit": "a55badae9f0e5a0d609127c0406e9a8d20ef9b83",
+      "sha256": "1e94071361e815e0b0c2dc39ebe9303b97f9386b85e5fc23263cc453ae6a275f"
+    },
+    {
+      "name": "0005-Fix-use-the-mat-vec-kernel-for-bf16-matrices-under-6.patch",
+      "commit": "588318660c5076795ad43487c3410f1a44970bf8",
+      "sha256": "6e6486db151da0cf8203c691250bcbce0bb378a0418d067af18bf85d8dc5b152"
+    },
+    {
+      "name": "0006-Fix-keep-GGML_CUDA_RESTRICT-off-the-PTQ1_0-mat-vec-k.patch",
+      "commit": "2578fdfa33e1fd3e7b4196516717b5bc2ac7eda6",
+      "sha256": "188417ebbe0399c3c5e507a0a6789a802c6cae82ee1931b17f92d08c99d507d2"
+    },
+    {
+      "name": "0007-Docs-state-the-batch-invariance-guarantee-as-1-to-4-.patch",
+      "commit": "497ea283248bb3725577b57e0531c865a0a8bb45",
+      "sha256": "edf640f7e0513e32cac55fe89ebf5fd1e9284ad6a8e704015f1a6fcc0f71dc89"
+    },
+    {
+      "name": "0008-latest.patch",
+      "commit": "0b159700d902ea0cece769f1c4b9bc925abbce4a",
+      "sha256": "4a9e1efe32d8216fa8b3661597d4e9d4907ffe55c16cda8e43567996b4b4d46d"
+    },
+    {
+      "name": "0009-latest.patch",
+      "commit": "e32dd7dd9be9cd5f792bc2e39578170bc4e5ba09",
+      "sha256": "895ce79bdcf70dbda7a16bd3ba2e7e985dbd1797804468144993b07cd4874533"
+    },
+    {
+      "name": "0010-latest.patch",
+      "commit": "285542d98d37d0f07f491cd206aefa31f1848f33",
+      "sha256": "6b76ca4045c1d7816dcfb13e24de4938d3b1b52629e366bb34cbbd2b48bbc561"
+    }
+  ]
+}

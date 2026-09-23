@@ -55,11 +55,6 @@ def chat(messages, max_tokens=96):
     result['test_wall_seconds'] = time.monotonic() - started
     return result
 
-reject = subprocess.run([exe, '-m', str(args.model), '--spec-type', 'draft-mtp'], env=env,
-    capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=creation, timeout=30)
-results['mtp_rejected'] = reject.returncode != 0 and 'MTP is disabled' in reject.stderr
-assert results['mtp_rejected'], reject.stderr
-
 simple = [
     [{'role':'user','content':'Reply with just the number: 17 + 25 = ?'}],
     [{'role':'user','content':'Translate the English word bamboo into Chinese. Reply with only the translation.'}],

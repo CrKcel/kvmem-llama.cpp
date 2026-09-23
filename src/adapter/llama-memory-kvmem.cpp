@@ -47,8 +47,9 @@ void llama_memory_kvmem::set_recurrent(llama_memory_recurrent * recr) {
         if (recr->r_l[il]) conv_bytes += ggml_nbytes(recr->r_l[il]);
         if (recr->s_l[il]) recurrent_bytes += ggml_nbytes(recr->s_l[il]);
     }
-    kvmem_diag("KVMEM_GDN_ALLOCATION mode=plain recurrent_bytes=%zu conv_bytes=%zu rollback_bytes=0\n",
-            recurrent_bytes, conv_bytes);
+    const size_t rollback_bytes = (recurrent_bytes + conv_bytes) / (1 + recr->n_rs_seq) * recr->n_rs_seq;
+    kvmem_diag("KVMEM_GDN_ALLOCATION mode=%s recurrent_bytes=%zu conv_bytes=%zu rollback_bytes=%zu\n",
+            recr->n_rs_seq ? "snapshots" : "plain", recurrent_bytes, conv_bytes, rollback_bytes);
 }
 
 static std::atomic<uint64_t> transfer_bytes[3]{};
@@ -367,7 +368,17 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-        throw std::runtime_error("MTP is disabled in the Bonsai experimental build");
+        llama_memory_kvmem * target = nullptr;
+        if (cparams.ctx_other) {
+            auto * memory = llama_get_memory(cparams.ctx_other);
+            if (auto * hybrid = dynamic_cast<llama_memory_kvmem_hybrid *>(memory)) {
+                target = hybrid->attn_kvmem();
+            } else {
+                target = dynamic_cast<llama_memory_kvmem *>(memory);
+            }
+        }
+        if (!target) return nullptr;
+        return new llama_memory_kvmem_mtp(model, params, cparams, target);
     }
     if (llm_arch_is_recurrent(model.arch)) {
         LLAMA_LOG_WARN("%s: KVMem skips purely recurrent arch %s\n",

@@ -5,7 +5,7 @@ index 6d8a7e8..883cc27 100644
 @@ -128,6 +128,11 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
  # utils
  option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
- 
+
 +# KVMem out-of-tree adapter (kvmem_llamacpp). Off by default so a vanilla
 +# submodule build stays bit-identical to upstream.
 +option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
@@ -21,7 +21,7 @@ index 4884299..e2a68da 100644
 @@ -185,6 +185,21 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
      }
  }
- 
+
 +void common_reasoning_budget_accept_prefill(struct llama_sampler * smpl, llama_token token) {
 +    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 +    if (ctx->state != REASONING_BUDGET_FORCING) {
@@ -45,9 +45,9 @@ index 1b89a04..87584c8 100644
 --- a/common/reasoning-budget.h
 +++ b/common/reasoning-budget.h
 @@ -43,6 +43,9 @@ struct llama_sampler * common_reasoning_budget_init(
- 
+
  common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
- 
+
 +// Read prompt tokens without consuming the forced output sequence.
 +void common_reasoning_budget_accept_prefill(struct llama_sampler * smpl, llama_token token);
 +
@@ -60,13 +60,512 @@ index 06dea1e..bc33776 100644
 +++ b/common/sampling.cpp
 @@ -317,7 +317,7 @@ struct common_sampler * common_sampler_init(
              params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
- 
+
          for (const auto & token : prefill_tokens) {
 -            llama_sampler_accept(rbudget, token);
 +            common_reasoning_budget_accept_prefill(rbudget, token);
              LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
          }
      }
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 9b28b31..2faf280 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2044,6 +2044,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<llama_sampler *> backend_chains;
+
+     int32_t n_embd = 0;
++    std::vector<llama_pos> logical_pos;
++    std::vector<llama_pos> synced_rows;
++    std::vector<llama_pos> verify_start;
+
+     // One MTP draft driver, three modes (set once in the ctor):
+     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
+@@ -2098,6 +2101,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // TODO: fix, how to call without malloc
+         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
++        logical_pos.resize(n_b);
++        batch.logical_pos = logical_pos.data();
++        synced_rows.assign(n_seq, 0);
++        verify_start.assign(n_seq, 0);
++
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+@@ -2126,7 +2134,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
++        // ctx_other is also set for Qwen MTP so the KVMem factory can follow
++        // the target slot-pool. Shared-KV (Gemma4) is the same memory object.
++        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt
++                && llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+         if (chain_heads) {
+@@ -2175,7 +2186,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+
+         auto * ctx_dft = this->params.ctx_dft;
+-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++        const llama_pos pos_max = std::find(prompt.begin(), prompt.end(), LLAMA_TOKEN_NULL) != prompt.end()
++                ? synced_rows[seq_id] - 1 : llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+         if (pos_max < N - 1 && !is_mem_shared) {
+             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
+@@ -2191,10 +2203,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return true;
+         }
+
+-        // TODO: how to make it work with vision tokens?
+-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+-            return true;
+-        }
++        if (!batch_in.token && !batch_in.embd) return false;
+
+         const int32_t n_tokens = batch_in.n_tokens;
+
+@@ -2225,7 +2234,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             common_batch_clear(batch);
+
+             for (int k = 0; k < n_tokens; ++k) {
+-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                common_batch_add(batch, batch_in.token ? batch_in.token[k] : 0, batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                batch.logical_pos[k] = batch_in.logical_pos ? batch_in.logical_pos[k] : batch_in.pos[k];
+             }
+
+             // shift the tgt embeddings to the right by one position
+@@ -2251,6 +2261,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+             }
+
++            llama_batch sync_batch = batch;
++            sync_batch.embd_nextn = batch.embd;
++            if (!batch_in.token) {
++                sync_batch.token = nullptr;
++                sync_batch.embd = batch_in.embd;
++                sync_batch.pos = batch_in.pos;
++            }
+             auto * mem_dft = llama_get_memory(ctx_dft);
+
+             bool ok = true;
+@@ -2266,7 +2283,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+
+-                const int32_t rc = llama_decode(ctx_dft, batch);
++                const int32_t rc = llama_decode(ctx_dft, sync_batch);
+                 if (rc != 0) {
+                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                             head, (int) rc, (int) batch_in.pos[0]);
+@@ -2290,6 +2307,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
++            const int first = i_batch_beg[seq_id];
++            verify_start[seq_id] = batch_in.logical_pos ? batch_in.logical_pos[first] : batch_in.pos[first];
++            synced_rows[seq_id] = verify_start[seq_id] + n_rows;
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+             for (int32_t i = 0; i < n_rows; ++i) {
+@@ -2327,6 +2347,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             common_sampler_reset(smpls[seq_id].get());
+
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
++            batch.logical_pos[batch.n_tokens - 1] = dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past;
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+
+             i_last[seq_id] = batch.n_tokens - 1;
+@@ -2416,6 +2437,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     for (int t = 0; t < n_rows; ++t) {
+                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
+                         common_batch_add(batch, tok, dp.n_past + t, { seq_id }, t == n_rows - 1);
++                        batch.logical_pos[batch.n_tokens - 1] = (dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past) + t;
+                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
+                     }
+@@ -2423,9 +2445,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+                     common_batch_add(batch, id, dp.n_past, { seq_id }, true);
++                    batch.logical_pos[batch.n_tokens - 1] = dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past;
+                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                 } else {
+                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
++                    batch.logical_pos[batch.n_tokens - 1] = (dp.n_past_logical >= 0 ? dp.n_past_logical : dp.n_past) + i + 1;
+                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                 }
+
+@@ -2466,9 +2490,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
++        synced_rows[seq_id] = verify_start[seq_id] + i_h + 1;
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+     }
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        if (seq_id < 0 || (uint32_t) seq_id >= n_seq) return false;
++        data.resize(sizeof(llama_pos) + (size_t) n_embd*sizeof(float));
++        std::memcpy(data.data(), &synced_rows[seq_id], sizeof(llama_pos));
++        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        if (seq_id < 0 || (uint32_t) seq_id >= n_seq) return;
++        if (data.size() != sizeof(llama_pos) + (size_t) n_embd*sizeof(float)) {
++            throw std::runtime_error("invalid MTP carry state");
++        }
++        std::memcpy(&synced_rows[seq_id], data.data(), sizeof(llama_pos));
++        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd*sizeof(float));
++        verify_h_rows[seq_id] = 0;
++    }
++
+ };
+
+ // state of self-speculation (simple implementation, not ngram-map)
+diff --git a/common/speculative.h b/common/speculative.h
+index d1a724d..d5d6eaf 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -60,6 +60,7 @@ struct common_speculative_draft_params {
+
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
++    llama_pos n_past_logical = -1; // optional cache row cursor for multimodal input
+ };
+
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index ef929d3..4ae9a06 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -173,6 +173,19 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
+
+ // ---------------------------------------------------------------------------------------------------------
+
++// GGML_CUDA_BATCH_INVARIANT=1: for batches of 1 to 4 columns, pick kernels whose per-column
++// arithmetic does not depend on the column count on the paths this flag covers: the F16 and BF16
++// mat-vec paths it selects, the PTQ1_0 mat-vec (1 to 4 columns; 5 and above take the MMQ tile
++// path, which this flag does not touch), and flash attention up to 8 queries. On those paths a
++// token decoded alone and a token verified inside a speculative batch see the same logits bit
++// for bit. Other weight types and attention shapes outside those kernels can still pick
++// batch-dependent kernels, so this is not a whole-model guarantee. Costs some throughput at
++// 2 to 4 columns.
++static inline bool ggml_cuda_batch_invariant() {
++    static const bool enabled = getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr;
++    return enabled;
++}
++
+ #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
+
+ #define GGML_CUDA_MAX_STREAMS 8
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index e67cc7f..ae4318c 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1154,11 +1154,14 @@ void launch_fattn(
+
+         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+         // Test whether parallel_blocks can be set to a higher value for better efficiency.
++        // Batch-invariant mode: size the KV split as for a single query tile, so the order in which the
++        // partial softmax results are combined does not depend on how many queries are in the batch.
++        const int ntiles_dst_eff = ggml_cuda_batch_invariant() ? ntiles_dst / ntiles_x : ntiles_dst;
+         const int blocks_per_wave = nsm * max_blocks_per_sm;
+         int nwaves_best = 0;
+         int efficiency_percent_best = 0;
+         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
++            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
+             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b2..b504284 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -460,6 +460,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     // If Turing tensor cores are available, use them:
+     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+         if (can_use_vector_kernel) {
++            // batch-invariant mode: the same (vector) kernel for up to 8 queries, so a token verified in a
++            // speculative batch attends with the same arithmetic as a token decoded alone (the whole-model
++            // guarantee is 1 to 4 queries, see ggml_cuda_batch_invariant)
++            if (ggml_cuda_batch_invariant() && Q->ne[1] <= 8 && Q->ne[3] == 1) {
++                return BEST_FATTN_KERNEL_VEC;
++            }
+             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                     return BEST_FATTN_KERNEL_VEC;
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b..b12245e 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -821,6 +821,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                 if (ampere_mma_available(cc)) {
++                    if (ggml_cuda_batch_invariant()) {
++                        return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
++                    }
+                     return src0_small && ne11 == 1;
+                 }
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+@@ -847,6 +850,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                 if (ampere_mma_available(cc)) {
++                    // a few dozen rows (the qwen35 gated-delta-net gate projections) run faster as a
++                    // mat-vec than through the tensor-core path at 2 to 8 columns: 3.4 vs 10.5 us on an RTX 3060
++                    if (ggml_cuda_batch_invariant() || src0_ne[1] <= 64) {
++                        return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
++                    }
+                     return src0_small && ne11 == 1;
+                 }
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index bf51b61..3678c78 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvq-ptq1_0.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -296,7 +297,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+     }
+ #if !defined(GGML_USE_HIP)
+     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+-        return ne11 <= 7;
++        // the PT mat-vec path shares the weight decode across columns and stays ahead of the
++        // MMQ tile path up to 4 columns; from 5 on the branch-free MMQ tile loader is faster
++        // (RTX 3060, K = 5120 shapes: a batch of 8 in 64.4 ms through MMQ against 112.7 ms
++        // through the 8-column mat-vec, llama-bench pp8), so 5 and above take that path
++        return ne11 <= PTQ1_0_PT_MAX_COLS;
+     }
+ #endif
+     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
+@@ -404,6 +409,12 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ }
+
+ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
++    if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 &&
++        (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
++        // one K partition for every column count, so the fp32 sums of a column
++        // do not depend on how many columns share the launch (batch invariance)
++        return ncols_dst <= MMVQ_MAX_BATCH_SIZE ? 4 : 1;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+         switch (ncols_dst) {
+             case 1:
+@@ -534,7 +545,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     return 1;
+ }
+
+-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 &&
++        (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
++        return ptq1_0_pt_rows_per_block(ncols_dst);
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+@@ -573,7 +588,7 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -716,28 +731,49 @@ static __global__ void mul_mat_vec_q(
+             const int kqs = vdr * (tid % (qi/vdr));
+
+ #if !defined(GGML_USE_HIP)
+-        if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
++        if constexpr (type == GGML_TYPE_PTQ1_0) {
++            // activations arrive in the PT layout (see mmvq-ptq1_0.cuh): every
++            // column count runs this same code, one thread per 128-weight block
++            const int nblk = ptq1_0_pt_nblk(ncols_x);
++            const char * ycol[ncols_dst];
++#    pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                ycol[j] = (const char *) (y + j*stride_col_y);
++            }
++            const block_ptq1_0 * bq[rows_per_cuda_block];
+ #    pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                float dots[ncols_dst];
+-                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
+-                                                     stride_col_y, dots);
++                bq[i] = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx;
++            }
++            float dots[ncols_dst][rows_per_cuda_block];
++            ptq1_0_pt_block_dot<ncols_dst, rows_per_cuda_block>(bq, ycol, kbx, nblk, dots);
+ #    pragma unroll
+-                for (int j = 0; j < ncols_dst; ++j) {
+-                    tmp[j][i] += dots[j];
++            for (int j = 0; j < ncols_dst; ++j) {
++#    pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    tmp[j][i] += dots[j][i];
+                 }
++            }
+
+-                if constexpr (has_fusion) {
+-                    if constexpr (has_gate) {
+-                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
+-                                                             stride_col_y, dots);
++            if constexpr (has_fusion) {
++                if constexpr (has_gate) {
++                    const block_ptq1_0 * bg[rows_per_cuda_block];
++#    pragma unroll
++                    for (int i = 0; i < rows_per_cuda_block; ++i) {
++                        bg[i] = (const block_ptq1_0 *) vgate + kbx_offset + i*stride_row_x + kbx;
++                    }
++                    ptq1_0_pt_block_dot<ncols_dst, rows_per_cuda_block>(bg, ycol, kbx, nblk, dots);
+ #    pragma unroll
+-                        for (int j = 0; j < ncols_dst; ++j) {
+-                            tmp_gate[j][i] += dots[j];
++                    for (int j = 0; j < ncols_dst; ++j) {
++#    pragma unroll
++                        for (int i = 0; i < rows_per_cuda_block; ++i) {
++                            tmp_gate[j][i] += dots[j][i];
+                         }
+                     }
+                 }
+             }
++            GGML_UNUSED(kqs);
++            GGML_UNUSED(kby);
+         } else
+ #endif
+         {
+@@ -897,9 +933,31 @@ static __global__ void mul_mat_vec_q_moe(
+         const int kby = kbx * (qk/QK8_1);
+         const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
++#if !defined(GGML_USE_HIP)
++        if constexpr (type == GGML_TYPE_PTQ1_0) {
++            // PT activation layout, see mmvq-ptq1_0.cuh
++            const int nblk = ptq1_0_pt_nblk(ncols_x);
++            const char * ycol[1] = { (const char *) y };
++            const block_ptq1_0 * bq[c_rows_per_block];
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                bq[i] = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx;
++            }
++            float dots[1][c_rows_per_block];
++            ptq1_0_pt_block_dot<1, c_rows_per_block>(bq, ycol, kbx, nblk, dots);
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                tmp[i] += dots[0][i];
++            }
++            GGML_UNUSED(kqs);
++            GGML_UNUSED(kby);
++        } else
++#endif
++        {
+ #pragma unroll
+-        for (int i = 0; i < c_rows_per_block; ++i) {
+-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++            }
+         }
+     }
+
+@@ -922,7 +980,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);
+@@ -1003,6 +1061,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+
++#if !defined(GGML_USE_HIP)
++    if constexpr (type == GGML_TYPE_PTQ1_0) {
++        // plain 2D PTQ1_0 mat-vec: dedicated kernel with full lane utilization, see mmvq-ptq1_0.cuh
++        if (!ids && mul_mat_vec_ptq1_0_pt_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst,
++                                                 stride_row_x, stride_col_y, stride_col_dst,
++                                                 nchannels_dst, nsamples_dst, stream)) {
++            return;
++        }
++    }
++#endif
++
+     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index fbbc631..5c66128 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -1,4 +1,5 @@
+ #include "quantize.cuh"
++#include "mmvq-ptq1_0.cuh"
+ #include "unary.cuh"
+ #include <cstdint>
+
+@@ -51,6 +52,9 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
+ #endif // CUDART_VERSION >= 12080
+ #endif // defined(BLACKWELL_MMA_AVAILABLE)
+
++// pt: write the planar-transposed layout consumed by the PTQ1_0 mat-vec path
++// (see mmvq-ptq1_0.cuh) instead of block_q8_1; same quantization, same bytes per row
++template <bool pt>
+ __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+ static __global__ void quantize_q8_1(
+         const float * x_ptr, void * vy_ptr,
+@@ -92,6 +96,23 @@ static __global__ void quantize_q8_1(
+     const float  d = amax / 127.0f;
+     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
++    if constexpr (pt) {
++        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
++        char * ycol = (char *) vy + row_cont * (ne0 * 9 / 8); // same row stride as block_q8_1
++        const int64_t nblk = ne0 / QK_PTQ1_0;
++        const int64_t kb   = i0 / QK_PTQ1_0;
++        const int     e    = i0 % QK_PTQ1_0;
++        ycol[((e / 16)*nblk + kb) * 16 + (e % 16)] = q;
++
++        if (iqs > 0) {
++            return;
++        }
++
++        half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
++        *ds = make_half2(d, sum);
++        return;
++    }
++
+     y[ib].qs[iqs] = q;
+
+     if (iqs > 0) {
+@@ -648,8 +669,12 @@ void quantize_row_q8_1_cuda(
+     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+-    GGML_UNUSED(type_src0);
++    if (ptq1_0_pt_enabled() && type_src0 == GGML_TYPE_PTQ1_0) {
++        GGML_ASSERT(ne0 % QK_PTQ1_0 == 0);
++        ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
++        return;
++    }
++    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+ }
+
+ void quantize_mmq_q8_1_cuda(
 diff --git a/include/llama.h b/include/llama.h
 index deb1e12..1bc8dab 100644
 --- a/include/llama.h
@@ -80,16 +579,16 @@ index deb1e12..1bc8dab 100644
 +        llama_pos    *  logical_pos; // unique cache row IDs, independent of M-RoPE
 +        float        *  embd_nextn;  // previous target hidden rows for MTP
      } llama_batch;
- 
+
      enum llama_model_kv_override_type {
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index c6df19f..73ea0ba 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -62,6 +62,41 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
- 
+
  target_link_libraries(llama PUBLIC ggml)
- 
+
 +if (LLAMA_KVMEM)
 +    if (LLAMA_KVMEM_ROOT STREQUAL "")
 +        message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
@@ -133,7 +632,7 @@ index 2b98a55..106ce11 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
 @@ -758,6 +758,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
- 
+
      udata->token     .resize(n_tokens);
      udata->embd      .resize(n_embd_all);
 +    udata->embd_nextn.resize(batch.embd_nextn ? (int64_t) n_tokens*n_embd : 0);
@@ -151,19 +650,19 @@ index 2b98a55..106ce11 100644
 +        if (batch.logical_pos) {
 +            udata->logical_pos[i] = batch.logical_pos[idxs[i]];
 +        }
- 
+
          for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
              // if we are using M-RoPE
 @@ -834,6 +842,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
          /*.data         =*/ std::move(udata),
      };
- 
+
 +    res.logical_pos = batch.logical_pos ? res.data->logical_pos.data() : nullptr;
 +    res.embd_nextn = batch.embd_nextn ? res.data->embd_nextn.data() : nullptr;
 +
      if (debug > 0) {
          LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
- 
+
 diff --git a/src/llama-batch.h b/src/llama-batch.h
 index a3d1889..dcba8c1 100644
 --- a/src/llama-batch.h
@@ -178,13 +677,13 @@ index a3d1889..dcba8c1 100644
          std::vector<int32_t>        n_seq_id;
          std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
 @@ -66,6 +68,8 @@ struct llama_ubatch {
- 
+
      // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
      std::shared_ptr<data_t> data;
 +    llama_pos * logical_pos = nullptr;
 +    float * embd_nextn = nullptr;
  };
- 
+
  // a helper for sanitizing, fulfilling and splitting a batch
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index cc8c004..bdc49ef 100644
@@ -197,13 +696,13 @@ index cc8c004..bdc49ef 100644
 +#if defined(LLAMA_KVMEM)
 +#include "llama-kvmem-hooks.h"
 +#endif
- 
+
  #include <cinttypes>
  #include <cmath>
 @@ -218,6 +221,12 @@ llama_context::llama_context(
- 
+
      cparams.ctx_other = nullptr;
- 
+
 +    // MTP draft context needs the target so KVMem can size the follower
 +    // slot-pool from the target pool instead of n_ctx.
 +    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
@@ -216,7 +715,7 @@ index cc8c004..bdc49ef 100644
 @@ -1545,7 +1554,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
- 
+
 -    if (!graph_reuse_disable && res->can_reuse(gparams)) {
 +    if (!graph_reuse_disable && res->can_reuse(gparams)
 +#if defined(LLAMA_KVMEM)
@@ -225,28 +724,28 @@ index cc8c004..bdc49ef 100644
 +#endif
 +            ) {
          //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
- 
+
          // with pipeline parallelism, the previous graph_compute_async may still be running
 @@ -1564,6 +1578,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
- 
+
          //const auto t_start_us = ggml_time_us();
- 
+
 +#if defined(LLAMA_KVMEM)
 +        llama_kvmem_capture_on_new_graph(gtype == LLM_GRAPH_TYPE_DECODER_MTP);
 +#endif
          gf = model.build_graph(gparams);
- 
+
          //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 @@ -1598,6 +1615,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
- 
+
 +#if defined(LLAMA_KVMEM)
 +    llama_kvmem_harvest_ubatch(sched.get(), gtype == LLM_GRAPH_TYPE_DECODER_MTP);
 +#endif
 +
      ret = GGML_STATUS_SUCCESS;
- 
+
      return res;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 99f263e..a21f5ea 100644
@@ -259,13 +758,13 @@ index 99f263e..a21f5ea 100644
 +#if defined(LLAMA_KVMEM)
 +#include "llama-kvmem-hooks.h"
 +#endif
- 
+
  #include <cassert>
  #include <cmath>
 @@ -150,13 +153,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
          ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
      }
- 
+
 -    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
 -    //       for now, we assume that the hidden state is always provided as an embedding
 -    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
@@ -273,25 +772,25 @@ index 99f263e..a21f5ea 100644
 +    const float * hidden = ubatch->embd_nextn ? ubatch->embd_nextn : ubatch->embd;
 +    if (hidden) {
          GGML_ASSERT(n_embd == h->ne[0]);
- 
+
 -        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
 +        ggml_backend_tensor_set(h, hidden, 0, n_tokens*n_embd*ggml_element_size(h));
      }
  }
- 
+
 @@ -165,7 +166,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
- 
+
      res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
      res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
 -    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
 +    res &= (!params.ubatch.embd && !params.ubatch.embd_nextn) || (h && h->ne[1] == params.ubatch.n_tokens);
- 
+
      return res;
  }
 @@ -1535,6 +1536,88 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
      }
  }
- 
+
 +static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * src, int il, const char * tag) {
 +#if defined(LLAMA_KVMEM)
 +    const llama_kvmem_params * kp = llama_kvmem_get_params();
@@ -374,8 +873,8 @@ index 99f263e..a21f5ea 100644
 +    kvmem_capture_impl(ctx0, gf, v, il, "v");
 +}
 +
- 
- 
+
+
  ggml_tensor * llm_graph_context::build_cvec(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
 index e85c1aa..26e8d15 100644
@@ -390,9 +889,9 @@ index e85c1aa..26e8d15 100644
                  (!ubatch.token && !other.ubatch.token) ||
                  (!ubatch.embd  && !other.ubatch.embd)  ||
 @@ -1146,6 +1147,15 @@ struct llm_graph_context {
- 
+
      void cb(ggml_tensor * cur, const char * name, int il) const;
- 
+
 +    // KVMem: side-channel copies. No-ops unless LLAMA_KVMEM is enabled and
 +    // llama_kvmem_get_params()->enabled. Q is copied only when the ubatch
 +    // overlaps the retrieval query span. V is copied in prefill only with
@@ -412,7 +911,7 @@ index 3df5ced..7c5ce5e 100644
 @@ -380,6 +380,31 @@ void llama_kv_cache::clear(bool data) {
      }
  }
- 
+
 +bool llama_kv_cache::seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 +    p0 = std::max<llama_pos>(p0, 0);
 +    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
@@ -442,9 +941,9 @@ index 3df5ced..7c5ce5e 100644
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
 @@ -1131,13 +1156,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
- 
+
              cells.pos_set(idx, ubatch.pos[i]);
- 
+
 +            llama_kv_cell_ext ext;
 +            ext.logical_pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
              if (ubatch.is_pos_2d()) {
@@ -457,13 +956,13 @@ index 3df5ced..7c5ce5e 100644
 +                ext.y = ubatch.pos[i + ubatch.n_tokens];
              }
 +            cells.ext_set(idx, ext);
- 
+
              for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                  cells.seq_add(idx, ubatch.seq_id[i][s]);
 @@ -1145,23 +1170,30 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
          }
      }
- 
+
 -    // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
 -    //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
 -    //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
@@ -484,30 +983,30 @@ index 3df5ced..7c5ce5e 100644
 +            if (seq_pos_max_rm[s] == -1) {
 +                continue;
 +            }
- 
+
 -        GGML_ASSERT(s < seq_to_stream.size());
 +            GGML_ASSERT(s < seq_to_stream.size());
- 
+
 -        auto & cells = v_cells[seq_to_stream[s]];
 +            auto & cells = v_cells[seq_to_stream[s]];
- 
+
 -        if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
 -            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
 -                    __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 +            if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
 +                LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
 +                        __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
- 
+
 -            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
 +                seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
 +            }
          }
      }
- 
+
 @@ -1229,6 +1261,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
      return layers[ikv].k;
  }
- 
+
 +ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
 +    const int32_t ikv = map_layer_ids.at(il);
 +
@@ -516,11 +1015,11 @@ index 3df5ced..7c5ce5e 100644
 +
  const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
      GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
- 
+
 @@ -1792,7 +1830,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
- 
+
              auto & idxs = seq_idxs[seq_id];
- 
+
 -            if (!alibi) {
 +            // The copy-and-patch shortcut only records cells near seq_pos_min.
 +            // KVMem resurrects mid-document holes far below that window; they
@@ -534,7 +1033,7 @@ index 3df5ced..7c5ce5e 100644
 +            if (!alibi && !holes) {
                  if (seq_srct.find(seq_id) != seq_srct.end()) {
                      const uint32_t srct = seq_srct[seq_id];
- 
+
 @@ -1878,6 +1925,26 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
  skip:
                  data[idst + j] = mask_drop;
@@ -567,14 +1066,14 @@ index 4d2229b..70eec69 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -163,6 +163,8 @@ public:
- 
+
      std::vector<uint32_t> get_layer_ids() const;
      ggml_tensor * get_k_storage(int32_t il) const;
 +    ggml_tensor * get_v_storage(int32_t il) const;
 +    bool seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
- 
+
      const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
- 
+
 diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
 index fddd31a..7a0779c 100644
 --- a/src/llama-kv-cells.h
@@ -584,17 +1083,17 @@ index fddd31a..7a0779c 100644
      llama_pos x = 0;
      llama_pos y = 0;
 +    llama_pos logical_pos = -1;
- 
+
      // return true if the current 2D spatial position is greater than other
      bool is_2d_gt(llama_pos ox, llama_pos oy) const {
 @@ -24,6 +25,7 @@ struct llama_kv_cell_ext {
          static_assert(std::is_trivially_copyable_v<llama_kv_cell_ext>);
- 
+
          memset(this, 0, sizeof(*this));
 +        logical_pos = -1;
      }
  };
- 
+
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 191d025..5c28993 100644
 --- a/src/llama-model.cpp
@@ -604,13 +1103,13 @@ index 191d025..5c28993 100644
  #include "llama-memory-hybrid-iswa.h"
  #include "llama-memory-recurrent.h"
 +#include "llama-kvmem-factory.h"
- 
+
  #include "llama.h"
  #include "models/models.h"
 @@ -2498,6 +2499,12 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
      llama_memory_i * res;
- 
+
 +#if defined(LLAMA_KVMEM)
 +    if (llama_memory_i * kvmem = llama_memory_kvmem_maybe_create(*this, params, cparams)) {
 +        return kvmem;
@@ -627,7 +1126,7 @@ index f4b2a2a..d75c2db 100644
 @@ -88,6 +88,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
              Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
              cb(Qcur, "Qcur_normed", il);
- 
+
 +            kvmem_capture_q(Qcur, il);
              Qcur = ggml_rope_ext(
                      ctx0, Qcur, inp_pos, nullptr,
@@ -635,7 +1134,7 @@ index f4b2a2a..d75c2db 100644
 @@ -97,6 +98,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
              Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
              cb(Kcur, "Kcur_normed", il);
- 
+
 +            kvmem_capture_k(Kcur, il);
              Kcur = ggml_rope_ext(
                      ctx0, Kcur, inp_pos, nullptr,
@@ -645,59 +1144,128 @@ index f4b2a2a..d75c2db 100644
              cb(Kcur, "Kcur", il);
              cb(Vcur, "Vcur", il);
 +            kvmem_capture_v(Vcur, il);
- 
+
              cur = build_attn(inp_attn,
                      model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index c5f816e..5e0341b 100644
+index c5f816e..6713fc7 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
-@@ -343,6 +343,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "llama-impl.h"
+ #include "llama-memory-recurrent.h"
+
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+@@ -343,6 +344,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
      Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
      cb(Qcur, "Qcur_normed", il);
- 
+
 +    kvmem_capture_q(Qcur, il);
 +
      ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
      cb(Kcur, "Kcur", il);
- 
-@@ -354,6 +356,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
+
+@@ -354,6 +357,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
      Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
      cb(Kcur, "Kcur_normed", il);
- 
+
 +    kvmem_capture_k(Kcur, il);
 +
      ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
          ggml_element_size(Qcur_full) * n_embd_head * 2,
          ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-@@ -379,6 +383,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
+@@ -379,6 +384,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
      cb(Qcur, "Qcur", il);
      cb(Kcur, "Kcur", il);
      cb(Vcur, "Vcur", il);
 +    kvmem_capture_v(Vcur, il);
- 
+
      // Attention computation
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-@@ -692,10 +697,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+@@ -634,6 +640,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+
+         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
++        // Restore the same embedding basis used by the target model.
++        if (hadamard_inverses) {
++            const auto it = hadamard_inverses->find(tok_embd_w);
++            if (it != hadamard_inverses->end()) {
++                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
++                if (it->second.signs) {
++                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
++                }
++            }
++        }
+     } else {
+         tok_embd = inp->embd;
+     }
+@@ -692,10 +708,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
      Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
      Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
      cb(Kcur, "mtp_Kcur_normed", il);
 +    kvmem_capture_k(Kcur, il);
- 
+
      ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
      Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
      cb(Vcur, "mtp_Vcur", il);
 +    kvmem_capture_v(Vcur, il);
- 
+
      Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
              n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b28bc29..87af6d4 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10161,6 +10161,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+
++    // PTQ1_0 mat-vec kernel, shared-memory boundary: the launch asks for ncols * rows_per_cta * (K / 128) * 4 bytes,
++    // twice that with gate fusion, against the 48 KiB default. With one column and 4 rows per CTA the last K that
++    // fits is 393216 without a gate and 196608 with one; the next K block over each must take the generic kernel.
++    for (int64_t k : {393216, 393344}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, 1, k, {1, 1}, {1, 1}));
++    }
++    for (int64_t k : {196608, 196736}) {
++        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,
++            false, 1, 1, false, false, true, false, {1, 1}));
++    }
++
+     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
+         for (bool with_norm : {false, true}) {
+             for (bool bias_probs : {false, true}) {
+@@ -10451,6 +10462,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+
++    // Ternary Bonsai 2 27B (qwen35): the bf16 gated-delta-net gate projections
++    for (int bs : {1, 2, 3, 4, 8}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 48, bs, 5120, {1, 1}, {1, 1})); // ssm_alpha, ssm_beta
++    }
++
++    // Ternary Bonsai 2 27B (qwen35, PTQ1_0) projections at speculative-decoding batch sizes
++    for (int bs : {1, 2, 3, 4, 8}) {
++        for (ggml_type type_a : {GGML_TYPE_PTQ1_0, GGML_TYPE_Q4_0}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, bs,  5120, {1, 1}, {1, 1})); // attn_qkv
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  6144, bs,  5120, {1, 1}, {1, 1})); // attn_gate
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, bs,  6144, {1, 1}, {1, 1})); // ssm_out
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, bs,  5120, {1, 1}, {1, 1})); // ffn_up, ffn_gate
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, bs, 17408, {1, 1}, {1, 1})); // ffn_down
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 12288, bs,  5120, {1, 1}, {1, 1})); // attn_q
++        }
++    }
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
 diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
 index f1defb6..0753e49 100644
 --- a/tools/mtmd/mtmd-helper.cpp
 +++ b/tools/mtmd/mtmd-helper.cpp
 @@ -115,7 +115,7 @@ private:
  };
- 
+
  // Helper function for decoding an image whose embeddings have already been calculated
 -int32_t mtmd_helper_decode_image_chunk(
 +int32_t mtmd_helper_decode_image_chunk_with_decoder(
@@ -715,7 +1283,7 @@ index f1defb6..0753e49 100644
      const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
 @@ -174,7 +174,7 @@ int32_t mtmd_helper_decode_image_chunk(
          LOG_INF("decoding %s batch %d/%d, n_tokens_batch = %d\n", name, i_batch+1, n_img_batches, n_tokens_batch);
- 
+
          int64_t t1 = ggml_time_ms();
 -        int32_t ret = llama_decode(lctx, batch_embd_view);
 +        int32_t ret = decoder ? decoder(lctx, batch_embd_view, user_data) : llama_decode(lctx, batch_embd_view);
@@ -725,7 +1293,7 @@ index f1defb6..0753e49 100644
 @@ -199,6 +199,14 @@ int32_t mtmd_helper_decode_image_chunk(
      return 0;
  }
- 
+
 +int32_t mtmd_helper_decode_image_chunk(
 +        mtmd_context * ctx, llama_context * lctx, const mtmd_input_chunk * chunk,
 +        float * encoded_embd, llama_pos n_past, llama_seq_id seq_id, int32_t n_batch,
@@ -744,7 +1312,7 @@ index 58dfb15..164d738 100644
 @@ -108,6 +108,14 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
                                                  mtmd_helper_post_decode_callback callback,
                                                  void * user_data);
- 
+
 +// Alternate decode dispatch; preserves native batching, positions and attention setup.
 +typedef int32_t (*mtmd_helper_decode_callback)(struct llama_context * lctx, struct llama_batch batch, void * user_data);
 +MTMD_API int32_t mtmd_helper_decode_image_chunk_with_decoder(
@@ -763,7 +1331,7 @@ index 4f5b820..935728c 100644
 @@ -1124,57 +1124,8 @@ static void handle_media(
      }
  }
- 
+
 -// used by /chat/completions endpoint
 -json oaicompat_chat_params_parse(
 -    json & body, /* openai api json semantics */
@@ -823,7 +1391,7 @@ index 4f5b820..935728c 100644
 @@ -1255,6 +1206,62 @@ json oaicompat_chat_params_parse(
          }
      }
- 
+
 +}
 +
 +// used by /chat/completions endpoint
@@ -881,7 +1449,7 @@ index 4f5b820..935728c 100644
 +    json & messages = body.at("messages");
 +
      auto caps = common_chat_templates_get_caps(opt.tmpls.get());
- 
+
      common_chat_templates_inputs inputs;
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
 index f8ea82e..c0bfad9 100644
@@ -889,7 +1457,7 @@ index f8ea82e..c0bfad9 100644
 +++ b/tools/server/server-common.h
 @@ -316,6 +316,9 @@ struct server_chat_params {
  json oaicompat_completion_params_parse(const json & body);
- 
+
  // used by /chat/completions endpoint
 +void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
 +                                 std::vector<raw_buffer> & out_files);
@@ -897,6 +1465,478 @@ index f8ea82e..c0bfad9 100644
  json oaicompat_chat_params_parse(
      json & body, /* openai api json semantics */
      const server_chat_params & opt,
+diff --git a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+@@ -0,0 +1,467 @@
++// PTQ1_0 mat-vec inner loop on a planar-transposed Q8_1 activation layout.
++//
++// Why: the stock mmvq path hands each thread one 128-weight PTQ1_0 block and
++// walks the activations as 32 scattered 4-byte loads per column out of
++// 36-byte block_q8_1 structs. The weight decode is shared across columns but
++// the activation traffic is not, so every extra column costs a full pass
++// (measured 2.2x at 2 columns, 3.3x at 3 on an RTX 3060). Here the activations
++// are stored so that the 128 quants a thread needs are 8 aligned 16-byte
++// pieces, one per plane, and the 4 (d, s) scales are one more 16-byte piece.
++// Adjacent threads read adjacent 16-byte pieces of the same plane, so a warp
++// load touches 4 cache lines instead of 32, and a thread reuses each piece
++// for every row it owns. The decode, the dp4a sequence and the fp32 epilogue
++// are the same operations in the same order as the single-column kernel, so
++// every column count produces the same bits for a given column.
++//
++// PT layout, per activation column (all sizes for the padded row length):
++//   plane t (t = 0..7):   nblk * 16 bytes, byte b of block kb is the quant of
++//                         element kb*128 + t*16 + b
++//   plane 8:              nblk * 16 bytes, block kb holds 4 half2 (d, s), one
++//                         per 32-element sub-block
++// Column stride is 9 * nblk * 16 = padded_row * 9/8 bytes, exactly the
++// block_q8_1 stride (padded_row/32 blocks of 36 bytes), so every stride the
++// mmvq launcher computes in block_q8_1 units stays valid.
++#pragma once
++
++#include "common.cuh"
++#include "unary.cuh"
++#include "vecdotq.cuh"
++
++#define PTQ1_0_PT_PLANES 9
++
++// dedicated 2D kernel geometry, see mul_mat_vec_ptq1_0_pt below
++#define PTQ1_0_PT_THREADS      128
++#define PTQ1_0_PT_MAX_ROWS     16
++#define PTQ1_0_PT_MAX_COLS     4    // 1 to 4 columns here; 5 and above take the MMQ tile path (ggml_cuda_should_use_mmvq)
++#define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB of partial sums per weight matrix: the target when choosing rows per CTA
++
++// the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
++static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
++#if defined(GGML_USE_HIP)
++    return false;
++#else
++    return true;
++#endif
++}
++
++// rows of the weight matrix one thread handles per K block: more rows reuse
++// each activation piece more often, fewer rows keep the register count down
++static constexpr __host__ __device__ int ptq1_0_pt_rows_per_block(const int ncols_dst) {
++    return ncols_dst == 1 ? 1 : 2;
++}
++
++// number of 128-element blocks in a row padded to MATRIX_ROW_PADDING
++static __host__ __device__ __forceinline__ int ptq1_0_pt_nblk(const int ncols_x) {
++    return ((ncols_x + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * (MATRIX_ROW_PADDING / QK_PTQ1_0);
++}
++
++static __device__ __forceinline__ int int4_at(const int4 & v, const int k) {
++    switch (k & 3) {
++        case 0:  return v.x;
++        case 1:  return v.y;
++        case 2:  return v.z;
++        default: return v.w;
++    }
++}
++
++// four trits (0, 1, 2) packed as bytes -> the weights (-1, 0, 1) as signed bytes.
++// t + 127 never carries out of its byte, and flipping the top bit maps
++// 127, 128, 129 to -1, 0, 1: two integer ops instead of a byte-wise subtract.
++static __device__ __forceinline__ int ptq1_0_trits_to_weights(const int q) {
++    return (int) (((uint32_t) q + 0x7F7F7F7Fu) ^ 0x80808080u);
++}
++
++// one base-3 digit step on four bytes held as two 16-bit-lane words:
++// returns the weights (-1, 0, 1) as four signed bytes, advances the remainders
++static __device__ __forceinline__ int ptq1_0_trit_step(uint32_t & vlo, uint32_t & vhi) {
++    const uint32_t wlo = vlo * 3;
++    const uint32_t whi = vhi * 3;
++    vlo = wlo & 0x00FF00FF;
++    vhi = whi & 0x00FF00FF;
++    return ptq1_0_trits_to_weights(__byte_perm(wlo, whi, 0x7531));
++}
++
++// Dot products of nrows PTQ1_0 blocks with the same block index of ncols
++// activation columns. bq[i] points at the weight block of row i, ycol[j] at
++// the PT column base of column j, kbx is the block index along K.
++//
++// The integer sum of each 32-element sub-block k is folded into the fp32
++// accumulator as soon as the sub-block is complete, in the order k = 0..3,
++// which is the expression acc = sum_k d8_k * sumi_k of the block_q8_1 kernel.
++template <int ncols, int nrows>
++static __device__ __forceinline__ void ptq1_0_pt_block_dot(
++        const block_ptq1_0 * const (&bq)[nrows],
++        const char * const (&ycol)[ncols],
++        const int kbx, const int nblk,
++        float (&result)[ncols][nrows]) {
++    int4 dsraw[ncols];
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++        dsraw[j] = *((const int4 *) ycol[j] + 8*nblk + kbx);
++    }
++
++    int   sumi[ncols][nrows];
++    float acc[ncols][nrows];
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++        for (int i = 0; i < nrows; ++i) {
++            sumi[j][i] = 0;
++            acc[j][i]  = 0.0f;
++        }
++    }
++
++    auto fold = [&](const int k) {
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++            const float d8 = __low2float(((const half2 *) &dsraw[j])[k]);
++#pragma unroll
++            for (int i = 0; i < nrows; ++i) {
++                acc[j][i] = __fmaf_rn(d8, (float) sumi[j][i], acc[j][i]); // one FFMA in every instantiation
++                sumi[j][i] = 0;
++            }
++        }
++    };
++
++    // qs[0..15]: four groups of four bytes, five trits each: element 16*t + 4*g + b,
++    // plane t holds words 4*t .. 4*t+3
++    uint32_t vlo[nrows][4];
++    uint32_t vhi[nrows][4];
++#pragma unroll
++    for (int i = 0; i < nrows; ++i) {
++#pragma unroll
++        for (int g = 0; g < 4; ++g) {
++            const uint32_t packed = get_int_b4(bq[i]->qs, g);
++            vlo[i][g] = __byte_perm(packed, 0, 0x4140);
++            vhi[i][g] = __byte_perm(packed, 0, 0x4342);
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < 5; ++t) {
++        int4 u[ncols];
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++            u[j] = *((const int4 *) ycol[j] + t*nblk + kbx);
++        }
++#pragma unroll
++        for (int i = 0; i < nrows; ++i) {
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                const int q = ptq1_0_trit_step(vlo[i][g], vhi[i][g]);
++#pragma unroll
++                for (int j = 0; j < ncols; ++j) {
++                    sumi[j][i] = ggml_cuda_dp4a(q, int4_at(u[j], g), sumi[j][i]);
++                }
++            }
++        }
++        if (t == 1) {
++            fold(0); // elements 0..31 done
++        }
++        if (t == 3) {
++            fold(1); // elements 32..63 done
++        }
++    }
++
++    // qs[16..23]: two groups of four bytes, five trits each: element 80 + 8*t + 4*g + b,
++    // words 20..29 live in planes 5, 6 and the lower half of 7
++    uint32_t vlo2[nrows][2];
++    uint32_t vhi2[nrows][2];
++#pragma unroll
++    for (int i = 0; i < nrows; ++i) {
++#pragma unroll
++        for (int g = 0; g < 2; ++g) {
++            const uint32_t packed = get_int_b4(bq[i]->qs + 16, g);
++            vlo2[i][g] = __byte_perm(packed, 0, 0x4140);
++            vhi2[i][g] = __byte_perm(packed, 0, 0x4342);
++        }
++    }
++    int4 u2[ncols];
++#pragma unroll
++    for (int t = 0; t < 5; ++t) {
++        if (t % 2 == 0) {
++#pragma unroll
++            for (int j = 0; j < ncols; ++j) {
++                u2[j] = *((const int4 *) ycol[j] + (5 + t/2)*nblk + kbx);
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < nrows; ++i) {
++#pragma unroll
++            for (int g = 0; g < 2; ++g) {
++                const int q = ptq1_0_trit_step(vlo2[i][g], vhi2[i][g]);
++                const int w = 20 + 2*t + g; // word index within the 128-element block
++#pragma unroll
++                for (int j = 0; j < ncols; ++j) {
++                    sumi[j][i] = ggml_cuda_dp4a(q, int4_at(u2[j], w & 3), sumi[j][i]);
++                }
++            }
++        }
++        if (t == 1) {
++            fold(2); // elements 64..95 done (words 16..23)
++        }
++    }
++
++    // qh: two bytes, four trits each, interleaved: element 120 + 2*t + h -> words 30, 31,
++    // the upper half of plane 7 that u2 still holds
++#pragma unroll
++    for (int i = 0; i < nrows; ++i) {
++        uint32_t v = (uint32_t) bq[i]->qh[0] | ((uint32_t) bq[i]->qh[1] << 16);
++#pragma unroll
++        for (int t = 0; t < 4; t += 2) {
++            const uint32_t w0 = v * 3;
++            v                 = w0 & 0x00FF00FF;
++            const uint32_t w1 = v * 3;
++            v                 = w1 & 0x00FF00FF;
++            const int q = ptq1_0_trits_to_weights(__byte_perm(w0, w1, 0x7531));
++#pragma unroll
++            for (int j = 0; j < ncols; ++j) {
++                sumi[j][i] = ggml_cuda_dp4a(q, int4_at(u2[j], 2 + t/2), sumi[j][i]);
++            }
++        }
++    }
++    fold(3); // elements 96..127 done
++
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++        for (int i = 0; i < nrows; ++i) {
++            result[j][i] = __fmul_rn((float) bq[i]->d, acc[j][i]);
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Dedicated PTQ1_0 mat-vec for plain 2D MUL_MAT (no batch dims, no expert ids).
++//
++// The generic mmvq kernel gives every thread of a 128-thread block one
++// 128-weight K block of the same row, so a K = 5120 projection (40 blocks per
++// row) keeps 40 of 128 threads busy and K = 17408 (136 blocks) keeps 53%. Here
++// the work items are (row group, K block) pairs of `rows_per_cta` rows
++// flattened into one index space, with rows_per_cta chosen on the host so that
++// the items fill whole 128-thread iterations where possible. A thread handles
++// ROWS adjacent rows per item so that each activation piece it loads serves
++// ROWS rows. Each thread writes one fp32 partial per (row, column, K block) to
++// shared memory and one warp per (row, column) sums them in a fixed order
++// (lane-strided sequential, then a butterfly). That order depends only on the
++// weight shape, so the result for a column is the same bits for every column
++// count.
++// ---------------------------------------------------------------------------
++
++// rows_per_cta: fill whole 128-thread iterations where possible, within the shared memory budget
++static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int ncols_dst, const int nrows_x, const int rows_per_item) {
++    int rmax = PTQ1_0_PT_SMEM_FLOATS / (ncols_dst * blocks_per_row);
++    rmax = rmax < rows_per_item ? rows_per_item : (rmax > PTQ1_0_PT_MAX_ROWS ? PTQ1_0_PT_MAX_ROWS : rmax);
++    rmax -= rmax % rows_per_item;
++    int best = rows_per_item;
++    double best_util = 0.0;
++    for (int r = rows_per_item; r <= rmax; r += rows_per_item) {
++        const int items = (r / rows_per_item) * blocks_per_row;
++        const int iters = (items + PTQ1_0_PT_THREADS - 1) / PTQ1_0_PT_THREADS;
++        const double util = (double) items / (double) (iters * PTQ1_0_PT_THREADS);
++        if (util > best_util + 1e-9) {
++            best_util = util;
++            best = r;
++        }
++        if (util > 0.999) {
++            break;
++        }
++    }
++    GGML_UNUSED(nrows_x);
++    return best;
++}
++
++// rows per work item: 4 (independent blocks per thread, activation reuse across rows); the 2-row branch served
++// 5 to 8 columns before the column limit dropped to 4 and is kept only so the arithmetic stays in one place
++static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
++    return ncols_dst <= 4 ? 4 : 2;
++}
++
++// dynamic shared memory the launch requests for a shape: one fp32 partial per (column, row, K block) for the
++// rows of one CTA, twice that with gate fusion. The entry guard and the launcher both call this, so the guard
++// budgets exactly what the launch asks for; rows_per_cta is never below rows_per_item, which is what lets a
++// long enough K exceed the PTQ1_0_PT_SMEM_FLOATS target.
++static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int ncols_dst, const int nrows_x, const bool has_gate) {
++    const int rows_per_cta = ptq1_0_pt_rows_per_cta(blocks_per_row, ncols_dst, nrows_x, ptq1_0_pt_rows_per_item(ncols_dst));
++    return (size_t) ncols_dst * rows_per_cta * blocks_per_row * sizeof(float) * (has_gate ? 2 : 1);
++}
++
++template <int ncols, int ROWS, bool has_fusion, bool has_gate>
++__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? 3 : 2)))
++static __global__ void mul_mat_vec_ptq1_0_pt(
++        const void * vx_ptr, const void * vy_ptr, const ggml_cuda_mm_fusion_args_device fusion,
++        float * dst_ptr,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        const int rows_per_cta, const uint3 bpr_fd) {
++    // Wait for the activation quantizer when launched with PDL.
++    ggml_cuda_pdl_sync();
++    // GGML_CUDA_RESTRICT stays off the formal parameters: it expands differently in the host pass and in
++    // the Hopper-or-newer device pass with PDL, and the generated host stub then fails to match the
++    // template. Same pattern as mul_mat_vec_q.
++    const void * GGML_CUDA_RESTRICT vx  = vx_ptr;
++    const void * GGML_CUDA_RESTRICT vy  = vy_ptr;
++    float      * GGML_CUDA_RESTRICT dst = dst_ptr;
++    extern __shared__ float partials_dyn[];
++    float * partials = partials_dyn;                                       // [ncols][rows_per_cta][bpr]
++    [[maybe_unused]] float * partials_gate = partials_dyn + ncols*rows_per_cta*(ncols_x / QK_PTQ1_0);
++
++    const int bpr  = ncols_x / QK_PTQ1_0;      // K blocks per row
++    const int nblk = ptq1_0_pt_nblk(ncols_x);  // plane stride of the PT layout
++    const int row0 = rows_per_cta * blockIdx.x;
++    const int tid  = threadIdx.x;
++
++    const char * ycol[ncols];
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++        ycol[j] = (const char *) ((const block_q8_1 *) vy + j*stride_col_y);
++    }
++
++    const int n_items = (rows_per_cta / ROWS) * bpr;
++    for (int idx = tid; idx < n_items; idx += PTQ1_0_PT_THREADS) {
++        const int rg  = fastdiv((uint32_t) idx, bpr_fd); // row group within the CTA
++        const int kbx = idx - rg*bpr;
++
++        const block_ptq1_0 * bq[ROWS];
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            int row = row0 + rg*ROWS + i;
++            row = row < nrows_x ? row : nrows_x - 1; // clamp the tail, that result is not written
++            bq[i] = (const block_ptq1_0 *) vx + (int64_t) row*stride_row_x + kbx;
++        }
++        float dots[ncols][ROWS];
++        ptq1_0_pt_block_dot<ncols, ROWS>(bq, ycol, kbx, nblk, dots);
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                partials[(j*rows_per_cta + rg*ROWS + i)*bpr + kbx] = dots[j][i];
++            }
++        }
++        if constexpr (has_gate) {
++            const block_ptq1_0 * bg[ROWS];
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                int row = row0 + rg*ROWS + i;
++                row = row < nrows_x ? row : nrows_x - 1;
++                bg[i] = (const block_ptq1_0 *) fusion.gate + (int64_t) row*stride_row_x + kbx;
++            }
++            ptq1_0_pt_block_dot<ncols, ROWS>(bg, ycol, kbx, nblk, dots);
++#pragma unroll
++            for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++                for (int i = 0; i < ROWS; ++i) {
++                    partials_gate[(j*rows_per_cta + rg*ROWS + i)*bpr + kbx] = dots[j][i];
++                }
++            }
++        }
++    }
++
++    __syncthreads();
++
++    // one warp per (row, column), lane-strided sequential sum then butterfly: a fixed order
++    const int warp = tid / WARP_SIZE;
++    const int lane = tid % WARP_SIZE;
++    for (int w = warp; w < rows_per_cta*ncols; w += PTQ1_0_PT_THREADS / WARP_SIZE) {
++        const int j = w / rows_per_cta;
++        const int r = w - j*rows_per_cta;
++        const int row = row0 + r;
++
++        float sum = 0.0f;
++        [[maybe_unused]] float sum_gate = 0.0f;
++        for (int kbx = lane; kbx < bpr; kbx += WARP_SIZE) {
++            sum += partials[(j*rows_per_cta + r)*bpr + kbx];
++            if constexpr (has_gate) {
++                sum_gate += partials_gate[(j*rows_per_cta + r)*bpr + kbx];
++            }
++        }
++        sum = warp_reduce_sum<WARP_SIZE>(sum);
++        if constexpr (has_gate) {
++            sum_gate = warp_reduce_sum<WARP_SIZE>(sum_gate);
++        }
++
++        if (lane == 0 && row < nrows_x) {
++            float result = sum;
++            if constexpr (has_fusion) {
++                if (fusion.x_bias) {
++                    result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
++                }
++                if constexpr (has_gate) {
++                    float gate_value = sum_gate;
++                    if (fusion.gate_bias) {
++                        gate_value += ((const float *) fusion.gate_bias)[j*stride_col_dst + row];
++                    }
++                    switch (fusion.glu_op) {
++                        case GGML_GLU_OP_SWIGLU:
++                            result *= ggml_cuda_op_silu_single(gate_value);
++                            break;
++                        case GGML_GLU_OP_GEGLU:
++                            result *= ggml_cuda_op_gelu_single(gate_value);
++                            break;
++                        case GGML_GLU_OP_SWIGLU_OAI:
++                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
++                            break;
++                        default:
++                            result = result * gate_value;
++                            break;
++                    }
++                }
++            }
++            dst[j*stride_col_dst + row] = result;
++        }
++    }
++}
++
++template <int ncols>
++static void mul_mat_vec_ptq1_0_pt_launch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        cudaStream_t stream) {
++    constexpr int ROWS = ptq1_0_pt_rows_per_item(ncols); // independent blocks per thread for latency hiding, activation reuse across rows; 8 spills
++    const int bpr = ncols_x / QK_PTQ1_0;
++    const int rows_per_cta = ptq1_0_pt_rows_per_cta(bpr, ncols, nrows_x, ROWS);
++    const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
++    const dim3 block_nums((nrows_x + rows_per_cta - 1) / rows_per_cta, 1, 1);
++    const dim3 block_dims(PTQ1_0_PT_THREADS, 1, 1);
++
++    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
++    const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, fusion.gate != nullptr);
++    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
++    if (has_fusion) {
++        GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
++        if (fusion.gate != nullptr) {
++            ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, true, true>, lp,
++                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
++        } else {
++            ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, true, false>, lp,
++                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
++        }
++        return;
++    }
++    ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, false, false>, lp,
++        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
++}
++
++// true when the dedicated kernel handles this call (plain 2D, K a multiple of 128, 1 to 4 columns)
++static bool mul_mat_vec_ptq1_0_pt_switch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int ncols_dst,
++        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
++    if (!ptq1_0_pt_enabled() || nchannels_dst != 1 || nsamples_dst != 1 || ncols_x % QK_PTQ1_0 != 0 ||
++        ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS) {
++        return false;
++    }
++    // the kernel never opts in to more than the default dynamic shared memory per block (48 KiB on the
++    // supported cards), so a shape whose launch would request more goes to the generic kernel
++    const size_t smem = ptq1_0_pt_smem_bytes(ncols_x / QK_PTQ1_0, ncols_dst, nrows_x, fusion.gate != nullptr);
++    if (smem > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
++        return false;
++    }
++    switch (ncols_dst) {
++        case 1: mul_mat_vec_ptq1_0_pt_launch<1>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++        case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++        case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++        case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++        default: return false;
++    }
++    return true;
++}
 diff --git a/src/llama-kvmem-factory.h b/src/llama-kvmem-factory.h
 new file mode 100644
 --- /dev/null

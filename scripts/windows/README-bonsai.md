@@ -1,9 +1,9 @@
-# Bonsai 2 experimental Windows runtime
+# Bonsai 2 experimental Windows runtime — rc3-prism.2
 
 Based on KVMem rc3 with Prism llama.cpp. This package is for **Windows x64,
 NVIDIA RTX 30/40/50 series** (SM86/89/120a), using CUDA 12.9.86.
-Actual inference validation uses RTX 5050 Laptop 8 GB; RTX 30/40 are compiled
-targets, not hardware-tested. Requires an AVX2/FMA/F16C/BMI2 CPU, a compatible
+Kernel and MTP inference validation uses RTX 5050 Laptop 8 GB and RTX 5060 Ti
+16 GB. RTX 30/40 are compiled targets, not hardware-tested. Requires an AVX2/FMA/F16C/BMI2 CPU, a compatible
 NVIDIA driver and the Microsoft Visual C++ x64 Redistributable.
 CUDA Toolkit, Visual Studio, Python and Node.js are not needed to run it.
 
@@ -49,8 +49,32 @@ See the release validation for checks repeated on the packaged multiarch binary.
 
 ## Experimental scope
 
-- Text-only Bonsai PTQ1 is validated. MTP and DSpark are disabled; do not use
-  rc3 IQ3/IQ4 MTP launch recipes with this build.
+This version includes optimized PTQ1 CUDA decode and optional community r3 MTP.
+MTP is off by default. On the measured short decode workload, the new kernels
+improved no-MTP speed by 19-54%; draft=1 added another 15-18% on two RTX 50 GPUs.
+Prefill was roughly unchanged. See the bundled `docs/milestones/v0.16.0-rc3-prism.2.md`
+and `docs/bonsai-kernel-comparison.md` for conditions and validation boundaries.
+
+### Optional MTP / 可选 MTP
+
+Prepare a merged r3 GGUF following the bundled `docs/bonsai-mtp-validation.md`.
+The original GGUF has no MTP head; `-Mtp` does not download or convert weights.
+For an 8GB GPU, start with the tested smaller pool:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-bonsai.ps1 -Model 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q8_0.gguf' -Gpu 0 -Mtp -DraftTokens 1 -Context 8192 -Budget 2048 -Reserve 1024 -ReasoningBudget 256
+```
+
+The merged model adds about 430 MiB on disk; draft=1 added about 0.6 GiB VRAM
+in the small-pool tests. Enabling MTP does not shrink the default 24K + 10K pool.
+That default pool, long actual inputs (32K+), and 10K output have not been tested
+with MTP. draft=2 was slower than draft=1 in both tested GPUs.
+
+Server logs, including prefill/decode timing, are forwarded to the launch terminal.
+
+- Text-only Bonsai PTQ1 is validated; MTP uses a community-trained head, not an
+  official Prism checkpoint. DSpark is not integrated. Do not use rc3 IQ3/IQ4
+  MTP launch recipes with this build.
 - No NVMe KV storage. CPU-memory KV spill and retrieval are enabled.
 - Full UI does not imply backend tool execution or stream resumption support.
 - This is a separate experiment, not a general replacement for the rc3 runtime.

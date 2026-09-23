@@ -72,6 +72,10 @@ if (KVMEM_BUILD_LLAMA)
     endforeach()
 
     add_executable(kvmem-reasoning-budget-test tests/reasoning-budget-test.cpp)
+    add_executable(kvmem-mtp-kv-test tests/mtp-kv-test.cpp tools/kvmem-spec.cpp)
+    target_include_directories(kvmem-mtp-kv-test PRIVATE tools src/adapter llama.cpp/src kvmem/include)
+    target_link_libraries(kvmem-mtp-kv-test PRIVATE llama llama-common)
+
     target_include_directories(kvmem-reasoning-budget-test PRIVATE tools)
     target_link_libraries(kvmem-reasoning-budget-test PRIVATE llama-common)
     add_test(NAME kvmem-reasoning-budget-test COMMAND kvmem-reasoning-budget-test)

@@ -1,6 +1,10 @@
 # rc3 Prism baseline experiment
 
-Status: no-MTP adapter port implemented; Windows CUDA build, 11 tests and initial 4K text tests pass. On 8GB, 32K with a 2K retrieval budget recalls 1/3 codes; 64K with a 24K retrieval budget plus 10K reserve recalls 3/3 at a 7454 MiB peak. These are synthetic tests. This is a local experimental build, not a release. See [validation results](bonsai-validation.md).
+Historical initial validation: no-MTP adapter port implemented; Windows CUDA build, 11 tests and initial 4K text tests pass. On 8GB, 32K with a 2K retrieval budget recalls 1/3 codes; 64K with a 24K retrieval budget plus 10K reserve recalls 3/3 at a 7454 MiB peak. These are synthetic tests. For current release preparation, see [rc3-prism.2 notes](milestones/v0.16.0-rc3-prism.2.md). See [validation results](bonsai-validation.md).
+
+September 23 update: opt-in snapshot MTP is now implemented and tested separately
+with the community r3 head. Its smaller-pool results and limitations are in
+[Bonsai MTP validation](bonsai-mtp-validation.md); the 64K measurements above remain no-MTP results.
 
 ## Reproducible baseline
 
@@ -20,11 +24,11 @@ The gitlink pins the exact revision. Do not use `git submodule update --remote` 
 
 - KVMem memory factory, Q/K/V capture, logical token positions, sparse KV selection, host spill and stage-in.
 - Prism's native recurrent state and host checkpoints for KVMem query replay.
-- No MTP draft context, no rollback planes (`n_rs_seq=0`), no GDN Record/Fold buffers or kernels. CLI/server reject `--spec-type draft-mtp` before loading weights. Shared MTP adapter glue remains compiled but is not instantiated.
-- Prism PTQ1, weight Hadamard transforms and CPU/CUDA GDN computations remain unchanged.
+- No rollback planes when MTP is off (`n_rs_seq=0`). Opt-in `draft-mtp` uses a follower KV pool and GPU snapshot planes. GDN Record/Fold buffers and kernels are not included.
+- PTQ1 CUDA small-batch kernels include the community optimization and local PDL fix. Weight formats, Hadamard metadata and GDN computations remain unchanged.
 - KV constructor and mtmd helper calls adapted to the pinned Prism interfaces. Vision is not validated by this experiment.
 
-`patches/llama-kvmem-current.patch` is the regenerated 22-file Prism patch. The old rc3 cumulative patch is retained as `llama-kvmem-rc3-reference.patch`. Historical numbered patches must not be applied to this baseline. Patch replay was checked on a fresh export of the pinned revision, including repeat application.
+`patches/llama-kvmem-current.patch` is the cumulative Prism integration patch (including MTP and CUDA kernels). The old rc3 cumulative patch is retained as `llama-kvmem-rc3-reference.patch`. Historical numbered patches must not be applied to this baseline. Patch replay was checked on a fresh export of the pinned revision, including repeat application.
 
 ## Build and run
 
@@ -51,4 +55,4 @@ Replace the UUID for another machine. Results and server traces are written unde
 
 ## Remaining validation
 
-Compare logits against an independently built, unmodified Prism runtime; extend long-context and tool-use coverage; run ordinary Qwen regressions and validate other GPUs/platforms. MTP remains outside this branch's supported scope. The earlier compatibility analyses are planning records, not test results.
+Compare logits against an independently built, unmodified Prism runtime; extend long-context and tool-use coverage; run ordinary Qwen regressions and validate other GPUs/platforms. MTP's separate validation boundaries are documented above. The earlier compatibility analyses are planning records, not test results.

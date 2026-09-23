@@ -43,7 +43,6 @@ struct kvmem_spec_session {
     llama_context * ctx_dft = nullptr;
     bool use_ckpt_tgt = false;
     bool use_ckpt_dft = false;
-    bool use_gdn_replay = false;
     uint32_t n_rs_tgt = 0;
     bool ok = false;
 };

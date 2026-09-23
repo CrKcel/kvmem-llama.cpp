@@ -26,7 +26,7 @@ llama_memory_kvmem_hybrid::llama_memory_kvmem_hybrid(
             GGML_TYPE_F32,
             std::max((uint32_t) 1, cparams.n_seq_max),
             cparams.n_seq_max,
-            /* n_rs_seq */ 0,
+            cparams.n_rs_seq,
             cparams.offload_kqv,
             /* unified */ true,
             [&](int32_t il) {
