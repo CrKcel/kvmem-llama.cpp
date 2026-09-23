@@ -50,7 +50,10 @@ Adding `--sink-tokens 512` to the smoke command (server option
 ```
 
 The total selection budget remains 24576 and the reserve remains 10240; the
-additional 384 prefix tokens replace other selected tokens. Device VRAM peak
+additional 384 pinned prefix tokens replace recent tokens during prefill pressure
+selection. At final question retrieval, both runs already select blocks 0–46;
+their sets differ by 13 blocks elsewhere, not just the three extra prefix blocks.
+See `bonsai-prefix-causality-analysis.md` for the detailed comparison. Device VRAM peak
 is 7876 MiB in both runs. Initial request wall time is 224.22 seconds versus
 224.14 seconds in the 128-token prefix audit. These diagnostic timings are not
 a new performance benchmark.
