@@ -1,7 +1,9 @@
 """Compare pristine Prism and KVMem with the same model, requests and CUDA kernels."""
 import argparse
+import hashlib
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import threading
@@ -11,7 +13,9 @@ import urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument('--model', type=Path, required=True)
 ap.add_argument('--gpu', required=True)
-ap.add_argument('--profile', choices=['original-32k','comparison'], default='original-32k')
+ap.add_argument('--profile', choices=['original-32k','original-128k-recall','comparison'], default='original-32k')
+ap.add_argument('--cache-type-k', choices=['q8_0','q4_0'], default='q8_0')
+ap.add_argument('--cache-type-v', choices=['q8_0','q4_0'], default='q8_0')
 ap.add_argument('--out', type=Path, default=Path('logs/prism-comparison'))
 args = ap.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
@@ -24,16 +28,16 @@ opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 base = 'http://127.0.0.1:18333'
 results = {}
 
-def request(path, data=None, timeout=1800):
+def request(path, data=None, timeout=7200):
     req = urllib.request.Request(base + path, data=None if data is None else json.dumps(data).encode(),
                                  headers={'Content-Type':'application/json'})
     with opener.open(req, timeout=timeout) as response:
         return json.load(response)
 
-def chat(messages, count):
+def chat(messages, count, cache_prompt=False):
     started = time.monotonic()
     response = request('/v1/chat/completions', {'model':'bonsai', 'messages':messages,
-        'max_tokens':count, 'temperature':0, 'seed':42, 'cache_prompt':False,
+        'max_tokens':count, 'temperature':0, 'seed':42, 'cache_prompt':cache_prompt,
         'chat_template_kwargs':{'enable_thinking':False}, 'enable_thinking':False})
     return {'wall_seconds':time.monotonic()-started, 'response':response}
 
@@ -44,13 +48,17 @@ def run(name, context, kvmem=False, capacity=False):
     exe = Path('build-win-bonsai/bin/llama-kvmem-server.exe' if kvmem else
                'build-win-prism-reference/build/bin/llama-server.exe').resolve()
     command = [str(exe), '-m', str(args.model), '-ngl', '99', '-c', str(context),
-               '-b','128','-ub','128','-fa','on','-ctk','q8_0','-ctv','q8_0',
+               '-b','128','-ub','128','-fa','on','-ctk',args.cache_type_k,'-ctv',args.cache_type_v,
                '-t','4','-tb','4','--host','127.0.0.1','--port','18333','--spec-type','none']
     if kvmem:
         command += ['--kvmem-budget','24576','--kvmem-gen-reserve','10240','--no-ui']
     else:
         command += ['--parallel','1','--fit','off','--reasoning','off','--cache-ram','0','--ctx-checkpoints','0','--perf']
     entry = results[name] = {'command':command, 'requests':[]}
+    with exe.open('rb') as f:
+        entry['binary_sha256'] = hashlib.file_digest(f, 'sha256').hexdigest()
+    with args.model.open('rb') as f:
+        entry['model_sha256'] = hashlib.file_digest(f, 'sha256').hexdigest()
     samples, stop = [], threading.Event()
     def monitor():
         while not stop.is_set():
@@ -62,6 +70,8 @@ def run(name, context, kvmem=False, capacity=False):
                 pass
             stop.wait(1)
     thread = threading.Thread(target=monitor, daemon=True)
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1',18333))
     with (args.out/f'{name}.log').open('w',encoding='utf-8') as log:
         proc = subprocess.Popen(command, stdout=log, stderr=log, env=env, creationflags=creation)
         thread.start()
@@ -79,8 +89,45 @@ def run(name, context, kvmem=False, capacity=False):
             else:
                 raise TimeoutError('startup did not become healthy')
             entry['healthy'] = True
+            entry['server_props'] = request('/props')
             entry['warmup'] = chat([{'role':'user','content':'Reply with just the number: 17 + 25 = ?'}],16)
-            if capacity:
+            if args.profile == 'original-128k-recall':
+                assert '42' in entry['warmup']['response']['choices'][0]['message'].get('content','')
+                evidence = Path('logs/bonsai-128k-mtp1-q4-kq8-vq4-5050/archive-request.json')
+                history = json.loads(evidence.read_text(encoding='utf-8'))
+                (args.out/'archive-request.json').write_bytes(evidence.read_bytes())
+                rendered = request('/apply-template', {'messages':history,
+                    'chat_template_kwargs':{'enable_thinking':False}, 'enable_thinking':False})['prompt']
+                pieces = request('/tokenize', {'content':rendered, 'add_special':True,
+                    'parse_special':True, 'with_pieces':True})['tokens']
+                text = ''.join(t['piece'] if isinstance(t['piece'],str) else bytes(t['piece']).decode('utf-8') for t in pieces)
+                offsets, cursor = [], 0
+                for t in pieces:
+                    piece = t['piece'] if isinstance(t['piece'],str) else bytes(t['piece']).decode('utf-8')
+                    offsets.append((cursor,cursor+len(piece)))
+                    cursor += len(piece)
+                entry['archive_token_count'] = len(pieces)
+                entry['needle_positions'] = {}
+                for code in ['ORCHID-5831','MAPLE-2964','CEDAR-8172']:
+                    start = text.index(code)
+                    indices = [i for i,(lo,hi) in enumerate(offsets) if lo < start+len(code) and hi > start]
+                    entry['needle_positions'][code] = {'tokens':indices, 'blocks_128':sorted({i//128 for i in indices})}
+                (args.out/'rendered-archive.txt').write_text(rendered,encoding='utf-8')
+                save()
+                print('Submitting identical 7650-entry archive to full 128K KV Prism',flush=True)
+                first = chat(history,96,cache_prompt=True)
+                entry['requests'].append({'case':'archive',**first})
+                save()
+                print('archive',first['response']['usage'],'seconds',round(first['wall_seconds'],2),flush=True)
+                history.append(first['response']['choices'][0]['message'])
+                history.append({'role':'user','content':'List the secret access codes for the lunar observatory, coral laboratory, and desert telescope. Reply with each facility and its code.'})
+                second = chat(history,96,cache_prompt=True)
+                entry['requests'].append({'case':'recall',**second})
+                answer = second['response']['choices'][0]['message'].get('content','')
+                entry['needle_matches'] = {code:code in answer for code in ['ORCHID-5831','MAPLE-2964','CEDAR-8172']}
+                entry['recall_passed'] = all(entry['needle_matches'].values())
+                print('recall',json.dumps(entry['needle_matches']),answer,flush=True)
+            elif capacity:
                 # Use the same archive, with one long reply to measure full-KV decode.
                 evidence = Path('logs/bonsai-32k-smoke' if context == 32768 else 'logs/bonsai-64k-24k-10k')
                 history = json.loads((evidence/'archive-request.json').read_text(encoding='utf-8'))
@@ -109,7 +156,9 @@ def run(name, context, kvmem=False, capacity=False):
             (args.out/f'{name}-memory.json').write_text(json.dumps(samples),encoding='utf-8')
             save()
 
-if args.profile == 'original-32k':
+if args.profile == 'original-128k-recall':
+    run('prism-128k-recall',131072)
+elif args.profile == 'original-32k':
     run('prism-32k',32768,capacity=True)
 else:
     run('prism-64k',65536,capacity=True)
@@ -117,4 +166,6 @@ else:
     run('kvmem-matched',65536,kvmem=True)
 print('Comparison results saved:',args.out,flush=True)
 if args.profile == 'original-32k' and not results['prism-32k'].get('completed'):
+    raise SystemExit(1)
+if args.profile == 'original-128k-recall' and not results['prism-128k-recall'].get('completed'):
     raise SystemExit(1)

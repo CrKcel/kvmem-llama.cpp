@@ -23,6 +23,10 @@ disable thinking, while the server default reasoning budget remains 4096.
 
 The verdict is **recall_failed**. Exact recall response:
 
+A subsequent [original Prism full-KV control on RTX 5060 Ti](bonsai-prism-128k-recall-validation.md)
+recalled all three codes with K Q8_0 / V Q4_0 and MTP disabled. This narrows the
+investigation but does not isolate KVMem state handling, MTP, or kernel differences.
+
 ```text
 Based on the archive provided, only one secret access code was found:
 
