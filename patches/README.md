@@ -1,7 +1,6 @@
 # llama.cpp patch replay
 
-`llama-kvmem-current.patch` is the cumulative diff against merge base `997dc089e`
-(PrismML `prism` merged into ggml-org `b81c99b`).
+`llama-kvmem-current.patch` is the cumulative diff against Prism `9a9394a`.
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
 It also fixes reasoning-budget initialization from a template's generation prefix.
@@ -23,7 +22,7 @@ To check a clean extraction without changing the active submodule:
 
 ```bash
 mkdir -p /tmp/kvmem-llama-patch-check
-git -C llama.cpp archive 997dc089e | tar -x -C /tmp/kvmem-llama-patch-check
+git -C llama.cpp archive 9a9394a | tar -x -C /tmp/kvmem-llama-patch-check
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 ```

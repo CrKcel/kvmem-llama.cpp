@@ -282,7 +282,7 @@ P0-2 ─┼─► P0-3 ─► P1-1 ─► P1-2 ─► P1-3 ─► P1-4 ─┬─
 
 **改动：**
 
-- `git submodule add` 钉分支（P1 已钉 `kvmem/prism-merge` — PrismML `prism` 合入 ggml-org `b81c99b`，合并基线 `997dc089e`；纯 Transformer + CUDA FA，Qwen3-0.6B Q8_0）
+- `git submodule add` 钉分支（P1 已钉 `kvmem/prism` — PrismML `prism` `9a9394a` 基线；纯 Transformer + CUDA FA，Qwen3-0.6B Q8_0）
 - `scripts/apply-patches.sh`、`scripts/rebase-llama.sh`
 - 文档写明 tag、验证过的模型、如何 bump
 
