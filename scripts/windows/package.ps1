@@ -101,7 +101,7 @@ if ($Bonsai) { $readme = 'README-bonsai.md' }
 if ($Component -eq 'Quantizer') { $readme = 'README-quantizer.md' }
 Copy-Item -LiteralPath (Join-Path $SourceDir ('scripts/windows/' + $readme)) -Destination (Join-Path $OutputDir 'README.md')
 if ($Bonsai -and $Component -eq 'Runtime') {
-    foreach ($name in 'docs/milestones/v0.16.0-rc3-prism.2.md', 'docs/bonsai-kernel-comparison.md', 'docs/bonsai-mtp-validation.md', 'docs/bonsai-128k-mtp1-validation.md') {
+    foreach ($name in 'docs/milestones/v0.16.0-rc3-prism.2.md', 'docs/bonsai-kernel-comparison.md', 'docs/bonsai-mtp-validation.md', 'docs/bonsai-128k-mtp1-validation.md', 'docs/bonsai-mtp1-f16-5060-comparison.md') {
         $dest = Join-Path $OutputDir $name
         $null = New-Item -ItemType Directory -Path (Split-Path $dest) -Force
         Copy-Item -LiteralPath (Join-Path $SourceDir $name) -Destination $dest

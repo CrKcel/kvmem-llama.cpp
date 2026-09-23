@@ -27,7 +27,7 @@ struct kvmem_spec_opts {
     std::string draft_model; // optional sidecar GGUF; empty = welded nextn
     ggml_type type_k = GGML_TYPE_Q8_0;
     ggml_type type_v = GGML_TYPE_Q8_0;
-    ggml_type draft_type = GGML_TYPE_COUNT; // inherit target K/V types unless overridden
+    ggml_type draft_type = GGML_TYPE_F16; // GGML_TYPE_COUNT explicitly requests target K/V inheritance
 };
 
 // Supported cache types: f16, f32, q8_0, q5_0, q4_0.

@@ -18,6 +18,7 @@ ap.add_argument('--port', type=int, default=18332)
 ap.add_argument('--mtp', action='store_true', help='Enable snapshot MTP with one draft token; requires a model with an MTP head')
 ap.add_argument('--cache-type-k', choices=('q8_0', 'q5_0', 'q4_0'), default='q8_0')
 ap.add_argument('--cache-type-v', choices=('q8_0', 'q5_0', 'q4_0'), default='q8_0')
+ap.add_argument('--draft-kv', choices=('f16', 'q8_0', 'q5_0', 'q4_0'), help='Override the default F16 MTP KV')
 ap.add_argument('--reasoning-budget', type=int, default=4096)
 ap.add_argument('--request-timeout', type=int, default=7200, help='Seconds per request, including long prefill')
 ap.add_argument('--long', action='store_true', help='Exercise host spill and retrieval beyond the KV pool')
@@ -80,8 +81,10 @@ for mode in (['plain'] if args.plain_only else ['kvmem'] if args.kvmem_only else
         '--kvmem-budget',str(args.budget),'--kvmem-gen-reserve',str(args.reserve),'--kvmem-block-tokens','128',
         '--no-ui','--no-kvmem' if mode=='plain' else '--kvmem']
     if args.mtp:
-        # Draft K/V independently inherit the target types when no override is supplied.
+        # Omit the override to exercise the server's F16 draft default.
         command += ['--spec-draft-n-max','1','--kvmem-mtp-state','snapshots']
+        if args.draft_kv:
+            command += ['--spec-kv-dtype', args.draft_kv]
     if args.sink_tokens:
         command += ['--kvmem-sink-tokens', str(args.sink_tokens)]
     results[mode] = {'command':command, 'request_thinking':False, 'server_reasoning_budget':args.reasoning_budget}
@@ -125,7 +128,8 @@ for mode in (['plain'] if args.plain_only else ['kvmem'] if args.kvmem_only else
             assert actual_kv == {'k':args.cache_type_k, 'v':args.cache_type_v}, actual_kv
             if args.mtp:
                 pool = re.search(r'KVMEM_TRACE mtp_pool [^\r\n]+', startup)
-                assert pool and f'type_k={args.cache_type_k} type_v={args.cache_type_v}' in pool.group(), 'Draft KV types did not inherit target types'
+                draft_kv = args.draft_kv or 'f16'
+                assert pool and f'type_k={draft_kv} type_v={draft_kv}' in pool.group(), 'Unexpected draft KV types'
             responses = [chat(messages) for messages in simple]
             contents = [r['choices'][0]['message'].get('content','') for r in responses]
             assert '42' in contents[0], contents

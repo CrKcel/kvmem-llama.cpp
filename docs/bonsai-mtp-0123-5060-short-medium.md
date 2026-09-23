@@ -77,7 +77,7 @@ generation contexts. These runs alone do not justify increasing the default to
 ## Reproduce and evidence
 
 ```powershell
-python scripts/bonsai-mtp-context-bench.py --binary build-win-bonsai-release/bin/llama-kvmem-server.exe --model "$env:LOCALAPPDATA/KVMem/models/Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q4_0.gguf" --gpu GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c --out logs/bonsai-mtp-0123-rerun
+python scripts/bonsai-mtp-context-bench.py --binary build-win-bonsai-release/bin/llama-kvmem-server.exe --model "$env:LOCALAPPDATA/KVMem/models/Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q4_0.gguf" --gpu GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c --draft-kv q8_0 --out logs/bonsai-mtp-0123-rerun
 ```
 
 Raw responses, commands, timings, per-request acceptance counts, prompts and

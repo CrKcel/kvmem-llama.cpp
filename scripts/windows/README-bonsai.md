@@ -30,15 +30,20 @@ original filename automatically when `-Model` is omitted). `-Mtp:$false` is supp
 from PowerShell as well. No automatic fallback occurs when the MTP model is missing.
 
 解压后按上面命令启动，然后打开浏览器即可聊天。无需编译或安装 CUDA Toolkit。
-默认开启 MTP draft=1，使用 Q8 KV、128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
+默认开启 MTP draft=1，主模型使用 Q8 KV、MTP 草稿使用 F16 KV，128K 上下文、24K 检索预算和 10K 生成预留，开启思考，
 思考预算为 4096 token（可用 `-ReasoningBudget` 覆盖）。思考 token 包含在总生成上限内。
 128K 配置已在 5050 上完成 130,103 token 实际输入测试，无 OOM，但检索仅命中 1/3；不能视为长文质量验证通过。
 
-Defaults: MTP draft=1, context 131072, retrieval budget 24576, generation reserve 10240,
+Defaults: MTP draft=1, target K/V Q8_0, draft K/V F16, context 131072, retrieval budget 24576, generation reserve 10240,
 thinking enabled with a 4096-token reasoning budget. The 128K MTP1 run on RTX 5050
 processed 130,103 input tokens without OOM, but recalled only 1/3 planted codes.
 Prefill was 60.95 token/s (35m35s), sustained decode 4.63 token/s, peak VRAM 7845 MiB.
 Windows shared GPU memory peaked at 706 MiB; that counter alone does not prove paging.
+Those historical 128K measurements used Q8 draft KV. The F16 default was selected
+after a separate RTX 5060 Ti MTP1 test at 4K/16K input: sampled total VRAM fell
+from 7834 to 7766 MiB, with no consistent decode speed improvement.
+Use `-DraftKvType q8_0` to override the launcher default; when running the binary
+directly, use `--spec-kv-dtype q8_0`. `-KvType` controls only the target KV.
 This is a failed recall test, not a 128K quality guarantee. See
 `docs/bonsai-128k-mtp1-validation.md`. Thinking was disabled for benchmark requests;
 only 256 output tokens were tested, not 10K.

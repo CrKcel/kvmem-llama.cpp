@@ -59,10 +59,11 @@ public class ArgvEcho {
     }
     $bonsai = & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -DryRun | ConvertFrom-Json
     $a = $bonsai.argv
-    Check ($a[[Array]::IndexOf($a, '--spec-type') + 1] -eq 'none') 'Bonsai disables MTP'
+    Check ($a[[Array]::IndexOf($a, '--spec-type') + 1] -eq 'draft-mtp') 'Bonsai enables MTP'
+    Check ($a[[Array]::IndexOf($a, '--spec-kv-dtype') + 1] -eq 'f16') 'Bonsai F16 draft KV'
     Check (!($a -contains '--mmproj')) 'Bonsai text mode does not load a projector'
-    Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq '2048') 'Bonsai budget'
-    Check ($a[[Array]::IndexOf($a, '--kvmem-gen-reserve') + 1] -eq '1024') 'Bonsai reserve'
+    Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq '24576') 'Bonsai budget'
+    Check ($a[[Array]::IndexOf($a, '--kvmem-gen-reserve') + 1] -eq '10240') 'Bonsai reserve'
     Check ($a[[Array]::IndexOf($a, '--ubatch-size') + 1] -eq '128') 'Bonsai prefill batch'
     $failed = $false
     try { & (Join-Path $PSScriptRoot 'start-bonsai.ps1') -BuildDir $temp -Model $model -Gpu 0 -Budget 129 -DryRun }

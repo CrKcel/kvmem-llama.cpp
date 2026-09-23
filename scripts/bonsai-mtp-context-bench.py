@@ -19,7 +19,7 @@ p.add_argument('--out', type=Path, required=True)
 p.add_argument('--repeats', type=int, default=2)
 p.add_argument('--port', type=int, default=18346)
 p.add_argument('--drafts', type=int, nargs='+', default=[0, 1, 2, 3])
-p.add_argument('--draft-kv', choices=['q8_0'], help='Explicit draft KV for servers whose default does not inherit target KV')
+p.add_argument('--draft-kv', choices=['q8_0', 'f16'], help='Override draft KV (current server default: f16)')
 a = p.parse_args()
 assert a.repeats > 0 and all(d in range(4) for d in a.drafts)
 a.out.mkdir(parents=True, exist_ok=True)
@@ -42,7 +42,7 @@ def chat(text, count):
         'chat_template_kwargs':{'enable_thinking':False}, 'enable_thinking':False})
 
 report = {'settings':{'context':131072, 'budget':24576, 'reserve':10240,
-    'kv':'q8_0/q8_0', 'batch':128, 'ubatch':128, 'thinking':False,
+    'kv':'q8_0/q8_0', 'draft_kv_requested':a.draft_kv, 'batch':128, 'ubatch':128, 'thinking':False,
     'output_tokens':512, 'repeats':a.repeats, 'gpu':a.gpu, 'trace':True,
     'audit':False, 'prefix':'default128', 'presence_penalty':0}, 'runs':[]}
 for label, path in [('binary',a.binary),('model',a.model)]:
@@ -94,7 +94,10 @@ for draft in a.drafts:
             assert ready['kv']=={'k':'q8_0','v':'q8_0'} and ready['kvmem']['enabled']
             if draft:
                 assert f'spec_start type=draft-mtp n_max={draft} p_min=0.000' in startup
-                assert 'type_k=q8_0 type_v=q8_0' in startup
+                pool = re.search(r'KVMEM_TRACE mtp_pool ([^\r\n]+)', startup)
+                expected_draft_kv = a.draft_kv or 'f16'
+                assert pool and f'type_k={expected_draft_kv} type_v={expected_draft_kv}' in pool[1]
+                entry['draft_kv_pool'] = pool[1]
             entry['startup']=ready
             warmup=chat('Write a detailed explanation of how reflecting telescopes focus light.',128)
             assert warmup['usage']['completion_tokens']>=100

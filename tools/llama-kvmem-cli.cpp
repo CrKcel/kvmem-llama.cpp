@@ -49,7 +49,7 @@ static void print_usage(const char * argv0) {
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
             "  --spec-type TYPE           none|draft-mtp (default none)\n"
-            "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
+            "  --spec-kv-dtype TYPE       MTP K/V type (default: f16)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 1)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
             "  --spec-draft-model PATH    optional sidecar MTP GGUF\n",
@@ -88,7 +88,7 @@ int main(int argc, char ** argv) {
     bool dump_kv = false;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
-    ggml_type spec_cache_type = GGML_TYPE_COUNT;
+    ggml_type spec_cache_type = GGML_TYPE_F16;
     bool spec_mtp = false;
     int spec_n_max = 1;
     float spec_p_min = 0.0f;
