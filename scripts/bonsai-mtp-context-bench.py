@@ -20,6 +20,7 @@ p.add_argument('--repeats', type=int, default=2)
 p.add_argument('--port', type=int, default=18346)
 p.add_argument('--drafts', type=int, nargs='+', default=[0, 1, 2, 3])
 p.add_argument('--draft-kv', choices=['q8_0', 'f16'], help='Override draft KV (current server default: f16)')
+p.add_argument('--workload', choices=['prose', 'coding'], default='prose')
 a = p.parse_args()
 assert a.repeats > 0 and all(d in range(4) for d in a.drafts)
 a.out.mkdir(parents=True, exist_ok=True)
@@ -43,7 +44,7 @@ def chat(text, count):
 
 report = {'settings':{'context':131072, 'budget':24576, 'reserve':10240,
     'kv':'q8_0/q8_0', 'draft_kv_requested':a.draft_kv, 'batch':128, 'ubatch':128, 'thinking':False,
-    'output_tokens':512, 'repeats':a.repeats, 'gpu':a.gpu, 'trace':True,
+    'output_tokens':512, 'workload':a.workload, 'repeats':a.repeats, 'gpu':a.gpu, 'trace':True,
     'audit':False, 'prefix':'default128', 'presence_penalty':0}, 'runs':[]}
 for label, path in [('binary',a.binary),('model',a.model)]:
     with path.open('rb') as f:
@@ -109,6 +110,9 @@ for draft in a.drafts:
                     text=f'Benchmark {label} trial {repeat}. Read the following reference archive.\n'
                     text+='\n'.join(f'Archive entry {i:04d}: the warehouse stores ordinary green bamboo crates.' for i in range(records))
                     text+='\nNow write a detailed 2000-word guide to how astronomical observatories work, including telescope optics, detectors, calibration, atmospheric effects, data processing, and scientific observations. Use complete paragraphs and continue until every topic is fully explained.'
+                    if a.workload == 'coding':
+                        from bonsai_coding_cases import make_prompt
+                        text = make_prompt(label, repeat)
                     (a.out/f'prompt-{label}-{repeat}.txt').write_text(text,encoding='utf-8')
                     offset=len(logpath.read_text(encoding='utf-8',errors='replace'))
                     started=time.time()
@@ -123,11 +127,13 @@ for draft in a.drafts:
                     timing={k:float(v) for k,v in re.findall(r'(\w+)=([\d.]+)',turns[-1])}
                     usage=response['usage']
                     assert usage.get('prompt_cache_hit_tokens',0)<=16, usage
-                    assert usage['completion_tokens']==512, usage
+                    assert 0 < usage['completion_tokens'] <= 512, usage
+                    if a.workload == 'prose':
+                        assert usage['completion_tokens']==512, usage
                     assert 'prefill_pressure' not in segment, 'unexpected eviction'
                     spec=re.findall(r'KVMEM_TRACE spec_stats ([^\r\n]+)',segment)
                     stats={k:float(v) for k,v in re.findall(r'(\w+)=([\d.]+)',spec[-1])} if spec else None
-                    if draft: assert stats and stats['n_gen']==512
+                    if draft: assert stats and stats['n_gen']==usage['completion_tokens']
                     histogram={}
                     for n in re.findall(r'spec_verify n_draft=(\d+)',segment):
                         histogram[n]=histogram.get(n,0)+1
@@ -138,7 +144,7 @@ for draft in a.drafts:
                     entry['measurements'].append(row)
                     save()
                     print(json.dumps({'draft':draft,'context':label,'repeat':repeat,
-                        'prompt':usage['prompt_tokens'],'cache':usage.get('prompt_cache_hit_tokens'),
+                        'prompt':usage['prompt_tokens'],'output':usage['completion_tokens'],'cache':usage.get('prompt_cache_hit_tokens'),
                         'pp':round(row['prefill_tps'],2),'tg':timing['gen_toks'],
                         'accept':stats['accept_pct'] if stats else None,
                         'hist':histogram,'vram':row['peak_device_mib']}),flush=True)
