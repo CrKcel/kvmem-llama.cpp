@@ -725,6 +725,7 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
             }
         }
         harvest_gpu_v_commit();
+        audit_packed_blocks("before_stage_out", plan.stage_out);
         runtime_->spill_outgoing();
         if (retr_.enabled) {
             retr_.stage_out_us += ggml_time_us() - t0;
@@ -3159,6 +3160,11 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
         kvmem_diag("KVMEM_TRACE writeback laid_out=%d raw=%u skip_resident=%u stage_in=%zu\n",
                 (int) laid_out, n_raw, n_skip, plan.stage_in.size());
     }
+    if (std::getenv("KVMEM_AUDIT_RETRIEVAL")) {
+        std::vector<uint32_t> ids;
+        for (const auto & b : store.blocks()) if (b.gpu_slot >= 0) ids.push_back(b.block_id);
+        audit_packed_blocks("after_retrieval", ids);
+    }
     if (trace_) {
         const int64_t t_dump = ggml_time_us();
         for (uint32_t id : plan.stage_in) {
@@ -3218,6 +3224,51 @@ void llama_memory_kvmem::trace_working_set(const char * tag) const {
                 empty ? -1 : (int) cells.pos_get(idx),
                 (int) last_empty, (int) p_last, b.n_tokens, b.orig_pos_start);
     }
+}
+
+void llama_memory_kvmem::audit_packed_blocks(const char * phase, const std::vector<uint32_t> & blocks) {
+    const char * enabled = std::getenv("KVMEM_AUDIT_RETRIEVAL");
+    if (!enabled || std::strcmp(enabled, "1") != 0 || !raw_ || !kv_ || v_trans_) return;
+    const auto & store = runtime_->store();
+    const auto & cells = kv_->get_cells(0);
+    uint64_t checked = 0, mismatches = 0, missing = 0, bad_positions = 0, bytes = 0;
+    for (uint32_t id : blocks) {
+        if (id >= store.block_count()) { ++missing; continue; }
+        const auto & b = store.blocks()[id];
+        if (b.gpu_slot < 0) { ++missing; continue; }
+        const uint32_t cell0 = (uint32_t) b.gpu_slot * block_tokens_;
+        for (uint32_t j = 0; j < b.n_tokens; ++j) {
+            const uint32_t cell = cell0 + j;
+            if (cell >= cells.size() || cells.is_empty(cell) || !cells.seq_has(cell, 0) ||
+                    cells.pos_get(cell) != model_pos(b.orig_pos_start + j)) ++bad_positions;
+        }
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            if (!kvmem_cache_has_layer(kv_, (int32_t) il)) continue;
+            for (int is_k = 0; is_k < 2; ++is_k) {
+                const size_t row = ggml_row_size(is_k ? type_k_ : type_v_, is_k ? n_embd_k_ : n_embd_v_);
+                const size_t n = row * b.n_tokens;
+                std::vector<uint8_t> host(n), gpu(n);
+                const bool have = is_k ? raw_->copy_k_gpu(id, il, host.data(), b.n_tokens)
+                                       : raw_->copy_v_gpu(id, il, host.data(), b.n_tokens);
+                auto * tensor = is_k ? kv_->get_k_storage((int32_t) il) : kv_->get_v_storage((int32_t) il);
+                if (!have || !tensor || cell0 + b.n_tokens > kv_size_) {
+                    if (missing < 2) kvmem_diag("KVMEM_AUDIT missing phase=%s block=%u layer=%u kind=%c tokens=%u have_raw=%d have_tensor=%d\n",
+                            phase, id, il, is_k ? 'K' : 'V', b.n_tokens, (int) have, (int) (tensor != nullptr));
+                    ++missing;
+                    continue;
+                }
+                kvmem_tensor_get(tensor, gpu.data(), (size_t) cell0 * row, n);
+                ++checked; bytes += n;
+                if (std::memcmp(host.data(), gpu.data(), n) != 0) {
+                    if (mismatches < 16) kvmem_diag("KVMEM_AUDIT mismatch phase=%s block=%u layer=%u kind=%c\n", phase, id, il, is_k ? 'K' : 'V');
+                    ++mismatches;
+                }
+            }
+        }
+    }
+    kvmem_diag("KVMEM_AUDIT phase=%s blocks=%zu tensors=%llu bytes=%llu mismatches=%llu missing=%llu bad_positions=%llu\n",
+            phase, blocks.size(), (unsigned long long) checked, (unsigned long long) bytes,
+            (unsigned long long) mismatches, (unsigned long long) missing, (unsigned long long) bad_positions);
 }
 
 void llama_memory_kvmem::kv_stats(const char * tag, const float * a, const float * b, size_t n) {

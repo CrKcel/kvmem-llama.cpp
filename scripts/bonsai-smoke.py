@@ -28,6 +28,7 @@ ap.add_argument('--decode-tokens', type=int, default=0, help='Also request a sus
 ap.add_argument('--context', type=int, default=32768)
 ap.add_argument('--budget', type=int, default=2048)
 ap.add_argument('--reserve', type=int, default=1024)
+ap.add_argument('--sink-tokens', type=int, default=0, help='Pinned prefix size; 0 keeps the server default')
 ap.add_argument('--out', type=Path, default=Path('logs/bonsai-smoke'))
 ap.add_argument('--cuda', default=r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9')
 args = ap.parse_args()
@@ -37,6 +38,8 @@ if args.records < 8 or not 0 <= args.decode_tokens <= args.reserve:
     ap.error('records must be at least 8; decode-tokens must fit the generation reserve')
 if min(args.budget, args.reserve) < 128 or args.budget % 128 or args.reserve % 128:
     ap.error('budget and reserve must be positive multiples of 128')
+if args.sink_tokens < 0 or args.sink_tokens % 128 or args.sink_tokens > args.budget:
+    ap.error('sink-tokens must be 0 or a positive multiple of 128 within the budget')
 if args.budget + args.reserve > args.context:
     ap.error('budget + reserve must fit the context')
 args.out.mkdir(parents=True, exist_ok=True)
@@ -79,6 +82,8 @@ for mode in (['plain'] if args.plain_only else ['kvmem'] if args.kvmem_only else
     if args.mtp:
         # Draft K/V independently inherit the target types when no override is supplied.
         command += ['--spec-draft-n-max','1','--kvmem-mtp-state','snapshots']
+    if args.sink_tokens:
+        command += ['--kvmem-sink-tokens', str(args.sink_tokens)]
     results[mode] = {'command':command, 'request_thinking':False, 'server_reasoning_budget':args.reasoning_budget}
     print('starting', mode, 'mtp', args.mtp, 'context', args.context, 'pool', args.budget+args.reserve, flush=True)
     peak = [0]

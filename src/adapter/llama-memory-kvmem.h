@@ -118,6 +118,7 @@ public:
     void note_attention_change() { ++attention_epoch_; }
     bool query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const;
     void dump_kv_compare(int32_t block_id, bool writeback_test = false);
+    void audit_packed_blocks(const char * phase, const std::vector<uint32_t> & blocks);
     void trace_working_set(const char * tag) const;
     void set_replay(bool replay);
     bool replay() const { return replay_; }
