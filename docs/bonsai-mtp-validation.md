@@ -17,7 +17,7 @@ This is not an official Prism MTP checkpoint.
 - Output SHA256: `d020556899ccb7879bab6c2356cd6e633e14ddf12a4fb42eb7820b24d21220d9`.
 
 `scripts/bonsai-mtp-graft.py` reads BF16 safetensors without Torch, uses the pinned
-Prism gguf-py quantizer for Q8 matrices, converts zero-centered norms to effective
+Prism gguf-py quantizer for Q8 matrices by default (or `--head-type Q4_0`), converts zero-centered norms to effective
 F32 multipliers, and appends 15 tensors. All 851 original tensor payloads are
 verified byte-for-byte. The original model and Hadamard metadata are preserved;
 the head does not duplicate the embedding table. A JSON manifest is beside the output.
@@ -35,6 +35,13 @@ python scripts/bonsai-mtp-graft.py --base 'D:\models\Ternary-Bonsai-2-27B-PTQ1_0
 
 The converter verifies the pinned base/head hashes above and refuses to overwrite
 an existing output. Keep the original PTQ1 model for no-MTP use.
+
+For the Q4 MTP experiment, add `--head-type Q4_0` and choose a separate output
+such as `Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q4_0.gguf`. This quantizes only the
+MTP matrices directly from the original BF16 head; norms stay F32 and the base
+PTQ1 payloads are unchanged. The head adds about 227.9 MiB instead of 430.4 MiB.
+See the [128K mixed-KV comparison](bonsai-128k-q4-mtp-mixed-kv-validation.md)
+for the experiment using K Q8_0 / V Q4_0 in both target and draft caches.
 
 ## Implementation
 

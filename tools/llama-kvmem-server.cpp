@@ -232,7 +232,7 @@ struct ServerState {
     kvmem_spec_session spec;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
-    ggml_type spec_cache_type = GGML_TYPE_F16;
+    ggml_type spec_cache_type = GGML_TYPE_COUNT; // inherit target K/V unless overridden
     bool spec_mtp = false;
     int spec_n_max = 1;
     float spec_p_min = 0.0f;

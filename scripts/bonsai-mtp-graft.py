@@ -26,7 +26,10 @@ def main():
     p.add_argument('--base', type=Path, required=True)
     p.add_argument('--head', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--head-type', choices=('Q8_0', 'Q4_0'), default='Q8_0',
+                   help='Quantization for MTP matrices only; norms remain F32')
     a = p.parse_args()
+    head_type = gguf.GGMLQuantizationType[a.head_type]
     partial = a.output.with_suffix('.gguf.part')
     if a.output.exists() or partial.exists():
         p.error('Output or partial output already exists; choose another output path')
@@ -52,7 +55,8 @@ def main():
                              field.types[1] if len(field.types) > 1 else None)
     writer.add_uint32('qwen35.block_count', 65)
     writer.add_uint32('qwen35.nextn_predict_layers', 1)
-    writer.add_string('general.name', 'Ternary Bonsai 2 27B PTQ1 with ProCreations r3 Q8 MTP')
+    head_label = 'Q8' if a.head_type == 'Q8_0' else a.head_type
+    writer.add_string('general.name', f'Ternary Bonsai 2 27B PTQ1 with ProCreations r3 {head_label} MTP')
     for tensor in base.tensors:
         writer.add_tensor(tensor.name, tensor.data, raw_dtype=tensor.tensor_type)
     names = {'fc': 'nextn.eh_proj', 'pre_fc_norm_embedding': 'nextn.enorm',
@@ -81,10 +85,9 @@ def main():
             values += 1.0
             writer.add_tensor(target, values)
         else:
-            writer.add_tensor(target, gguf.quantize(values, gguf.GGMLQuantizationType.Q8_0),
-                              raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+            writer.add_tensor(target, gguf.quantize(values, head_type), raw_dtype=head_type)
         exported.append({'source': name, 'target': target, 'shape': shape,
-                         'type': 'F32' if len(shape) == 1 else 'Q8_0'})
+                         'type': 'F32' if len(shape) == 1 else a.head_type})
         print(f'Converted {name} -> {target}', flush=True)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -104,7 +107,8 @@ def main():
     report = {'base': str(a.base), 'base_sha256': BASE_SHA, 'head': str(a.head),
               'head_sha256': HEAD_SHA, 'head_repository': 'ProCreations/Ternary-Bonsai-2-27B-MTP',
               'head_revision': REVISION, 'output': str(a.output), 'output_sha256': sha(a.output),
-              'output_bytes': a.output.stat().st_size, 'unchanged_base_tensors': 851, 'mtp_tensors': exported}
+              'output_bytes': a.output.stat().st_size, 'head_type': a.head_type,
+              'unchanged_base_tensors': 851, 'mtp_tensors': exported}
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps(report), flush=True)
 

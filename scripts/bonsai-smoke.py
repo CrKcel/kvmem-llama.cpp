@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import socket
 from pathlib import Path
 import subprocess
@@ -15,6 +16,8 @@ ap.add_argument('--build', type=Path, default=Path('build-win-bonsai'))
 ap.add_argument('--gpu', required=True, help='GPU UUID')
 ap.add_argument('--port', type=int, default=18332)
 ap.add_argument('--mtp', action='store_true', help='Enable snapshot MTP with one draft token; requires a model with an MTP head')
+ap.add_argument('--cache-type-k', choices=('q8_0', 'q5_0', 'q4_0'), default='q8_0')
+ap.add_argument('--cache-type-v', choices=('q8_0', 'q5_0', 'q4_0'), default='q8_0')
 ap.add_argument('--reasoning-budget', type=int, default=4096)
 ap.add_argument('--request-timeout', type=int, default=7200, help='Seconds per request, including long prefill')
 ap.add_argument('--long', action='store_true', help='Exercise host spill and retrieval beyond the KV pool')
@@ -65,12 +68,14 @@ simple = [
 ]
 for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
     command = [exe,'-m',str(args.model),'-ngl','99','--host','127.0.0.1','--port',str(args.port),
-        '-c',str(args.context) if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on','--kv-dtype','q8_0','--spec-type','draft-mtp' if args.mtp else 'none',
+        '-c',str(args.context) if mode=='kvmem' else '8192','-b','128','-ub','128','-fa','on',
+        '--cache-type-k',args.cache_type_k,'--cache-type-v',args.cache_type_v,'--spec-type','draft-mtp' if args.mtp else 'none',
         '--enable-thinking','--reasoning-budget',str(args.reasoning_budget),
         '--kvmem-budget',str(args.budget),'--kvmem-gen-reserve',str(args.reserve),'--kvmem-block-tokens','128',
         '--no-ui','--no-kvmem' if mode=='plain' else '--kvmem']
     if args.mtp:
-        command += ['--spec-draft-n-max','1','--spec-kv-dtype','q8_0','--kvmem-mtp-state','snapshots']
+        # Draft K/V independently inherit the target types when no override is supplied.
+        command += ['--spec-draft-n-max','1','--kvmem-mtp-state','snapshots']
     results[mode] = {'command':command, 'request_thinking':False, 'server_reasoning_budget':args.reasoning_budget}
     print('starting', mode, 'mtp', args.mtp, 'context', args.context, 'pool', args.budget+args.reserve, flush=True)
     peak = [0]
@@ -103,6 +108,14 @@ for mode in (['kvmem'] if args.kvmem_only else ['plain', 'kvmem']):
                     time.sleep(1)
             else:
                 raise TimeoutError(f'{mode} startup')
+            startup = (args.out/f'{mode}.log').read_text(encoding='utf-8', errors='replace')
+            ready = re.search(r'KVMEM_STARTUP ready=(.+)', startup)
+            assert ready, 'Missing startup configuration'
+            actual_kv = json.loads(ready.group(1))['kv']
+            assert actual_kv == {'k':args.cache_type_k, 'v':args.cache_type_v}, actual_kv
+            if args.mtp:
+                pool = re.search(r'KVMEM_TRACE mtp_pool [^\r\n]+', startup)
+                assert pool and f'type_k={args.cache_type_k} type_v={args.cache_type_v}' in pool.group(), 'Draft KV types did not inherit target types'
             responses = [chat(messages) for messages in simple]
             contents = [r['choices'][0]['message'].get('content','') for r in responses]
             assert '42' in contents[0], contents
